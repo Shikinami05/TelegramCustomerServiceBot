@@ -1,0 +1,1979 @@
+import asyncio
+import contextlib
+import hmac
+import html
+import logging
+import os
+import sqlite3
+import time
+import uuid
+from collections.abc import Iterator
+from contextlib import asynccontextmanager, contextmanager
+from datetime import datetime
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import Any
+
+import httpx
+from dotenv import load_dotenv
+from fastapi import FastAPI, Header, HTTPException, Request
+
+load_dotenv()
+
+
+def env_int(name: str, default: int, minimum: int = 0) -> int:
+    raw_value = os.getenv(name, str(default))
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if value < minimum:
+        raise RuntimeError(f"{name} must be at least {minimum}")
+    return value
+
+
+def env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    raw_value = os.getenv(name, str(default))
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a number") from exc
+    if value < minimum:
+        raise RuntimeError(f"{name} must be at least {minimum}")
+    return value
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.getenv("ADMIN_IDS", "").split(",")
+    if x.strip().lstrip("-").isdigit()
+}
+
+DB_BACKUP_ENABLED = os.getenv("DB_BACKUP_ENABLED", "true").lower() == "true"
+DB_BACKUP_INTERVAL_SECONDS = env_int("DB_BACKUP_INTERVAL_SECONDS", 86400, 60)
+DB_BACKUP_KEEP = env_int("DB_BACKUP_KEEP", 14, 1)
+USER_RATE_LIMIT_COUNT = env_int("USER_RATE_LIMIT_COUNT", 8, 1)
+USER_RATE_LIMIT_WINDOW_SECONDS = env_int("USER_RATE_LIMIT_WINDOW_SECONDS", 60, 1)
+USER_RATE_LIMIT_COOLDOWN_SECONDS = env_int("USER_RATE_LIMIT_COOLDOWN_SECONDS", 300, 1)
+MESSAGE_RETENTION_DAYS = env_int("MESSAGE_RETENTION_DAYS", 0, 0)
+BROADCAST_SEND_DELAY_SECONDS = env_float("BROADCAST_SEND_DELAY_SECONDS", 0.05, 0.0)
+UPDATE_PROCESSING_TIMEOUT_SECONDS = env_int("UPDATE_PROCESSING_TIMEOUT_SECONDS", 300, 30)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing")
+if not WEBHOOK_SECRET:
+    raise RuntimeError("WEBHOOK_SECRET is missing")
+if not ADMIN_IDS:
+    raise RuntimeError("ADMIN_IDS is missing")
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "bot.db"
+DB_BACKUP_DIR = Path(os.getenv("DB_BACKUP_DIR", str(BASE_DIR / "backups")))
+API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("tg_bot")
+
+telegram_client: httpx.AsyncClient | None = None
+backup_task: asyncio.Task[None] | None = None
+broadcast_worker_task: asyncio.Task[None] | None = None
+broadcast_wakeup: asyncio.Event | None = None
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global telegram_client, backup_task, broadcast_worker_task, broadcast_wakeup
+
+    init_db()
+    purge_expired_data()
+    try:
+        backup_database()
+    except Exception:
+        logger.exception("Initial database backup failed")
+
+    telegram_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(20.0),
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+    )
+    broadcast_wakeup = asyncio.Event()
+    backup_task = asyncio.create_task(periodic_db_backup(), name="database-backup")
+    broadcast_worker_task = asyncio.create_task(
+        periodic_broadcast_worker(), name="broadcast-worker"
+    )
+
+    try:
+        yield
+    finally:
+        for task in (broadcast_worker_task, backup_task):
+            if task:
+                task.cancel()
+        for task in (broadcast_worker_task, backup_task):
+            if task:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        if telegram_client:
+            await telegram_client.aclose()
+        telegram_client = None
+
+
+app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
+
+
+# =========================
+# 数据库
+# =========================
+
+def init_db() -> None:
+    with db_connect() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                chat_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                last_message TEXT DEFAULT '',
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admin_states (
+                admin_id INTEGER PRIMARY KEY,
+                target_chat_id INTEGER,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS message_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                sender_type TEXT NOT NULL,
+                sender_id INTEGER NOT NULL,
+                text TEXT NOT NULL DEFAULT '',
+                telegram_message_id INTEGER,
+                edited_at DATETIME,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS blacklists (
+                chat_id INTEGER PRIMARY KEY,
+                reason TEXT DEFAULT '',
+                created_by INTEGER,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS conversations (
+                chat_id INTEGER PRIMARY KEY,
+                owner_admin_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'open',
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                closed_at DATETIME
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_broadcasts (
+                id TEXT PRIMARY KEY,
+                admin_id INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                total_count INTEGER NOT NULL DEFAULT 0,
+                sent_count INTEGER NOT NULL DEFAULT 0,
+                failed_count INTEGER NOT NULL DEFAULT 0,
+                confirmed_at DATETIME,
+                started_at DATETIME,
+                completed_at DATETIME,
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS broadcast_recipients (
+                broadcast_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (broadcast_id, chat_id),
+                FOREIGN KEY (broadcast_id) REFERENCES pending_broadcasts(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS processed_updates (
+                update_id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'done',
+                attempts INTEGER NOT NULL DEFAULT 1,
+                last_error TEXT NOT NULL DEFAULT '',
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_rate_limits (
+                chat_id INTEGER PRIMARY KEY,
+                window_started_at INTEGER NOT NULL,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                blocked_until INTEGER NOT NULL DEFAULT 0,
+                last_notified_at INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+
+        ensure_column(conn, "message_logs", "telegram_message_id", "INTEGER")
+        ensure_column(conn, "message_logs", "edited_at", "DATETIME")
+        ensure_column(conn, "pending_broadcasts", "status", "TEXT NOT NULL DEFAULT 'pending'")
+        ensure_column(conn, "pending_broadcasts", "total_count", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "pending_broadcasts", "sent_count", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "pending_broadcasts", "failed_count", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "pending_broadcasts", "confirmed_at", "DATETIME")
+        ensure_column(conn, "pending_broadcasts", "started_at", "DATETIME")
+        ensure_column(conn, "pending_broadcasts", "completed_at", "DATETIME")
+        ensure_column(conn, "pending_broadcasts", "last_error", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "processed_updates", "status", "TEXT NOT NULL DEFAULT 'done'")
+        ensure_column(conn, "processed_updates", "attempts", "INTEGER NOT NULL DEFAULT 1")
+        ensure_column(conn, "processed_updates", "last_error", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "processed_updates", "updated_at", "DATETIME")
+        conn.execute(
+            "UPDATE processed_updates SET updated_at = processed_at WHERE updated_at IS NULL"
+        )
+        conn.execute(
+            "UPDATE broadcast_recipients SET status = 'pending' WHERE status = 'sending'"
+        )
+        conn.execute(
+            "UPDATE pending_broadcasts SET status = 'queued' WHERE status = 'running'"
+        )
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_message_logs_chat_id_id "
+            "ON message_logs(chat_id, id DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_broadcast_recipients_status "
+            "ON broadcast_recipients(broadcast_id, status)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pending_broadcasts_status "
+            "ON pending_broadcasts(status, created_at)"
+        )
+        conn.commit()
+
+
+@contextmanager
+def db_connect() -> Iterator[sqlite3.Connection]:
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def ensure_column(
+    conn: sqlite3.Connection, table: str, column: str, definition: str
+) -> None:
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def db_execute(sql: str, params: tuple[Any, ...] = ()) -> None:
+    with db_connect() as conn:
+        conn.execute(sql, params)
+        conn.commit()
+
+
+def db_fetchone(sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
+    with db_connect() as conn:
+        return conn.execute(sql, params).fetchone()
+
+
+def db_fetchall(sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
+    with db_connect() as conn:
+        return conn.execute(sql, params).fetchall()
+
+
+def claim_update(update_id: int) -> bool:
+    stale_modifier = f"-{UPDATE_PROCESSING_TIMEOUT_SECONDS} seconds"
+    with db_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT status,
+                   CASE
+                       WHEN updated_at < datetime('now', ?) THEN 1
+                       ELSE 0
+                   END AS is_stale
+            FROM processed_updates
+            WHERE update_id = ?
+            """,
+            (stale_modifier, update_id),
+        ).fetchone()
+
+        if row and row["status"] == "done":
+            conn.commit()
+            return False
+        if row and row["status"] == "processing" and not row["is_stale"]:
+            conn.commit()
+            return False
+
+        if row:
+            conn.execute(
+                """
+                UPDATE processed_updates
+                SET status = 'processing',
+                    attempts = attempts + 1,
+                    last_error = '',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE update_id = ?
+                """,
+                (update_id,),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO processed_updates (
+                    update_id, status, attempts, updated_at, processed_at
+                ) VALUES (?, 'processing', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """,
+                (update_id,),
+            )
+        conn.commit()
+        return True
+
+
+def finish_update(update_id: int) -> None:
+    db_execute(
+        """
+        UPDATE processed_updates
+        SET status = 'done', last_error = '',
+            updated_at = CURRENT_TIMESTAMP, processed_at = CURRENT_TIMESTAMP
+        WHERE update_id = ?
+        """,
+        (update_id,),
+    )
+
+
+def fail_update(update_id: int, error: str) -> None:
+    db_execute(
+        """
+        UPDATE processed_updates
+        SET status = 'failed', last_error = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE update_id = ?
+        """,
+        (error[:1000], update_id),
+    )
+
+
+def purge_expired_data() -> None:
+    with db_connect() as conn:
+        if MESSAGE_RETENTION_DAYS > 0:
+            conn.execute(
+                "DELETE FROM message_logs WHERE created_at < datetime('now', ?)",
+                (f"-{MESSAGE_RETENTION_DAYS} days",),
+            )
+        conn.execute(
+            """
+            DELETE FROM processed_updates
+            WHERE status = 'done'
+              AND processed_at < datetime('now', '-7 days')
+            """
+        )
+        conn.execute(
+            """
+            UPDATE pending_broadcasts
+            SET status = 'canceled', completed_at = CURRENT_TIMESTAMP,
+                last_error = 'confirmation expired'
+            WHERE status = 'pending'
+              AND created_at < datetime('now', '-1 day')
+            """
+        )
+        conn.execute(
+            """
+            DELETE FROM broadcast_recipients
+            WHERE broadcast_id IN (
+                SELECT id FROM pending_broadcasts
+                WHERE status IN ('completed', 'canceled')
+                  AND created_at < datetime('now', '-30 days')
+            )
+            """
+        )
+        conn.execute(
+            """
+            DELETE FROM pending_broadcasts
+            WHERE status IN ('completed', 'canceled')
+              AND created_at < datetime('now', '-30 days')
+            """
+        )
+        conn.execute(
+            "DELETE FROM user_rate_limits WHERE window_started_at < ?",
+            (int(time.time()) - 7 * 86400,),
+        )
+        conn.commit()
+
+
+def backup_database() -> Path | None:
+    if not DB_BACKUP_ENABLED or not DB_PATH.exists():
+        return None
+
+    DB_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    backup_path = DB_BACKUP_DIR / f"bot-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db"
+
+    with sqlite3.connect(DB_PATH, timeout=30) as source:
+        with sqlite3.connect(backup_path) as backup:
+            source.backup(backup)
+
+    if DB_BACKUP_KEEP > 0:
+        backups = sorted(DB_BACKUP_DIR.glob("bot-*.db"), key=lambda p: p.stat().st_mtime)
+        for old_backup in backups[:-DB_BACKUP_KEEP]:
+            old_backup.unlink(missing_ok=True)
+
+    return backup_path
+
+
+async def periodic_db_backup() -> None:
+    if not DB_BACKUP_ENABLED:
+        return
+
+    while True:
+        await asyncio.sleep(DB_BACKUP_INTERVAL_SECONDS)
+        try:
+            backup_path = backup_database()
+            purge_expired_data()
+            if backup_path:
+                logger.info("Database backup created: %s", backup_path)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Periodic database backup failed")
+
+
+# =========================
+# Telegram API
+# =========================
+
+TELEGRAM_TEXT_LIMIT = 4096
+
+
+class PlainTextHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+
+def html_to_plain_text(value: str) -> str:
+    parser = PlainTextHTMLParser()
+    parser.feed(value)
+    parser.close()
+    return "".join(parser.parts)
+
+
+def truncate_text(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    if limit <= 1:
+        return value[:limit]
+    return value[: limit - 1] + "…"
+
+
+def escape_html_limited(value: str, limit: int) -> str:
+    escaped = html.escape(value)
+    if len(escaped) <= limit:
+        return escaped
+
+    low = 0
+    high = len(value)
+    while low < high:
+        middle = (low + high + 1) // 2
+        candidate = html.escape(value[:middle]) + "…"
+        if len(candidate) <= limit:
+            low = middle
+        else:
+            high = middle - 1
+    return html.escape(value[:low]) + "…"
+
+
+async def tg(method: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if telegram_client is None:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.post(f"{API_BASE}/{method}", json=payload)
+    else:
+        response = await telegram_client.post(f"{API_BASE}/{method}", json=payload)
+    response.raise_for_status()
+    data = response.json()
+    if not data.get("ok", False):
+        raise RuntimeError(f"Telegram API {method} failed: {data}")
+    return data
+
+
+async def send_message(
+    chat_id: int,
+    text: str,
+    reply_markup: dict[str, Any] | None = None,
+    parse_mode: str | None = "HTML",
+) -> bool:
+    if len(text) > TELEGRAM_TEXT_LIMIT:
+        logger.warning(
+            "Telegram message exceeded limit; falling back to truncated plain text chat_id=%s",
+            chat_id,
+        )
+        text = html_to_plain_text(text) if parse_mode == "HTML" else text
+        text = truncate_text(text, TELEGRAM_TEXT_LIMIT)
+        parse_mode = None
+
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    try:
+        await tg("sendMessage", payload)
+    except Exception as exc:
+        logger.warning("sendMessage failed chat_id=%s error=%s", chat_id, exc)
+        return False
+    return True
+
+
+async def answer_callback_query(callback_query_id: str, text: str = "") -> bool:
+    payload = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = text
+    try:
+        await tg("answerCallbackQuery", payload)
+    except Exception as exc:
+        logger.warning("answerCallbackQuery failed error=%s", exc)
+        return False
+    return True
+
+
+async def copy_message(to_chat_id: int, from_chat_id: int, message_id: int) -> bool:
+    try:
+        await tg(
+            "copyMessage",
+            {
+                "chat_id": to_chat_id,
+                "from_chat_id": from_chat_id,
+                "message_id": message_id,
+            },
+        )
+    except Exception as exc:
+        logger.warning(
+            "copyMessage failed to_chat_id=%s from_chat_id=%s message_id=%s error=%s",
+            to_chat_id,
+            from_chat_id,
+            message_id,
+            exc,
+        )
+        return False
+    return True
+
+
+def inline_keyboard(rows: list[list[tuple[str, str]]]) -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [{"text": text, "callback_data": data} for text, data in row]
+            for row in rows
+        ]
+    }
+
+
+# =========================
+# 用户、历史、黑名单
+# =========================
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+def user_label(user: dict[str, Any]) -> str:
+    username = user.get("username")
+    name = " ".join(
+        x for x in [user.get("first_name"), user.get("last_name")] if x
+    ).strip()
+    if username:
+        return f"@{username}"
+    return name or str(user.get("id"))
+
+
+def message_content(message: dict[str, Any]) -> str:
+    if text := message.get("text"):
+        return text
+    caption = message.get("caption") or ""
+    if "photo" in message:
+        kind = "[图片]"
+        return f"{kind} {caption}".strip()
+    if "document" in message:
+        document = message["document"]
+        filename = document.get("file_name") or "文件"
+        return f"[文件] {filename} {caption}".strip()
+    if "voice" in message:
+        return f"[语音] {caption}".strip()
+    if "video" in message:
+        return f"[视频] {caption}".strip()
+    if "audio" in message:
+        return f"[音频] {caption}".strip()
+    if "video_note" in message:
+        return "[视频消息]"
+    if "sticker" in message:
+        return "[贴纸]"
+    return "[非文本消息]"
+
+
+def can_copy_message(message: dict[str, Any]) -> bool:
+    return "message_id" in message and "chat" in message
+
+
+def is_private_chat_message(message: dict[str, Any]) -> bool:
+    return message.get("chat", {}).get("type") == "private"
+
+
+def is_private_callback(callback: dict[str, Any]) -> bool:
+    message = callback.get("message") or {}
+    chat = message.get("chat") or {}
+    return chat.get("type") == "private"
+
+
+def upsert_user(user: dict[str, Any], text: str) -> None:
+    db_execute(
+        """
+        INSERT INTO users (chat_id, username, first_name, last_name, last_message, updated_at)
+        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(chat_id) DO UPDATE SET
+            username = excluded.username,
+            first_name = excluded.first_name,
+            last_name = excluded.last_name,
+            last_message = excluded.last_message,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            user["id"],
+            user.get("username"),
+            user.get("first_name"),
+            user.get("last_name"),
+            text,
+        ),
+    )
+
+
+def add_message_log(
+    chat_id: int,
+    sender_type: str,
+    sender_id: int,
+    text: str,
+    telegram_message_id: int | None = None,
+) -> None:
+    db_execute(
+        """
+        INSERT INTO message_logs (
+            chat_id, sender_type, sender_id, text, telegram_message_id
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        (chat_id, sender_type, sender_id, text, telegram_message_id),
+    )
+
+
+def update_user_message_log(chat_id: int, message_id: int, text: str) -> bool:
+    with db_connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE message_logs
+            SET text = ?, edited_at = CURRENT_TIMESTAMP
+            WHERE id = (
+                SELECT id FROM message_logs
+                WHERE chat_id = ?
+                  AND sender_type = 'user'
+                  AND telegram_message_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+            )
+            """,
+            (text, chat_id, message_id),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+
+
+def get_history(
+    chat_id: int,
+    limit: int = 5,
+    exclude_message_id: int | None = None,
+) -> list[sqlite3.Row]:
+    if exclude_message_id is None:
+        rows = db_fetchall(
+            """
+            SELECT sender_type, text, edited_at, created_at
+            FROM message_logs
+            WHERE chat_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (chat_id, limit),
+        )
+    else:
+        rows = db_fetchall(
+            """
+            SELECT sender_type, text, edited_at, created_at
+            FROM message_logs
+            WHERE chat_id = ?
+              AND (telegram_message_id IS NULL OR telegram_message_id != ?)
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (chat_id, exclude_message_id, limit),
+        )
+    return rows[::-1]
+
+
+def format_history(
+    chat_id: int,
+    limit: int = 5,
+    exclude_message_id: int | None = None,
+    max_chars: int = 1800,
+) -> str:
+    rows = get_history(chat_id, limit, exclude_message_id)
+    if not rows:
+        return "暂无历史消息"
+
+    lines: list[str] = []
+    used_chars = 0
+    for row in rows:
+        sender = "用户" if row["sender_type"] == "user" else "客服"
+        edited = "（已编辑）" if row["edited_at"] else ""
+        text = escape_html_limited(row["text"], 300)
+        line = f"{row['created_at']} {sender}{edited}：{text}"
+        if lines and used_chars + len(line) + 1 > max_chars:
+            break
+        lines.append(line)
+        used_chars += len(line) + 1
+    return "\n".join(lines)
+
+
+def check_user_rate_limit(chat_id: int) -> tuple[bool, bool, int]:
+    now = int(time.time())
+    with db_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT window_started_at, message_count, blocked_until
+            FROM user_rate_limits
+            WHERE chat_id = ?
+            """,
+            (chat_id,),
+        ).fetchone()
+
+        if not row:
+            conn.execute(
+                """
+                INSERT INTO user_rate_limits (
+                    chat_id, window_started_at, message_count, blocked_until
+                ) VALUES (?, ?, 1, 0)
+                """,
+                (chat_id, now),
+            )
+            conn.commit()
+            return True, False, 0
+
+        blocked_until = int(row["blocked_until"])
+        if blocked_until > now:
+            conn.commit()
+            return False, False, blocked_until - now
+
+        window_started_at = int(row["window_started_at"])
+        if now - window_started_at >= USER_RATE_LIMIT_WINDOW_SECONDS:
+            conn.execute(
+                """
+                UPDATE user_rate_limits
+                SET window_started_at = ?, message_count = 1, blocked_until = 0
+                WHERE chat_id = ?
+                """,
+                (now, chat_id),
+            )
+            conn.commit()
+            return True, False, 0
+
+        message_count = int(row["message_count"]) + 1
+        if message_count > USER_RATE_LIMIT_COUNT:
+            blocked_until = now + USER_RATE_LIMIT_COOLDOWN_SECONDS
+            conn.execute(
+                """
+                UPDATE user_rate_limits
+                SET message_count = ?, blocked_until = ?, last_notified_at = ?
+                WHERE chat_id = ?
+                """,
+                (message_count, blocked_until, now, chat_id),
+            )
+            conn.commit()
+            return False, True, USER_RATE_LIMIT_COOLDOWN_SECONDS
+
+        conn.execute(
+            "UPDATE user_rate_limits SET message_count = ? WHERE chat_id = ?",
+            (message_count, chat_id),
+        )
+        conn.commit()
+        return True, False, 0
+
+
+def is_blacklisted(chat_id: int) -> bool:
+    return db_fetchone(
+        "SELECT chat_id FROM blacklists WHERE chat_id = ?",
+        (chat_id,),
+    ) is not None
+
+
+def blacklist_user(chat_id: int, admin_id: int, reason: str = "") -> None:
+    db_execute(
+        """
+        INSERT INTO blacklists (chat_id, reason, created_by)
+        VALUES (?, ?, ?)
+        ON CONFLICT(chat_id) DO UPDATE SET
+            reason = excluded.reason,
+            created_by = excluded.created_by,
+            created_at = CURRENT_TIMESTAMP
+        """,
+        (chat_id, reason, admin_id),
+    )
+
+
+def unblacklist_user(chat_id: int) -> None:
+    db_execute("DELETE FROM blacklists WHERE chat_id = ?", (chat_id,))
+
+
+def set_admin_state(admin_id: int, target_chat_id: int) -> None:
+    db_execute(
+        """
+        INSERT INTO admin_states (admin_id, target_chat_id, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(admin_id) DO UPDATE SET
+            target_chat_id = excluded.target_chat_id,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (admin_id, target_chat_id),
+    )
+
+
+def get_admin_state(admin_id: int) -> int | None:
+    row = db_fetchone(
+        "SELECT target_chat_id FROM admin_states WHERE admin_id = ?",
+        (admin_id,),
+    )
+    return int(row["target_chat_id"]) if row else None
+
+
+def clear_admin_state(
+    admin_id: int, expected_target_chat_id: int | None = None
+) -> int | None:
+    target_chat_id = get_admin_state(admin_id)
+    if (
+        expected_target_chat_id is not None
+        and target_chat_id != expected_target_chat_id
+    ):
+        return None
+    db_execute("DELETE FROM admin_states WHERE admin_id = ?", (admin_id,))
+    return target_chat_id
+
+
+def clear_admin_states_for_target(chat_id: int) -> None:
+    db_execute("DELETE FROM admin_states WHERE target_chat_id = ?", (chat_id,))
+
+
+def ensure_open_conversation(chat_id: int) -> None:
+    db_execute(
+        """
+        INSERT INTO conversations (chat_id, status, updated_at)
+        VALUES (?, 'open', CURRENT_TIMESTAMP)
+        ON CONFLICT(chat_id) DO UPDATE SET
+            status = 'open',
+            updated_at = CURRENT_TIMESTAMP,
+            closed_at = NULL
+        """,
+        (chat_id,),
+    )
+
+
+def get_conversation(chat_id: int) -> sqlite3.Row | None:
+    return db_fetchone(
+        """
+        SELECT chat_id, owner_admin_id, status, updated_at, closed_at
+        FROM conversations
+        WHERE chat_id = ?
+        """,
+        (chat_id,),
+    )
+
+
+def get_conversation_owner(chat_id: int) -> int | None:
+    row = get_conversation(chat_id)
+    if not row or row["status"] != "open" or row["owner_admin_id"] is None:
+        return None
+    return int(row["owner_admin_id"])
+
+
+def claim_conversation(chat_id: int, admin_id: int) -> None:
+    with db_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "DELETE FROM admin_states WHERE target_chat_id = ? AND admin_id != ?",
+            (chat_id, admin_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO conversations (chat_id, owner_admin_id, status, updated_at)
+            VALUES (?, ?, 'open', CURRENT_TIMESTAMP)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                owner_admin_id = excluded.owner_admin_id,
+                status = 'open',
+                updated_at = CURRENT_TIMESTAMP,
+                closed_at = NULL
+            """,
+            (chat_id, admin_id),
+        )
+        conn.commit()
+
+
+def close_conversation(chat_id: int) -> None:
+    db_execute(
+        """
+        INSERT INTO conversations (chat_id, owner_admin_id, status, updated_at, closed_at)
+        VALUES (?, NULL, 'closed', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(chat_id) DO UPDATE SET
+            owner_admin_id = NULL,
+            status = 'closed',
+            updated_at = CURRENT_TIMESTAMP,
+            closed_at = CURRENT_TIMESTAMP
+        """,
+        (chat_id,),
+    )
+    clear_admin_states_for_target(chat_id)
+
+
+def create_pending_broadcast(admin_id: int, content: str) -> str:
+    broadcast_id = uuid.uuid4().hex[:12]
+    db_execute(
+        """
+        INSERT INTO pending_broadcasts (id, admin_id, content, status)
+        VALUES (?, ?, ?, 'pending')
+        """,
+        (broadcast_id, admin_id, content),
+    )
+    return broadcast_id
+
+
+def queue_broadcast(broadcast_id: str, admin_id: int) -> tuple[str, int]:
+    with db_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        broadcast = conn.execute(
+            "SELECT admin_id, status FROM pending_broadcasts WHERE id = ?",
+            (broadcast_id,),
+        ).fetchone()
+        if not broadcast:
+            conn.commit()
+            return "missing", 0
+        if int(broadcast["admin_id"]) != admin_id:
+            conn.commit()
+            return "forbidden", 0
+        if broadcast["status"] != "pending":
+            conn.commit()
+            return str(broadcast["status"]), 0
+
+        recipients = conn.execute(
+            """
+            SELECT u.chat_id
+            FROM users u
+            LEFT JOIN blacklists b ON b.chat_id = u.chat_id
+            WHERE b.chat_id IS NULL
+            ORDER BY u.updated_at DESC
+            """
+        ).fetchall()
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO broadcast_recipients (
+                broadcast_id, chat_id, status
+            ) VALUES (?, ?, 'pending')
+            """,
+            [(broadcast_id, int(row["chat_id"])) for row in recipients],
+        )
+        total = len(recipients)
+        conn.execute(
+            """
+            UPDATE pending_broadcasts
+            SET status = 'queued', total_count = ?, sent_count = 0,
+                failed_count = 0, confirmed_at = CURRENT_TIMESTAMP,
+                last_error = ''
+            WHERE id = ?
+            """,
+            (total, broadcast_id),
+        )
+        conn.commit()
+        return "queued", total
+
+
+def cancel_pending_broadcast(broadcast_id: str, admin_id: int) -> str:
+    with db_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        broadcast = conn.execute(
+            "SELECT admin_id, status FROM pending_broadcasts WHERE id = ?",
+            (broadcast_id,),
+        ).fetchone()
+        if not broadcast:
+            conn.commit()
+            return "missing"
+        if int(broadcast["admin_id"]) != admin_id:
+            conn.commit()
+            return "forbidden"
+        if broadcast["status"] != "pending":
+            conn.commit()
+            return str(broadcast["status"])
+        conn.execute(
+            """
+            UPDATE pending_broadcasts
+            SET status = 'canceled', completed_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (broadcast_id,),
+        )
+        conn.commit()
+        return "canceled"
+
+
+def claim_next_broadcast_job() -> sqlite3.Row | None:
+    with db_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        job = conn.execute(
+            """
+            SELECT id, admin_id, content
+            FROM pending_broadcasts
+            WHERE status IN ('queued', 'running')
+            ORDER BY confirmed_at, created_at
+            LIMIT 1
+            """
+        ).fetchone()
+        if job:
+            conn.execute(
+                """
+                UPDATE pending_broadcasts
+                SET status = 'running',
+                    started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+                    last_error = ''
+                WHERE id = ?
+                """,
+                (job["id"],),
+            )
+        conn.commit()
+        return job
+
+
+def claim_next_broadcast_recipient(broadcast_id: str) -> int | None:
+    with db_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        recipient = conn.execute(
+            """
+            SELECT chat_id
+            FROM broadcast_recipients
+            WHERE broadcast_id = ? AND status = 'pending'
+            ORDER BY chat_id
+            LIMIT 1
+            """,
+            (broadcast_id,),
+        ).fetchone()
+        if not recipient:
+            conn.commit()
+            return None
+        chat_id = int(recipient["chat_id"])
+        conn.execute(
+            """
+            UPDATE broadcast_recipients
+            SET status = 'sending', attempts = attempts + 1,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE broadcast_id = ? AND chat_id = ?
+            """,
+            (broadcast_id, chat_id),
+        )
+        conn.commit()
+        return chat_id
+
+
+def finish_broadcast_recipient(
+    broadcast_id: str, chat_id: int, sent: bool, error: str = ""
+) -> None:
+    recipient_status = "sent" if sent else "failed"
+    counter = "sent_count" if sent else "failed_count"
+    with db_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            UPDATE broadcast_recipients
+            SET status = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE broadcast_id = ? AND chat_id = ?
+            """,
+            (recipient_status, error[:500], broadcast_id, chat_id),
+        )
+        conn.execute(
+            f"UPDATE pending_broadcasts SET {counter} = {counter} + 1 WHERE id = ?",
+            (broadcast_id,),
+        )
+        conn.commit()
+
+
+def complete_broadcast(broadcast_id: str) -> sqlite3.Row | None:
+    with db_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        remaining = conn.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM broadcast_recipients
+            WHERE broadcast_id = ? AND status IN ('pending', 'sending')
+            """,
+            (broadcast_id,),
+        ).fetchone()
+        if remaining and int(remaining["total"]) > 0:
+            conn.commit()
+            return None
+        conn.execute(
+            """
+            UPDATE pending_broadcasts
+            SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (broadcast_id,),
+        )
+        result = conn.execute(
+            """
+            SELECT admin_id, total_count, sent_count, failed_count
+            FROM pending_broadcasts
+            WHERE id = ?
+            """,
+            (broadcast_id,),
+        ).fetchone()
+        conn.commit()
+        return result
+
+
+def recover_broadcast_job(broadcast_id: str, error: str) -> None:
+    with db_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            UPDATE broadcast_recipients
+            SET status = 'pending', updated_at = CURRENT_TIMESTAMP
+            WHERE broadcast_id = ? AND status = 'sending'
+            """,
+            (broadcast_id,),
+        )
+        conn.execute(
+            """
+            UPDATE pending_broadcasts
+            SET status = 'queued', last_error = ?
+            WHERE id = ? AND status = 'running'
+            """,
+            (error[:1000], broadcast_id),
+        )
+        conn.commit()
+
+
+def active_user_count() -> int:
+    row = db_fetchone(
+        """
+        SELECT COUNT(*) AS total
+        FROM users u
+        LEFT JOIN blacklists b ON b.chat_id = u.chat_id
+        WHERE b.chat_id IS NULL
+        """
+    )
+    return int(row["total"]) if row else 0
+
+
+async def process_broadcast_job(job: sqlite3.Row) -> None:
+    broadcast_id = str(job["id"])
+    content = str(job["content"])
+
+    while True:
+        chat_id = claim_next_broadcast_recipient(broadcast_id)
+        if chat_id is None:
+            result = complete_broadcast(broadcast_id)
+            if result:
+                await send_message(
+                    int(result["admin_id"]),
+                    "群发完成\n\n"
+                    f"总计：{result['total_count']}\n"
+                    f"成功：{result['sent_count']}\n"
+                    f"失败：{result['failed_count']}",
+                )
+            return
+
+        if is_blacklisted(chat_id):
+            finish_broadcast_recipient(
+                broadcast_id, chat_id, False, "user is blacklisted"
+            )
+            continue
+
+        sent = False
+        for attempt in range(2):
+            if await send_message(chat_id, content, parse_mode=None):
+                sent = True
+                break
+            if attempt == 0:
+                await asyncio.sleep(1)
+        finish_broadcast_recipient(
+            broadcast_id,
+            chat_id,
+            sent,
+            "Telegram send failed" if not sent else "",
+        )
+        if BROADCAST_SEND_DELAY_SECONDS:
+            await asyncio.sleep(BROADCAST_SEND_DELAY_SECONDS)
+
+
+async def periodic_broadcast_worker() -> None:
+    while True:
+        job: sqlite3.Row | None = None
+        try:
+            job = claim_next_broadcast_job()
+            if job:
+                await process_broadcast_job(job)
+                continue
+
+            if broadcast_wakeup is None:
+                await asyncio.sleep(2)
+                continue
+            broadcast_wakeup.clear()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(broadcast_wakeup.wait(), timeout=5)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Broadcast worker failed")
+            if job:
+                recover_broadcast_job(str(job["id"]), str(exc))
+            await asyncio.sleep(2)
+
+
+def admin_user_keyboard(chat_id: int, viewer_admin_id: int | None = None) -> dict[str, Any]:
+    owner_admin_id = get_conversation_owner(chat_id)
+    if owner_admin_id and viewer_admin_id and owner_admin_id != viewer_admin_id:
+        reply_button = ("接管会话", f"takeover:{chat_id}")
+    else:
+        reply_button = ("回复这个用户", f"reply:{chat_id}")
+
+    if is_blacklisted(chat_id):
+        block_button = ("解除黑名单", f"unblacklist:{chat_id}")
+    else:
+        block_button = ("加入黑名单", f"blacklist:{chat_id}")
+    return inline_keyboard(
+        [
+            [reply_button, ("用户详情", f"detail:{chat_id}")],
+            [("关闭会话", f"close:{chat_id}")],
+            [block_button],
+        ]
+    )
+
+
+def exit_reply_keyboard(chat_id: int) -> dict[str, Any]:
+    return inline_keyboard(
+        [
+            [("退出回复", f"cancel:{chat_id}")],
+            [("用户详情", f"detail:{chat_id}"), ("关闭会话", f"close:{chat_id}")],
+        ]
+    )
+
+
+def welcome_keyboard() -> dict[str, Any]:
+    return inline_keyboard(
+        [
+            [("联系人工客服", "user_help")],
+            [("使用说明", "user_guide")],
+        ]
+    )
+
+
+# =========================
+# 业务逻辑
+# =========================
+
+async def notify_admins(
+    user: dict[str, Any],
+    text: str,
+    source_message: dict[str, Any] | None = None,
+    title: str = "收到用户消息",
+    exclude_message_id: int | None = None,
+) -> None:
+    chat_id = int(user["id"])
+    history = format_history(
+        chat_id,
+        limit=6,
+        exclude_message_id=exclude_message_id,
+        max_chars=1800,
+    )
+    owner_admin_id = get_conversation_owner(chat_id)
+    owner_line = (
+        f"当前接管：<code>{owner_admin_id}</code>\n" if owner_admin_id else "当前接管：无人\n"
+    )
+    msg = (
+        f"{html.escape(title)}\n\n"
+        f"用户ID：<code>{chat_id}</code>\n"
+        f"用户：{escape_html_limited(user_label(user), 100)}\n"
+        f"{owner_line}"
+        f"内容：{escape_html_limited(text, 1200)}\n\n"
+        "此前历史：\n"
+        f"{history}"
+    )
+
+    for admin_id in ADMIN_IDS:
+        notification_sent = await send_message(
+            admin_id,
+            msg,
+            reply_markup=admin_user_keyboard(chat_id, viewer_admin_id=admin_id),
+        )
+        if notification_sent and source_message and can_copy_message(source_message):
+            if source_message.get("text") is None:
+                await copy_message(
+                    admin_id,
+                    int(source_message["chat"]["id"]),
+                    int(source_message["message_id"]),
+                )
+
+
+async def send_welcome(chat_id: int) -> None:
+    await send_message(
+        chat_id,
+        "你好，这里是人工客服入口。\n\n"
+        "你可以直接发送文字说明问题，我会收到并尽快回复你。",
+        reply_markup=welcome_keyboard(),
+    )
+
+
+async def handle_user_message(message: dict[str, Any]) -> None:
+    user = message["from"]
+    chat_id = int(message["chat"]["id"])
+    text = message_content(message)
+    message_id = int(message["message_id"])
+
+    upsert_user(user, text)
+
+    if is_blacklisted(chat_id):
+        allowed, _, _ = check_user_rate_limit(chat_id)
+        if allowed:
+            add_message_log(
+                chat_id,
+                "user",
+                chat_id,
+                f"[黑名单拦截] {text}",
+                telegram_message_id=message_id,
+            )
+        return
+
+    if text == "/start":
+        await send_welcome(chat_id)
+        return
+
+    allowed, should_notify, retry_after = check_user_rate_limit(chat_id)
+    if not allowed:
+        if should_notify:
+            add_message_log(
+                chat_id,
+                "user",
+                chat_id,
+                f"[频率限制] {text}",
+                telegram_message_id=message_id,
+            )
+            await send_message(
+                chat_id,
+                f"发送得太快了，请等待约 {retry_after} 秒后再试。",
+                parse_mode=None,
+            )
+        return
+
+    ensure_open_conversation(chat_id)
+    add_message_log(
+        chat_id,
+        "user",
+        chat_id,
+        text,
+        telegram_message_id=message_id,
+    )
+    await send_message(chat_id, "已收到，我会尽快回复你。")
+    await notify_admins(
+        user,
+        text,
+        source_message=message,
+        exclude_message_id=message_id,
+    )
+
+
+async def handle_user_edited_message(message: dict[str, Any]) -> None:
+    user = message["from"]
+    chat_id = int(message["chat"]["id"])
+    message_id = int(message["message_id"])
+    text = message_content(message)
+
+    upsert_user(user, text)
+    if is_blacklisted(chat_id) or text == "/start":
+        return
+
+    allowed, should_notify, retry_after = check_user_rate_limit(chat_id)
+    if not allowed:
+        if should_notify:
+            await send_message(
+                chat_id,
+                f"修改得太频繁了，请等待约 {retry_after} 秒后再试。",
+                parse_mode=None,
+            )
+        return
+
+    ensure_open_conversation(chat_id)
+    if not update_user_message_log(chat_id, message_id, text):
+        add_message_log(
+            chat_id,
+            "user",
+            chat_id,
+            text,
+            telegram_message_id=message_id,
+        )
+    await notify_admins(
+        user,
+        text,
+        source_message=message,
+        title="用户修改了消息",
+        exclude_message_id=message_id,
+    )
+
+
+async def handle_admin_command(admin_id: int, text: str) -> bool:
+    if not is_admin(admin_id):
+        return False
+
+    if text == "/myid":
+        await send_message(admin_id, f"你的 Telegram 数字 ID：<code>{admin_id}</code>")
+        return True
+
+    if text == "/cancel":
+        target_chat_id = clear_admin_state(admin_id)
+        if target_chat_id:
+            await send_message(
+                admin_id,
+                "已退出持续回复模式。",
+                reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
+            )
+        else:
+            await send_message(admin_id, "你当前不在持续回复模式。")
+        return True
+
+    if text == "/users":
+        rows = db_fetchall(
+            """
+            SELECT u.chat_id, u.username, u.first_name, u.last_name, u.last_message,
+                   u.updated_at, b.chat_id AS blocked
+            FROM users u
+            LEFT JOIN blacklists b ON b.chat_id = u.chat_id
+            ORDER BY u.updated_at DESC
+            LIMIT 20
+            """
+        )
+        if not rows:
+            await send_message(admin_id, "暂无用户记录。")
+            return True
+
+        lines = ["最近用户："]
+        for row in rows:
+            name = row["username"] or " ".join(
+                x for x in [row["first_name"], row["last_name"]] if x
+            ).strip() or "-"
+            blocked = " [黑名单]" if row["blocked"] else ""
+            lines.append(
+                f"<code>{row['chat_id']}</code>{blocked} {escape_html_limited(name, 100)}："
+                f"{escape_html_limited(row['last_message'] or '', 100)}"
+            )
+        await send_message(admin_id, "\n".join(lines))
+        return True
+
+    if text.startswith("/reply ") or text.startswith("/send "):
+        parts = text.split(maxsplit=2)
+        if len(parts) < 3 or not parts[1].lstrip("-").isdigit():
+            await send_message(admin_id, "格式：/reply 用户ID 内容")
+            return True
+        target_chat_id = int(parts[1])
+        content = parts[2]
+        if is_blacklisted(target_chat_id):
+            await send_message(admin_id, "这个用户在黑名单中，请先解除黑名单。")
+            return True
+        owner_admin_id = get_conversation_owner(target_chat_id)
+        if owner_admin_id and owner_admin_id != admin_id:
+            await send_message(
+                admin_id,
+                f"这个会话当前由 <code>{owner_admin_id}</code> 接管。请先接管后再发送。",
+                reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
+            )
+            return True
+        claim_conversation(target_chat_id, admin_id)
+        if not await send_message(target_chat_id, content, parse_mode=None):
+            await send_message(admin_id, "发送失败：用户可能已屏蔽 Bot 或 Telegram API 暂时不可用。")
+            return True
+        add_message_log(target_chat_id, "admin", admin_id, content)
+        await send_message(
+            admin_id,
+            "已发送。",
+            reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
+        )
+        return True
+
+    if text.startswith("/broadcast "):
+        content = text[len("/broadcast ") :].strip()
+        if not content:
+            await send_message(admin_id, "格式：/broadcast 内容")
+            return True
+        if len(content) > TELEGRAM_TEXT_LIMIT:
+            await send_message(admin_id, "群发内容不能超过 4096 个字符。")
+            return True
+        broadcast_id = create_pending_broadcast(admin_id, content)
+        total = active_user_count()
+        await send_message(
+            admin_id,
+            "请确认群发\n\n"
+            f"预计接收用户：{total}\n"
+            f"内容：{html.escape(content[:800])}",
+            reply_markup=inline_keyboard(
+                [
+                    [("确认群发", f"broadcast_confirm:{broadcast_id}")],
+                    [("取消群发", f"broadcast_cancel:{broadcast_id}")],
+                ]
+            ),
+        )
+        return True
+
+    if text == "/broadcast_status":
+        rows = db_fetchall(
+            """
+            SELECT id, status, total_count, sent_count, failed_count, created_at
+            FROM pending_broadcasts
+            WHERE admin_id = ?
+            ORDER BY created_at DESC
+            LIMIT 5
+            """,
+            (admin_id,),
+        )
+        if not rows:
+            await send_message(admin_id, "暂无群发记录。")
+            return True
+        lines = ["最近群发："]
+        for row in rows:
+            lines.append(
+                f"<code>{row['id']}</code> {html.escape(str(row['status']))} "
+                f"{row['sent_count']}/{row['total_count']}，失败 {row['failed_count']}"
+            )
+        await send_message(admin_id, "\n".join(lines))
+        return True
+
+    if text.startswith("/takeover "):
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+            await send_message(admin_id, "格式：/takeover 用户ID")
+            return True
+        target_chat_id = int(parts[1])
+        claim_conversation(target_chat_id, admin_id)
+        set_admin_state(admin_id, target_chat_id)
+        await send_message(
+            admin_id,
+            f"已接管会话：<code>{target_chat_id}</code>",
+            reply_markup=exit_reply_keyboard(target_chat_id),
+        )
+        return True
+
+    if text.startswith("/close "):
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+            await send_message(admin_id, "格式：/close 用户ID")
+            return True
+        target_chat_id = int(parts[1])
+        close_conversation(target_chat_id)
+        await send_message(
+            admin_id,
+            f"已关闭会话：<code>{target_chat_id}</code>",
+            reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
+        )
+        return True
+
+    if text.startswith("/blacklist "):
+        parts = text.split(maxsplit=2)
+        if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+            await send_message(admin_id, "格式：/blacklist 用户ID 可选原因")
+            return True
+        reason = parts[2] if len(parts) >= 3 else ""
+        target_chat_id = int(parts[1])
+        blacklist_user(target_chat_id, admin_id, reason)
+        close_conversation(target_chat_id)
+        await send_message(admin_id, "已加入黑名单。")
+        return True
+
+    if text.startswith("/unblacklist "):
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+            await send_message(admin_id, "格式：/unblacklist 用户ID")
+            return True
+        unblacklist_user(int(parts[1]))
+        await send_message(admin_id, "已解除黑名单。")
+        return True
+
+    if text == "/blacklist_list":
+        rows = db_fetchall(
+            """
+            SELECT chat_id, reason, created_at
+            FROM blacklists
+            ORDER BY created_at DESC
+            LIMIT 20
+            """
+        )
+        if not rows:
+            await send_message(admin_id, "黑名单为空。")
+            return True
+        lines = ["黑名单："]
+        for row in rows:
+            lines.append(
+                f"<code>{row['chat_id']}</code> "
+                f"{html.escape(truncate_text(row['reason'] or '', 80))} {row['created_at']}"
+            )
+        await send_message(admin_id, "\n".join(lines))
+        return True
+
+    return False
+
+
+async def handle_admin_message(message: dict[str, Any]) -> None:
+    admin_id = int(message["from"]["id"])
+    if not is_admin(admin_id):
+        return
+
+    text = message.get("text") or message.get("caption") or ""
+    content = message_content(message)
+
+    if await handle_admin_command(admin_id, text):
+        return
+
+    if text.startswith("/"):
+        await send_message(admin_id, "未知管理员命令，请检查命令格式。")
+        return
+
+    target_chat_id = get_admin_state(admin_id)
+    if not target_chat_id:
+        await send_message(admin_id, "请先点击“回复这个用户”，或使用 /reply 用户ID 内容。")
+        return
+
+    if is_blacklisted(target_chat_id):
+        await send_message(
+            admin_id,
+            "这个用户在黑名单中。请先解除黑名单后再回复。",
+            reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
+        )
+        return
+
+    conversation = get_conversation(target_chat_id)
+    if conversation and conversation["status"] == "closed":
+        await send_message(
+            admin_id,
+            "这个会话已经关闭。如需继续，请先接管会话。",
+            reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
+        )
+        return
+
+    owner_admin_id = get_conversation_owner(target_chat_id)
+    if owner_admin_id and owner_admin_id != admin_id:
+        await send_message(
+            admin_id,
+            f"这个会话当前由 <code>{owner_admin_id}</code> 接管。点击接管后再回复。",
+            reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
+        )
+        return
+
+    if not owner_admin_id:
+        claim_conversation(target_chat_id, admin_id)
+
+    if not await copy_message(
+        target_chat_id,
+        int(message["chat"]["id"]),
+        int(message["message_id"]),
+    ):
+        await send_message(admin_id, "发送失败：用户可能已屏蔽 Bot 或 Telegram API 暂时不可用。")
+        return
+    add_message_log(target_chat_id, "admin", admin_id, content)
+    await send_message(
+        admin_id,
+        "已发送。继续输入可持续回复，或点击退出。",
+        reply_markup=exit_reply_keyboard(target_chat_id),
+    )
+
+
+async def handle_callback(callback: dict[str, Any]) -> None:
+    callback_id = callback["id"]
+    from_user = callback["from"]
+    admin_id = int(from_user["id"])
+    data = callback.get("data", "")
+
+    if not is_private_callback(callback):
+        await answer_callback_query(callback_id, "请在私聊中使用")
+        return
+
+    if data in {"user_help", "user_guide"}:
+        chat_id = int(callback["message"]["chat"]["id"])
+        if is_blacklisted(chat_id):
+            await answer_callback_query(callback_id, "当前不可用")
+            return
+        await answer_callback_query(callback_id)
+        if data == "user_help":
+            text = "直接发送你的问题即可，我会看到并回复你。"
+        else:
+            text = "支持文字、图片、文件和语音。发送后请等待客服回复。"
+        await send_message(chat_id, text)
+        return
+
+    if not is_admin(admin_id):
+        await answer_callback_query(callback_id, "无权限")
+        return
+
+    if ":" not in data:
+        await answer_callback_query(callback_id)
+        return
+
+    action, raw_chat_id = data.split(":", 1)
+    if action in {"broadcast_confirm", "broadcast_cancel"}:
+        if action == "broadcast_cancel":
+            status = cancel_pending_broadcast(raw_chat_id, admin_id)
+            if status == "canceled":
+                await answer_callback_query(callback_id, "已取消")
+                await send_message(admin_id, "已取消群发。")
+            elif status == "forbidden":
+                await answer_callback_query(callback_id, "只能由创建者取消")
+            elif status == "missing":
+                await answer_callback_query(callback_id, "群发不存在")
+            else:
+                await answer_callback_query(callback_id, "群发已开始，无法取消")
+            return
+
+        status, total = queue_broadcast(raw_chat_id, admin_id)
+        if status == "queued":
+            if broadcast_wakeup:
+                broadcast_wakeup.set()
+            await answer_callback_query(callback_id, "已加入发送队列")
+            await send_message(
+                admin_id,
+                f"群发任务已加入队列，接收用户 {total}。\n"
+                "完成后会自动通知；可用 /broadcast_status 查看进度。",
+            )
+        elif status == "forbidden":
+            await answer_callback_query(callback_id, "只能由创建者确认")
+        elif status == "missing":
+            await answer_callback_query(callback_id, "群发不存在")
+        else:
+            await answer_callback_query(callback_id, "群发已处理")
+        return
+
+    if not raw_chat_id.lstrip("-").isdigit():
+        await answer_callback_query(callback_id)
+        return
+
+    target_chat_id = int(raw_chat_id)
+
+    if action == "reply":
+        owner_admin_id = get_conversation_owner(target_chat_id)
+        if owner_admin_id and owner_admin_id != admin_id:
+            await answer_callback_query(callback_id, "会话已被其他管理员接管")
+            await send_message(
+                admin_id,
+                f"这个会话当前由 <code>{owner_admin_id}</code> 接管。需要回复的话请先接管。",
+                reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
+            )
+            return
+        claim_conversation(target_chat_id, admin_id)
+        set_admin_state(admin_id, target_chat_id)
+        await answer_callback_query(callback_id, "已进入回复模式")
+        await send_message(
+            admin_id,
+            f"已进入持续回复模式。\n目标用户：<code>{target_chat_id}</code>\n\n"
+            "你现在发送普通消息，会自动转发给该用户。",
+            reply_markup=exit_reply_keyboard(target_chat_id),
+        )
+        return
+
+    if action == "cancel":
+        cleared_target = clear_admin_state(
+            admin_id, expected_target_chat_id=target_chat_id
+        )
+        if cleared_target is None:
+            await answer_callback_query(callback_id, "这不是当前回复会话")
+        else:
+            await answer_callback_query(callback_id, "已退出")
+            await send_message(
+                admin_id,
+                "已退出持续回复模式。",
+                reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
+            )
+        return
+
+    if action == "takeover":
+        claim_conversation(target_chat_id, admin_id)
+        set_admin_state(admin_id, target_chat_id)
+        await answer_callback_query(callback_id, "已接管")
+        await send_message(
+            admin_id,
+            f"已接管会话：<code>{target_chat_id}</code>\n\n"
+            "你现在发送普通消息，会自动转发给该用户。",
+            reply_markup=exit_reply_keyboard(target_chat_id),
+        )
+        return
+
+    if action == "close":
+        close_conversation(target_chat_id)
+        await answer_callback_query(callback_id, "已关闭")
+        await send_message(
+            admin_id,
+            f"已关闭会话：<code>{target_chat_id}</code>",
+            reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
+        )
+        return
+
+    if action == "detail":
+        user = db_fetchone("SELECT * FROM users WHERE chat_id = ?", (target_chat_id,))
+        history = format_history(target_chat_id, limit=10)
+        blocked = "是" if is_blacklisted(target_chat_id) else "否"
+        conversation = get_conversation(target_chat_id)
+        if conversation:
+            owner = conversation["owner_admin_id"] or "无人"
+            session_status = f"{conversation['status']} / 接管：{owner}"
+        else:
+            session_status = "open / 接管：无人"
+        if user:
+            name = user["username"] or " ".join(
+                x for x in [user["first_name"], user["last_name"]] if x
+            ).strip() or "-"
+            text = (
+                "用户详情\n\n"
+                f"用户ID：<code>{target_chat_id}</code>\n"
+                f"用户：{html.escape(name)}\n"
+                f"黑名单：{blocked}\n"
+                f"会话：{html.escape(str(session_status))}\n"
+                f"最近更新：{user['updated_at']}\n\n"
+                "最近历史：\n"
+                f"{history}"
+            )
+        else:
+            text = f"未找到用户：<code>{target_chat_id}</code>"
+        await answer_callback_query(callback_id)
+        await send_message(
+            admin_id,
+            text,
+            reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
+        )
+        return
+
+    if action == "blacklist":
+        blacklist_user(target_chat_id, admin_id, "管理员按钮添加")
+        close_conversation(target_chat_id)
+        await answer_callback_query(callback_id, "已加入黑名单")
+        await send_message(
+            admin_id,
+            f"已将 <code>{target_chat_id}</code> 加入黑名单。",
+            reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
+        )
+        return
+
+    if action == "unblacklist":
+        unblacklist_user(target_chat_id)
+        await answer_callback_query(callback_id, "已解除黑名单")
+        await send_message(
+            admin_id,
+            f"已解除 <code>{target_chat_id}</code> 的黑名单。",
+            reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
+        )
+        return
+
+    await answer_callback_query(callback_id)
+
+
+@app.get("/healthz")
+async def healthz() -> dict[str, str | bool]:
+    try:
+        db_fetchone("SELECT 1 AS ok")
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="db unavailable") from exc
+    if broadcast_worker_task is None or broadcast_worker_task.done():
+        raise HTTPException(status_code=503, detail="broadcast worker unavailable")
+    return {"ok": True, "db": "ok", "broadcast_worker": "ok"}
+
+
+@app.post("/tg/webhook")
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: str | None = Header(default=None),
+) -> dict[str, bool]:
+    if (
+        x_telegram_bot_api_secret_token is None
+        or not hmac.compare_digest(x_telegram_bot_api_secret_token, WEBHOOK_SECRET)
+    ):
+        raise HTTPException(status_code=403, detail="invalid secret token")
+
+    update = await request.json()
+    if not isinstance(update, dict):
+        raise HTTPException(status_code=400, detail="invalid update")
+
+    update_id = update.get("update_id")
+    claimed = False
+    if isinstance(update_id, int):
+        if not claim_update(update_id):
+            return {"ok": True}
+        claimed = True
+
+    try:
+        if "callback_query" in update:
+            await handle_callback(update["callback_query"])
+        else:
+            edited = "edited_message" in update
+            message = update.get("edited_message") if edited else update.get("message")
+            if message and "from" in message and is_private_chat_message(message):
+                from_id = int(message["from"]["id"])
+                if is_admin(from_id):
+                    if not edited:
+                        await handle_admin_message(message)
+                elif edited:
+                    await handle_user_edited_message(message)
+                else:
+                    await handle_user_message(message)
+
+        if claimed:
+            finish_update(update_id)
+        return {"ok": True}
+    except Exception as exc:
+        if claimed:
+            with contextlib.suppress(Exception):
+                fail_update(update_id, str(exc))
+        logger.exception("Webhook update processing failed update_id=%s", update_id)
+        raise HTTPException(status_code=500, detail="update processing failed") from exc

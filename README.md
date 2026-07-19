@@ -1,0 +1,264 @@
+# Telegram 双向客服 Bot
+
+这是一个基于 FastAPI、Telegram Webhook 和 SQLite 的双向客服 Bot。用户在 Telegram 私聊 Bot，管理员会收到带历史记录的通知，并可接管会话持续回复。
+
+当前版本不包含广告或 AI 内容审核。垃圾消息通过发送频率限制和管理员手动黑名单处理，避免自动审核误伤正常用户。
+
+## 主要功能
+
+### 用户侧
+
+- `/start` 欢迎界面
+- 支持文字、图片、文件、语音、视频等消息
+- 消息送达确认
+- 编辑消息会更新原历史记录，并通知管理员“用户修改了消息”
+- 短时间刷屏会进入临时冷却，但不会自动加入黑名单
+- 只处理 Telegram 私聊，不处理群聊或频道消息
+
+### 管理员侧
+
+- 新消息通知包含用户资料和此前历史，不重复展示当前消息
+- 持续回复模式，支持文字和媒体
+- 多管理员接管与关闭会话
+- 手动加入或解除黑名单
+- 群发二次确认、后台发送、进度记录和服务重启续发
+- Telegram API 失败会写入 systemd 日志
+
+### 可靠性与安全
+
+- 强制校验 `WEBHOOK_SECRET`
+- 所有管理命令和管理按钮均校验 `ADMIN_IDS`
+- Webhook 更新使用 `processing/done/failed` 状态，失败后允许 Telegram 重试
+- Telegram HTTP 连接复用
+- 管理员通知自动控制在 Telegram 消息长度限制内
+- SQLite WAL、自动迁移、在线备份和可选历史数据保留
+- `/healthz` 同时检查数据库和群发后台任务
+- systemd 示例只监听 `127.0.0.1:9000`
+
+## 技术要求
+
+- Debian 或 Ubuntu VPS
+- Python 3.10 或更高版本
+- Nginx
+- systemd
+- 一个已经指向 VPS 的域名
+
+默认示例使用：
+
+```text
+/home/lw/tg-bot
+```
+
+## 从 GitHub 安装
+
+建议先使用私有仓库。VPS 使用只读 Deploy Key 拉取代码，`.env` 和数据库只保存在 VPS。
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git
+
+sudo -u lw git clone git@github.com:OWNER/REPOSITORY.git /home/lw/tg-bot
+cd /home/lw/tg-bot
+
+sudo bash scripts/install.sh
+sudo bash scripts/configure-nginx.sh bot.example.com admin@example.com
+sudo -u lw /home/lw/tg-bot/venv/bin/python scripts/manage_webhook.py
+```
+
+安装脚本会：
+
+- 安装 Python 与虚拟环境组件
+- 创建 `venv`
+- 安装锁定版本的依赖
+- 在首次安装时交互式创建 `.env`
+- 自动生成随机 `WEBHOOK_SECRET`
+- 将 `.env` 权限设置为 `600`
+- 安装并启动 systemd 服务
+- 运行语法检查和单元测试
+- 检查 `/healthz`
+
+`configure-nginx.sh` 会配置 Nginx、申请 HTTPS 证书，并在 HTTPS 生效后设置 Telegram Webhook。
+
+脚本在 GitHub 上没有可执行权限时，可始终使用 `bash scripts/install.sh` 运行。也可以在 VPS 执行：
+
+```bash
+chmod +x scripts/*.sh
+```
+
+## 环境变量
+
+复制参考文件时不要写入真实仓库：
+
+```bash
+cp .env.example .env
+chmod 600 .env
+```
+
+必须配置：
+
+```env
+BOT_TOKEN=BotFather 提供的 Token
+WEBHOOK_SECRET=随机长字符串
+ADMIN_IDS=123456789,987654321
+WEBHOOK_URL=https://bot.example.com/tg/webhook
+```
+
+可选配置：
+
+```env
+DB_BACKUP_ENABLED=true
+DB_BACKUP_INTERVAL_SECONDS=86400
+DB_BACKUP_KEEP=14
+DB_BACKUP_DIR=backups
+
+USER_RATE_LIMIT_COUNT=8
+USER_RATE_LIMIT_WINDOW_SECONDS=60
+USER_RATE_LIMIT_COOLDOWN_SECONDS=300
+MESSAGE_RETENTION_DAYS=180
+
+BROADCAST_SEND_DELAY_SECONDS=0.05
+UPDATE_PROCESSING_TIMEOUT_SECONDS=300
+LOG_LEVEL=INFO
+```
+
+`MESSAGE_RETENTION_DAYS=0` 表示不自动清理历史消息。示例配置使用 `180` 天。
+
+## 管理员命令
+
+```text
+/myid
+/users
+/reply 用户ID 内容
+/send 用户ID 内容
+/broadcast 内容
+/broadcast_status
+/cancel
+/takeover 用户ID
+/close 用户ID
+/blacklist 用户ID 可选原因
+/unblacklist 用户ID
+/blacklist_list
+```
+
+群发流程：
+
+1. 管理员发送 `/broadcast 内容`
+2. Bot 显示预计人数和确认按钮
+3. 管理员确认后任务进入后台队列
+4. Bot 完成后发送成功和失败数量
+5. `/broadcast_status` 可查看最近进度
+
+群发接收人会在确认时生成快照。黑名单用户不会进入快照；发送期间新加入黑名单的用户也不会收到群发。
+
+## 数据库
+
+数据库文件默认为：
+
+```text
+bot.db
+```
+
+主要数据表：
+
+- `users`：用户资料和最近消息
+- `admin_states`：管理员当前回复目标
+- `message_logs`：用户和客服历史消息
+- `blacklists`：手动黑名单
+- `conversations`：会话接管状态
+- `pending_broadcasts`：群发任务状态和统计
+- `broadcast_recipients`：群发接收人及发送结果
+- `processed_updates`：Webhook 幂等和失败重试状态
+- `user_rate_limits`：用户临时频率限制
+
+旧数据库会在启动时自动增加新字段，不需要删除 `bot.db`。
+
+## 备份
+
+Bot 启动时会创建一次 SQLite 在线备份，之后按配置周期备份：
+
+```text
+backups/bot-YYYYMMDD-HHMMSS.db
+```
+
+默认保留最近 14 份。代码更新前，`scripts/update.sh` 也会先备份数据库。
+
+本机备份不能替代异地备份；重要数据应定期同步到另一台机器或对象存储。
+
+## 更新
+
+GitHub 仓库没有本地改动时：
+
+```bash
+cd /home/lw/tg-bot
+sudo bash scripts/update.sh
+```
+
+更新脚本使用 `git pull --ff-only`，遇到本地代码修改会停止，不会强制覆盖。
+
+## Webhook
+
+设置或更新：
+
+```bash
+cd /home/lw/tg-bot
+sudo -u lw ./venv/bin/python scripts/manage_webhook.py
+```
+
+查看当前状态：
+
+```bash
+sudo -u lw ./venv/bin/python scripts/manage_webhook.py --info
+```
+
+允许的 Telegram 更新类型：
+
+```json
+["message", "edited_message", "callback_query"]
+```
+
+## 健康检查
+
+```bash
+curl --fail http://127.0.0.1:9000/healthz
+```
+
+正常返回：
+
+```json
+{"ok":true,"db":"ok","broadcast_worker":"ok"}
+```
+
+Nginx 模板不会把 `/healthz` 暴露到公网。
+
+## 测试
+
+```bash
+cd /home/lw/tg-bot
+./venv/bin/python -m py_compile app.py scripts/manage_webhook.py
+./venv/bin/python -m unittest discover -s tests -v
+```
+
+GitHub Actions 会在 Python 3.10 和 3.12 上自动执行这些检查，不需要生产环境密钥。
+
+## 运维命令
+
+```bash
+sudo systemctl status tg-bot --no-pager
+sudo systemctl restart tg-bot
+journalctl -u tg-bot -n 100 --no-pager
+journalctl -u tg-bot -f
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+## GitHub 安全检查
+
+以下内容绝不能提交：
+
+- `.env` 或其他真实环境配置
+- `bot.db`、`bot.db-wal`、`bot.db-shm`
+- `backups/`
+- `venv/` 或 `.venv/`
+- 日志文件
+
+当前 `.gitignore` 已覆盖这些文件。公开仓库前还应选择许可证，并把文档中的真实域名替换为示例域名。
