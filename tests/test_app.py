@@ -180,8 +180,11 @@ class BotDatabaseTests(unittest.TestCase):
             app.normalize_command_text("/reply@ExampleBot 123 hello"),
             "/reply 123 hello",
         )
-        self.assertNotIn("人工客服入口", app.WELCOME_TEXT)
-        self.assertIn("无需私聊其他账号", app.WELCOME_TEXT)
+        self.assertEqual(
+            app.WELCOME_TEXT,
+            "你好，这里是统一留言聊天入口。\n\n"
+            "请直接在这里发送消息，我看到后会通过 Bot 回复你。",
+        )
 
     def test_webhook_secret_health_and_update_retry_state(self) -> None:
         headers = {"X-Telegram-Bot-Api-Secret-Token": "test-secret"}

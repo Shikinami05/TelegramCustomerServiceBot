@@ -124,8 +124,8 @@ async def lifespan(_: FastAPI):
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
 
 WELCOME_TEXT = (
-    "你好，这里是统一留言入口，不是实时人工客服。\n\n"
-    "请直接在这里发送消息，无需私聊其他账号；我看到后会通过 Bot 回复你。"
+    "你好，这里是统一留言聊天入口。\n\n"
+    "请直接在这里发送消息，我看到后会通过 Bot 回复你。"
 )
 
 
