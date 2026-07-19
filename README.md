@@ -1,6 +1,6 @@
-# Telegram 双向客服 Bot
+# Telegram 双向留言 Bot
 
-这是一个基于 FastAPI、Telegram Webhook 和 SQLite 的双向客服 Bot。用户在 Telegram 私聊 Bot，管理员会收到带历史记录的通知，并可接管会话持续回复。
+这是一个基于 FastAPI、Telegram Webhook 和 SQLite 的双向留言 Bot。用户通过 Bot 留言，无需直接私聊个人账号；管理员会收到带历史记录的通知，并可接管会话持续回复。
 
 当前版本不包含广告或 AI 内容审核。垃圾消息通过发送频率限制和管理员手动黑名单处理，避免自动审核误伤正常用户。
 
@@ -8,7 +8,7 @@
 
 ### 用户侧
 
-- `/start` 欢迎界面
+- `/start` 留言入口
 - 支持文字、图片、文件、语音、视频等消息
 - 消息送达确认
 - 编辑消息会更新原历史记录，并通知管理员“用户修改了消息”
@@ -23,6 +23,8 @@
 - 手动加入或解除黑名单
 - 群发二次确认、后台发送、进度记录和服务重启续发
 - Telegram API 失败会写入 systemd 日志
+
+普通用户的 Telegram 输入框菜单只显示 `/start`。每个 `ADMIN_IDS` 管理员会获得独立的完整管理菜单；运行 `scripts/manage_webhook.py` 时会自动同步，也可使用 `--commands-only` 单独更新菜单。
 
 ### 可靠性与安全
 
@@ -188,7 +190,7 @@ bot.db
 
 - `users`：用户资料和最近消息
 - `admin_states`：管理员当前回复目标
-- `message_logs`：用户和客服历史消息
+- `message_logs`：用户和管理员回复历史
 - `blacklists`：手动黑名单
 - `conversations`：会话接管状态
 - `pending_broadcasts`：群发任务状态和统计
