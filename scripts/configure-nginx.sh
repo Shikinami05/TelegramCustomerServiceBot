@@ -12,9 +12,13 @@ fi
 
 DOMAIN_NAME="$1"
 CERT_EMAIL="$2"
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP_USER="${APP_USER:-lw}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+SERVICE_NAME="${SERVICE_NAME:-tg-bot}"
 NGINX_SITE="/etc/nginx/sites-available/tg-bot"
+
+source "$SCRIPT_DIR/common.sh"
+resolve_app_identity "$SERVICE_NAME"
 
 if [[ ! "$DOMAIN_NAME" =~ ^[A-Za-z0-9.-]+$ ]]; then
     echo "Invalid domain: $DOMAIN_NAME" >&2

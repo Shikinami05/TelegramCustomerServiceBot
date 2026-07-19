@@ -6,10 +6,13 @@ if [[ "${EUID}" -ne 0 ]]; then
     exit 1
 fi
 
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP_USER="${APP_USER:-lw}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SERVICE_NAME="${SERVICE_NAME:-tg-bot}"
 PYTHON_BIN="$PROJECT_DIR/venv/bin/python"
+
+source "$SCRIPT_DIR/common.sh"
+resolve_app_identity "$SERVICE_NAME"
 
 if [[ ! -x "$PYTHON_BIN" || ! -d "$PROJECT_DIR/.git" ]]; then
     echo "The project must be a Git checkout with an installed virtual environment." >&2

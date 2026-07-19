@@ -43,27 +43,53 @@
 - systemd
 - 一个已经指向 VPS 的域名
 
-默认示例使用：
+部署脚本不假设 VPS 用户名。它按以下顺序确定运行 Bot 的非 root 用户：
 
-```text
-/home/lw/tg-bot
-```
+1. 显式传入的 `APP_USER`
+2. 已有 `tg-bot.service` 中的 `User`
+3. 发起 `sudo` 的 `SUDO_USER`
+
+如果直接登录 root 且尚未安装服务，必须显式指定，例如 `sudo APP_USER=ubuntu bash scripts/install.sh`。
 
 ## 从 GitHub 安装
 
 建议先使用私有仓库。VPS 使用只读 Deploy Key 拉取代码，`.env` 和数据库只保存在 VPS。
 
+先以将要运行 Bot 的普通 VPS 用户登录。此时 `~` 就是这个用户真实的主目录，不需要写死 `/home/用户名`：
+
 ```bash
 sudo apt-get update
 sudo apt-get install -y git
 
-sudo -u lw git clone git@github.com:OWNER/REPOSITORY.git /home/lw/tg-bot
-cd /home/lw/tg-bot
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+ssh-keygen -t ed25519 -f ~/.ssh/tg-bot-deploy -C tg-bot-deploy
+cat ~/.ssh/tg-bot-deploy.pub
+```
+
+把公钥添加为 GitHub 仓库的只读 Deploy Key，再为这个专用密钥配置 SSH 别名：
+
+```sshconfig
+Host github-tg-bot
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/tg-bot-deploy
+    IdentitiesOnly yes
+```
+
+将上面的内容加入 `~/.ssh/config`，并设置权限：
+
+```bash
+chmod 600 ~/.ssh/config
+ssh -T git@github-tg-bot
+git clone git@github-tg-bot:OWNER/REPOSITORY.git ~/tg-bot
+cd ~/tg-bot
 
 sudo bash scripts/install.sh
 sudo bash scripts/configure-nginx.sh bot.example.com admin@example.com
-sudo -u lw /home/lw/tg-bot/venv/bin/python scripts/manage_webhook.py
 ```
+
+`install.sh` 会从 `SUDO_USER` 识别当前普通用户；安装完成后，其他脚本会优先读取 systemd 服务中的真实用户。若仓库需要安装给另一个用户，请明确运行 `sudo APP_USER=目标用户 bash scripts/install.sh`。
 
 安装脚本会：
 
@@ -189,7 +215,8 @@ backups/bot-YYYYMMDD-HHMMSS.db
 GitHub 仓库没有本地改动时：
 
 ```bash
-cd /home/lw/tg-bot
+PROJECT_DIR="$(sudo systemctl show tg-bot -p WorkingDirectory --value)"
+cd "$PROJECT_DIR"
 sudo bash scripts/update.sh
 ```
 
@@ -200,14 +227,15 @@ sudo bash scripts/update.sh
 设置或更新：
 
 ```bash
-cd /home/lw/tg-bot
-sudo -u lw ./venv/bin/python scripts/manage_webhook.py
+APP_USER="$(sudo systemctl show tg-bot -p User --value)"
+PROJECT_DIR="$(sudo systemctl show tg-bot -p WorkingDirectory --value)"
+sudo runuser -u "$APP_USER" -- "$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/scripts/manage_webhook.py"
 ```
 
 查看当前状态：
 
 ```bash
-sudo -u lw ./venv/bin/python scripts/manage_webhook.py --info
+sudo runuser -u "$APP_USER" -- "$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/scripts/manage_webhook.py" --info
 ```
 
 允许的 Telegram 更新类型：
@@ -233,7 +261,8 @@ Nginx 模板不会把 `/healthz` 暴露到公网。
 ## 测试
 
 ```bash
-cd /home/lw/tg-bot
+PROJECT_DIR="$(sudo systemctl show tg-bot -p WorkingDirectory --value)"
+cd "$PROJECT_DIR"
 ./venv/bin/python -m py_compile app.py scripts/manage_webhook.py
 ./venv/bin/python -m unittest discover -s tests -v
 ```
