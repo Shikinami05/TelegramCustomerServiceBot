@@ -6,17 +6,16 @@ if [[ "${EUID}" -ne 0 ]]; then
     exit 1
 fi
 
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP_USER="${APP_USER:-lw}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SERVICE_NAME="${SERVICE_NAME:-tg-bot}"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
+source "$SCRIPT_DIR/common.sh"
+resolve_app_identity "$SERVICE_NAME"
+
 if [[ ! "$PROJECT_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
     echo "Unsupported project path: $PROJECT_DIR" >&2
-    exit 1
-fi
-if ! id "$APP_USER" >/dev/null 2>&1; then
-    echo "Linux user does not exist: $APP_USER" >&2
     exit 1
 fi
 if [[ ! -f "$PROJECT_DIR/app.py" ]]; then
