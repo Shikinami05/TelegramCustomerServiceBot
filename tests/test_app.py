@@ -174,6 +174,15 @@ class BotDatabaseTests(unittest.TestCase):
         escaped = app.escape_html_limited("&" * 500, 100)
         self.assertLessEqual(len(escaped), 100)
 
+    def test_command_normalization_and_welcome_positioning(self) -> None:
+        self.assertEqual(app.normalize_command_text("/START@ExampleBot"), "/start")
+        self.assertEqual(
+            app.normalize_command_text("/reply@ExampleBot 123 hello"),
+            "/reply 123 hello",
+        )
+        self.assertNotIn("人工客服入口", app.WELCOME_TEXT)
+        self.assertIn("无需私聊其他账号", app.WELCOME_TEXT)
+
     def test_webhook_secret_health_and_update_retry_state(self) -> None:
         headers = {"X-Telegram-Bot-Api-Secret-Token": "test-secret"}
         with TestClient(app.app) as client:

@@ -123,6 +123,11 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
 
+WELCOME_TEXT = (
+    "你好，这里是统一留言入口，不是实时人工客服。\n\n"
+    "请直接在这里发送消息，无需私聊其他账号；我看到后会通过 Bot 回复你。"
+)
+
 
 # =========================
 # 数据库
@@ -770,7 +775,7 @@ def format_history(
     lines: list[str] = []
     used_chars = 0
     for row in rows:
-        sender = "用户" if row["sender_type"] == "user" else "客服"
+        sender = "用户" if row["sender_type"] == "user" else "回复"
         edited = "（已编辑）" if row["edited_at"] else ""
         text = escape_html_limited(row["text"], 300)
         line = f"{row['created_at']} {sender}{edited}：{text}"
@@ -1312,8 +1317,8 @@ def exit_reply_keyboard(chat_id: int) -> dict[str, Any]:
 def welcome_keyboard() -> dict[str, Any]:
     return inline_keyboard(
         [
-            [("联系人工客服", "user_help")],
-            [("使用说明", "user_guide")],
+            [("如何留言", "user_help")],
+            [("支持的消息", "user_guide")],
         ]
     )
 
@@ -1368,10 +1373,17 @@ async def notify_admins(
 async def send_welcome(chat_id: int) -> None:
     await send_message(
         chat_id,
-        "你好，这里是人工客服入口。\n\n"
-        "你可以直接发送文字说明问题，我会收到并尽快回复你。",
+        WELCOME_TEXT,
         reply_markup=welcome_keyboard(),
     )
+
+
+def normalize_command_text(text: str) -> str:
+    if not text.startswith("/"):
+        return text
+    first, separator, remainder = text.partition(" ")
+    command = first.split("@", 1)[0].lower()
+    return f"{command} {remainder}" if separator else command
 
 
 async def handle_user_message(message: dict[str, Any]) -> None:
@@ -1394,7 +1406,8 @@ async def handle_user_message(message: dict[str, Any]) -> None:
             )
         return
 
-    if text == "/start":
+    command_text = normalize_command_text(message.get("text") or "")
+    if command_text == "/start" or command_text.startswith("/start "):
         await send_welcome(chat_id)
         return
 
@@ -1423,7 +1436,7 @@ async def handle_user_message(message: dict[str, Any]) -> None:
         text,
         telegram_message_id=message_id,
     )
-    await send_message(chat_id, "已收到，我会尽快回复你。")
+    await send_message(chat_id, "留言已收到，我看到后会通过 Bot 回复你。")
     await notify_admins(
         user,
         text,
@@ -1473,6 +1486,13 @@ async def handle_user_edited_message(message: dict[str, Any]) -> None:
 async def handle_admin_command(admin_id: int, text: str) -> bool:
     if not is_admin(admin_id):
         return False
+
+    if text == "/start" or text.startswith("/start "):
+        await send_message(
+            admin_id,
+            "管理入口已启用。请使用输入框左侧的菜单选择管理指令。",
+        )
+        return True
 
     if text == "/myid":
         await send_message(admin_id, f"你的 Telegram 数字 ID：<code>{admin_id}</code>")
@@ -1674,14 +1694,14 @@ async def handle_admin_message(message: dict[str, Any]) -> None:
     if not is_admin(admin_id):
         return
 
-    text = message.get("text") or message.get("caption") or ""
+    text = normalize_command_text(message.get("text") or message.get("caption") or "")
     content = message_content(message)
 
     if await handle_admin_command(admin_id, text):
         return
 
     if text.startswith("/"):
-        await send_message(admin_id, "未知管理员命令，请检查命令格式。")
+        await send_message(admin_id, "未知管理员指令，请从输入框左侧菜单选择。")
         return
 
     target_chat_id = get_admin_state(admin_id)
@@ -1750,9 +1770,9 @@ async def handle_callback(callback: dict[str, Any]) -> None:
             return
         await answer_callback_query(callback_id)
         if data == "user_help":
-            text = "直接发送你的问题即可，我会看到并回复你。"
+            text = "直接在当前对话发送消息即可。消息会通过 Bot 转交，无需私聊其他账号。"
         else:
-            text = "支持文字、图片、文件和语音。发送后请等待客服回复。"
+            text = "支持文字、图片、文件、语音和视频。发送后请等待回复，避免短时间重复发送。"
         await send_message(chat_id, text)
         return
 
