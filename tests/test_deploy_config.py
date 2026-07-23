@@ -6,6 +6,23 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 
 
 class DeploymentConfigTests(unittest.TestCase):
+    def test_service_and_proxy_keep_webhook_private(self) -> None:
+        service = (PROJECT_DIR / "deploy" / "tg-bot.service.example").read_text(
+            encoding="utf-8"
+        )
+        nginx = (PROJECT_DIR / "deploy" / "nginx.conf.example").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("--host 127.0.0.1", service)
+        self.assertNotIn("--host 0.0.0.0", service)
+        self.assertIn("UMask=0077", service)
+        self.assertIn(
+            "proxy_set_header X-Telegram-Bot-Api-Secret-Token "
+            "$http_x_telegram_bot_api_secret_token;",
+            nginx,
+        )
+
     def test_nginx_setup_supports_8443_without_certbot_rewriting_ports(self) -> None:
         script = (PROJECT_DIR / "scripts" / "configure-nginx.sh").read_text(
             encoding="utf-8"
@@ -38,6 +55,8 @@ class DeploymentConfigTests(unittest.TestCase):
         script = (PROJECT_DIR / "scripts" / "update.sh").read_text(encoding="utf-8")
         self.assertIn("manage_webhook.py", script)
         self.assertIn("--commands-only", script)
+        self.assertIn("deploy/tg-bot.service.example", script)
+        self.assertIn("systemctl daemon-reload", script)
 
 
 if __name__ == "__main__":

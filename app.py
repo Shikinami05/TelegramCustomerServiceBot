@@ -18,6 +18,9 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
 
+if os.name == "posix":
+    os.umask(0o077)
+
 load_dotenv()
 
 
@@ -136,6 +139,21 @@ WELCOME_TEXT = (
 # =========================
 # 数据库
 # =========================
+
+def enforce_private_mode(path: Path, mode: int) -> None:
+    if os.name == "posix" and path.exists():
+        path.chmod(mode)
+
+
+def secure_database_files() -> None:
+    for path in (
+        DB_PATH,
+        Path(f"{DB_PATH}-wal"),
+        Path(f"{DB_PATH}-shm"),
+        Path(f"{DB_PATH}-journal"),
+    ):
+        enforce_private_mode(path, 0o600)
+
 
 def init_db() -> None:
     with db_connect() as conn:
@@ -290,6 +308,7 @@ def init_db() -> None:
             "ON pending_broadcasts(status, created_at)"
         )
         conn.commit()
+    secure_database_files()
 
 
 @contextmanager
@@ -451,15 +470,20 @@ def backup_database() -> Path | None:
     if not DB_BACKUP_ENABLED or not DB_PATH.exists():
         return None
 
-    DB_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    DB_BACKUP_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    enforce_private_mode(DB_BACKUP_DIR, 0o700)
     backup_path = DB_BACKUP_DIR / f"bot-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db"
 
     with sqlite3.connect(DB_PATH, timeout=30) as source:
         with sqlite3.connect(backup_path) as backup:
             source.backup(backup)
+    enforce_private_mode(backup_path, 0o600)
+    secure_database_files()
 
     if DB_BACKUP_KEEP > 0:
         backups = sorted(DB_BACKUP_DIR.glob("bot-*.db"), key=lambda p: p.stat().st_mtime)
+        for existing_backup in backups:
+            enforce_private_mode(existing_backup, 0o600)
         for old_backup in backups[:-DB_BACKUP_KEEP]:
             old_backup.unlink(missing_ok=True)
 
