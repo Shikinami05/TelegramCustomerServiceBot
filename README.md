@@ -105,7 +105,17 @@ sudo bash scripts/configure-nginx.sh bot.example.com admin@example.com
 - 运行语法检查和单元测试
 - 检查 `/healthz`
 
-`configure-nginx.sh` 会配置 Nginx、申请 HTTPS 证书，并在 HTTPS 生效后设置 Telegram Webhook。
+`configure-nginx.sh` 会配置 Nginx、通过 Webroot 申请 HTTPS 证书、更新 `.env` 中的 `WEBHOOK_URL`，并设置 Telegram Webhook 与输入框命令菜单。默认使用 HTTPS `443`。
+
+对于已经存在的证书，新版 Certbot 会通过 `reconfigure` 把后续续期验证改为 Webroot；旧版 Certbot 会保留 Nginx 插件作为续期兼容兜底，不会强制重复签发证书。
+
+如果 `443` 已被 Xray REALITY 等服务占用，使用 Telegram 支持的 `8443`：
+
+```bash
+sudo bash scripts/configure-nginx.sh bot.example.com admin@example.com 8443
+```
+
+脚本会在修改 Nginx 前检查目标端口。发现端口由非 Nginx 程序占用时会停止，不会覆盖现有代理服务。使用 `8443` 时还需要在 UFW 和 VPS 服务商防火墙中允许 TCP `8443`。
 
 脚本在 GitHub 上没有可执行权限时，可始终使用 `bash scripts/install.sh` 运行。也可以在 VPS 执行：
 
@@ -222,7 +232,7 @@ cd "$PROJECT_DIR"
 sudo bash scripts/update.sh
 ```
 
-更新脚本使用 `git pull --ff-only`，遇到本地代码修改会停止，不会强制覆盖。
+更新脚本使用 `git pull --ff-only`，遇到本地代码修改会停止，不会强制覆盖。服务通过健康检查后会自动同步普通用户和管理员的 Telegram 输入框命令菜单；菜单同步失败只记录警告，不影响已经成功的代码更新。
 
 ## Webhook
 
@@ -246,6 +256,12 @@ sudo runuser -u "$APP_USER" -- "$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/scri
 ["message", "edited_message", "callback_query"]
 ```
 
+当使用 `8443` 时，Webhook URL 形如：
+
+```text
+https://bot.example.com:8443/tg/webhook
+```
+
 ## 健康检查
 
 ```bash
@@ -259,6 +275,8 @@ curl --fail http://127.0.0.1:9000/healthz
 ```
 
 Nginx 模板不会把 `/healthz` 暴露到公网。
+
+Telegram API 错误日志只记录方法、HTTP 状态和错误描述，不记录包含 Bot Token 的请求 URL。
 
 ## 测试
 

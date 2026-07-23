@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import patch
 
+import httpx
+
 from scripts import manage_webhook
 
 
@@ -33,6 +35,29 @@ class CommandMenuTests(unittest.TestCase):
             self.assertEqual(len(names), len(set(names)))
             self.assertTrue(all(name.replace("_", "").isalnum() for name in names))
             self.assertTrue(all(item["description"] for item in commands))
+
+    @patch.object(manage_webhook.httpx, "post")
+    def test_api_errors_do_not_expose_bot_token(self, post) -> None:
+        post.return_value = httpx.Response(
+            401,
+            json={"ok": False, "description": "Unauthorized"},
+            request=httpx.Request(
+                "POST",
+                "https://api.telegram.org/botSECRET/setWebhook",
+            ),
+        )
+
+        with self.assertRaises(RuntimeError) as context:
+            manage_webhook.api_post(
+                "https://api.telegram.org/botSECRET",
+                "setWebhook",
+                {},
+            )
+
+        error = str(context.exception)
+        self.assertNotIn("SECRET", error)
+        self.assertNotIn("api.telegram.org", error)
+        self.assertIn("Unauthorized", error)
 
 
 if __name__ == "__main__":

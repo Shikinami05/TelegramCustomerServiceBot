@@ -1,9 +1,14 @@
+import asyncio
+import logging
 import os
 import sqlite3
 import tempfile
 import unittest
 import warnings
 from pathlib import Path
+from unittest.mock import AsyncMock
+
+import httpx
 
 os.environ.setdefault("BOT_TOKEN", "test-token")
 os.environ.setdefault("WEBHOOK_SECRET", "test-secret")
@@ -185,6 +190,32 @@ class BotDatabaseTests(unittest.TestCase):
             "你好，这里是统一留言聊天入口。\n\n"
             "请直接在这里发送消息，我看到后会通过 Bot 回复你。",
         )
+
+    def test_telegram_http_errors_do_not_expose_bot_token(self) -> None:
+        response = httpx.Response(
+            403,
+            json={"ok": False, "description": "Forbidden: bot was blocked"},
+            request=httpx.Request(
+                "POST",
+                "https://api.telegram.org/bottest-token/sendMessage",
+            ),
+        )
+        client = AsyncMock()
+        client.post.return_value = response
+        previous_client = app.telegram_client
+        app.telegram_client = client
+        try:
+            with self.assertRaises(RuntimeError) as context:
+                asyncio.run(app.tg("sendMessage", {"chat_id": 1, "text": "hello"}))
+        finally:
+            app.telegram_client = previous_client
+
+        error = str(context.exception)
+        self.assertNotIn("test-token", error)
+        self.assertNotIn("api.telegram.org", error)
+        self.assertIn("Forbidden: bot was blocked", error)
+        self.assertTrue(logging.getLogger("httpx").disabled)
+        self.assertTrue(logging.getLogger("httpcore").disabled)
 
     def test_webhook_secret_health_and_update_retry_state(self) -> None:
         headers = {"X-Telegram-Bot-Api-Secret-Token": "test-secret"}
