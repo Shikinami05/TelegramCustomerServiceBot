@@ -32,13 +32,23 @@ runuser -u "$APP_USER" -- "$PYTHON_BIN" -m py_compile app.py scripts/manage_webh
 runuser -u "$APP_USER" -- "$PYTHON_BIN" -m unittest discover -s tests -v
 
 systemctl restart "$SERVICE_NAME"
+service_healthy=false
 for _ in {1..20}; do
     if curl --fail --silent http://127.0.0.1:9000/healthz >/dev/null; then
-        echo "Update complete."
-        exit 0
+        service_healthy=true
+        break
     fi
     sleep 1
 done
 
-journalctl -u "$SERVICE_NAME" -n 80 --no-pager
-exit 1
+if [[ "$service_healthy" != "true" ]]; then
+    journalctl -u "$SERVICE_NAME" -n 80 --no-pager
+    exit 1
+fi
+
+if ! runuser -u "$APP_USER" -- \
+    "$PYTHON_BIN" "$PROJECT_DIR/scripts/manage_webhook.py" --commands-only; then
+    echo "Warning: code was updated, but Telegram command menu sync failed." >&2
+fi
+
+echo "Update complete."

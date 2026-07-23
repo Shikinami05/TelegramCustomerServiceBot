@@ -28,13 +28,46 @@ ADMIN_COMMANDS = [
 ]
 
 
-def api_post(api_base: str, method: str, payload: dict) -> dict:
-    response = httpx.post(f"{api_base}/{method}", json=payload, timeout=20)
-    response.raise_for_status()
-    result = response.json()
-    if not result.get("ok", False):
-        raise RuntimeError(f"Telegram API {method} failed: {result}")
+def parse_api_response(method: str, response: httpx.Response) -> dict:
+    try:
+        result = response.json()
+    except ValueError:
+        result = {}
+    if (
+        response.is_error
+        or not isinstance(result, dict)
+        or not result.get("ok", False)
+    ):
+        description = (
+            str(result.get("description", "unexpected response"))
+            if isinstance(result, dict)
+            else "unexpected response"
+        )
+        raise RuntimeError(
+            f"Telegram API {method} failed with HTTP "
+            f"{response.status_code}: {description[:300]}"
+        ) from None
     return result
+
+
+def api_post(api_base: str, method: str, payload: dict) -> dict:
+    try:
+        response = httpx.post(f"{api_base}/{method}", json=payload, timeout=20)
+    except httpx.RequestError as exc:
+        raise RuntimeError(
+            f"Telegram API {method} request failed ({type(exc).__name__})"
+        ) from None
+    return parse_api_response(method, response)
+
+
+def api_get(api_base: str, method: str) -> dict:
+    try:
+        response = httpx.get(f"{api_base}/{method}", timeout=20)
+    except httpx.RequestError as exc:
+        raise RuntimeError(
+            f"Telegram API {method} request failed ({type(exc).__name__})"
+        ) from None
+    return parse_api_response(method, response)
 
 
 def configure_command_menus(api_base: str, admin_ids: set[int]) -> None:
@@ -86,9 +119,7 @@ def main() -> None:
 
     api_base = f"https://api.telegram.org/bot{token}"
     if args.info:
-        response = httpx.get(f"{api_base}/getWebhookInfo", timeout=20)
-        response.raise_for_status()
-        result = response.json()
+        result = api_get(api_base, "getWebhookInfo")
     elif args.commands_only:
         configure_command_menus(api_base, admin_ids)
         result = {"ok": True, "command_menus_configured": True}

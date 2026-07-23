@@ -1,0 +1,14 @@
+server {
+    listen 80;
+    listen [::]:80;
+    server_name __DOMAIN__;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root __ACME_WEBROOT__;
+        default_type text/plain;
+    }
+
+    location / {
+        return 404;
+    }
+}

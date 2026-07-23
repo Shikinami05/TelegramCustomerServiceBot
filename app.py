@@ -78,6 +78,10 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 logger = logging.getLogger("tg_bot")
+for dependency_logger_name in ("httpx", "httpcore"):
+    dependency_logger = logging.getLogger(dependency_logger_name)
+    dependency_logger.disabled = True
+    dependency_logger.propagate = False
 
 telegram_client: httpx.AsyncClient | None = None
 backup_task: asyncio.Task[None] | None = None
@@ -92,7 +96,7 @@ async def lifespan(_: FastAPI):
     init_db()
     purge_expired_data()
     try:
-        backup_database()
+        await asyncio.to_thread(backup_database)
     except Exception:
         logger.exception("Initial database backup failed")
 
@@ -469,8 +473,8 @@ async def periodic_db_backup() -> None:
     while True:
         await asyncio.sleep(DB_BACKUP_INTERVAL_SECONDS)
         try:
-            backup_path = backup_database()
-            purge_expired_data()
+            backup_path = await asyncio.to_thread(backup_database)
+            await asyncio.to_thread(purge_expired_data)
             if backup_path:
                 logger.info("Database backup created: %s", backup_path)
         except asyncio.CancelledError:
@@ -528,15 +532,31 @@ def escape_html_limited(value: str, limit: int) -> str:
 
 
 async def tg(method: str, payload: dict[str, Any]) -> dict[str, Any]:
-    if telegram_client is None:
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.post(f"{API_BASE}/{method}", json=payload)
-    else:
-        response = await telegram_client.post(f"{API_BASE}/{method}", json=payload)
-    response.raise_for_status()
-    data = response.json()
-    if not data.get("ok", False):
-        raise RuntimeError(f"Telegram API {method} failed: {data}")
+    try:
+        if telegram_client is None:
+            async with httpx.AsyncClient(timeout=20) as client:
+                response = await client.post(f"{API_BASE}/{method}", json=payload)
+        else:
+            response = await telegram_client.post(f"{API_BASE}/{method}", json=payload)
+    except httpx.RequestError as exc:
+        raise RuntimeError(
+            f"Telegram API {method} request failed ({type(exc).__name__})"
+        ) from None
+
+    try:
+        data = response.json()
+    except ValueError:
+        data = {}
+    if response.is_error or not isinstance(data, dict) or not data.get("ok", False):
+        description = (
+            str(data.get("description", "unexpected response"))
+            if isinstance(data, dict)
+            else "unexpected response"
+        )
+        raise RuntimeError(
+            f"Telegram API {method} failed with HTTP "
+            f"{response.status_code}: {truncate_text(description, 300)}"
+        ) from None
     return data
 
 
