@@ -2,11 +2,12 @@ import asyncio
 import logging
 import os
 import sqlite3
+import stat
 import tempfile
 import unittest
 import warnings
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
@@ -216,6 +217,37 @@ class BotDatabaseTests(unittest.TestCase):
         self.assertIn("Forbidden: bot was blocked", error)
         self.assertTrue(logging.getLogger("httpx").disabled)
         self.assertTrue(logging.getLogger("httpcore").disabled)
+
+    def test_non_admin_cannot_execute_management_actions(self) -> None:
+        callback = {
+            "id": "callback-1",
+            "from": {"id": 999},
+            "data": "blacklist:55",
+            "message": {"chat": {"id": 999, "type": "private"}},
+        }
+        answer = AsyncMock(return_value=True)
+        with patch.object(app, "answer_callback_query", answer):
+            asyncio.run(app.handle_callback(callback))
+
+        self.assertFalse(app.is_blacklisted(55))
+        self.assertFalse(
+            asyncio.run(app.handle_admin_command(999, "/blacklist 55 forged"))
+        )
+        answer.assert_awaited_once_with("callback-1", "无权限")
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission modes required")
+    def test_database_and_backups_are_private(self) -> None:
+        previous_enabled = app.DB_BACKUP_ENABLED
+        app.DB_BACKUP_ENABLED = True
+        try:
+            backup_path = app.backup_database()
+        finally:
+            app.DB_BACKUP_ENABLED = previous_enabled
+
+        self.assertIsNotNone(backup_path)
+        self.assertEqual(stat.S_IMODE(app.DB_PATH.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(app.DB_BACKUP_DIR.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(backup_path.stat().st_mode), 0o600)
 
     def test_webhook_secret_health_and_update_retry_state(self) -> None:
         headers = {"X-Telegram-Bot-Api-Secret-Token": "test-secret"}
