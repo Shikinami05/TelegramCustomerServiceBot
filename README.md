@@ -18,10 +18,14 @@
 ### 管理员侧
 
 - 新消息通知包含用户资料和此前历史，不重复展示当前消息
+- `/inbox` 显示尚未处理的新消息，`/pending` 显示超时待处理会话
+- `/closed` 显示最近已处理会话，可通过按钮重新打开
 - 持续回复模式，支持文字和媒体
 - 多管理员接管与关闭会话
 - 手动加入或解除黑名单
-- 群发二次确认、后台发送、进度记录和服务重启续发
+- `OWNER_IDS` 负责人专用群发与管理员审计权限
+- 群发二次确认、后台发送、进度记录、失败用户重试和服务重启续发
+- `/audit` 保存最近管理员接管、回复、关闭、拉黑和群发操作
 - Telegram API 失败会写入 systemd 日志
 
 普通用户的 Telegram 输入框菜单只显示 `/start`。每个 `ADMIN_IDS` 管理员会获得独立的完整管理菜单；运行 `scripts/manage_webhook.py` 时会自动同步，也可使用 `--commands-only` 单独更新菜单。
@@ -31,6 +35,7 @@
 - 强制校验 `WEBHOOK_SECRET`
 - 所有管理命令和管理按钮均校验 `ADMIN_IDS`
 - Webhook 更新使用 `processing/done/failed` 状态，失败后允许 Telegram 重试
+- Telegram 触发 flood control 时按 `retry_after` 等待；群发失败用户可单独重试
 - Telegram HTTP 连接复用
 - 管理员通知自动控制在 Telegram 消息长度限制内
 - SQLite WAL、自动迁移、在线备份和可选历史数据保留
@@ -139,6 +144,7 @@ chmod 600 .env
 BOT_TOKEN=BotFather 提供的 Token
 WEBHOOK_SECRET=随机长字符串
 ADMIN_IDS=123456789,987654321
+OWNER_IDS=123456789
 WEBHOOK_URL=https://bot.example.com/tg/webhook
 ```
 
@@ -156,21 +162,29 @@ USER_RATE_LIMIT_COOLDOWN_SECONDS=300
 MESSAGE_RETENTION_DAYS=180
 
 BROADCAST_SEND_DELAY_SECONDS=0.05
+BROADCAST_RATE_LIMIT_RETRIES=3
 UPDATE_PROCESSING_TIMEOUT_SECONDS=300
+PENDING_REMINDER_MINUTES=30
+TELEGRAM_INLINE_RETRY_MAX_SECONDS=5
 LOG_LEVEL=INFO
 ```
 
 `MESSAGE_RETENTION_DAYS=0` 表示不自动清理历史消息。示例配置使用 `180` 天。
 
+`OWNER_IDS` 可以省略；省略时所有 `ADMIN_IDS` 都视为负责人，以保持旧配置兼容。配置后，只有负责人能使用群发、群发失败重试和 `/audit`。`OWNER_IDS` 中的账号会自动获得管理员权限。
+
+`PENDING_REMINDER_MINUTES` 控制 `/pending` 的超时阈值。普通消息只会在 `retry_after` 不超过 `TELEGRAM_INLINE_RETRY_MAX_SECONDS` 时短暂等待，避免 Webhook 长时间阻塞；后台群发不受这个短等待上限影响。
+
 ## 管理员命令
 
 ```text
 /myid
+/inbox
+/pending
+/closed
 /users
 /reply 用户ID 内容
 /send 用户ID 内容
-/broadcast 内容
-/broadcast_status
 /cancel
 /takeover 用户ID
 /close 用户ID
@@ -179,6 +193,23 @@ LOG_LEVEL=INFO
 /blacklist_list
 ```
 
+负责人额外拥有：
+
+```text
+/broadcast 内容
+/broadcast_status
+/broadcast_retry 任务ID
+/audit
+```
+
+待处理流程：
+
+1. 用户发送新消息后，会话进入 `/inbox` 并累加未读数
+2. 超过 `PENDING_REMINDER_MINUTES` 仍未处理时会出现在 `/pending`
+3. 管理员成功回复后未读数清零
+4. 点击“标记已处理”或使用 `/close 用户ID` 后进入 `/closed`
+5. 用户再次留言会自动重新打开，也可以由管理员手动重新打开
+
 群发流程：
 
 1. 管理员发送 `/broadcast 内容`
@@ -186,6 +217,7 @@ LOG_LEVEL=INFO
 3. 管理员确认后任务进入后台队列
 4. Bot 完成后发送成功和失败数量
 5. `/broadcast_status` 可查看最近进度
+6. 失败用户可点击“重试失败用户”或使用 `/broadcast_retry 任务ID`
 
 群发接收人会在确认时生成快照。黑名单用户不会进入快照；发送期间新加入黑名单的用户也不会收到群发。
 
@@ -203,7 +235,8 @@ bot.db
 - `admin_states`：管理员当前回复目标
 - `message_logs`：用户和管理员回复历史
 - `blacklists`：手动黑名单
-- `conversations`：会话接管状态
+- `conversations`：会话接管、未读数和最后回复时间
+- `admin_audit_logs`：管理员操作审计记录
 - `pending_broadcasts`：群发任务状态和统计
 - `broadcast_recipients`：群发接收人及发送结果
 - `processed_updates`：Webhook 幂等和失败重试状态
