@@ -103,10 +103,21 @@ class BotDatabaseTests(unittest.TestCase):
         broadcast_columns = {
             row["name"] for row in app.db_fetchall("PRAGMA table_info(pending_broadcasts)")
         }
+        conversation_columns = {
+            row["name"] for row in app.db_fetchall("PRAGMA table_info(conversations)")
+        }
         self.assertEqual(message["text"], "legacy message")
         self.assertEqual(update["status"], "done")
         self.assertIsNotNone(update["updated_at"])
         self.assertIn("sent_count", broadcast_columns)
+        self.assertIn("unread_count", conversation_columns)
+        self.assertIn("last_user_message_at", conversation_columns)
+        self.assertIsNotNone(
+            app.db_fetchone(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'admin_audit_logs'"
+            )
+        )
 
     def test_rate_limit_only_notifies_when_cooldown_starts(self) -> None:
         self.assertEqual(app.check_user_rate_limit(10), (True, False, 0))
@@ -146,6 +157,37 @@ class BotDatabaseTests(unittest.TestCase):
         self.assertEqual(app.get_admin_state(2), 30)
         self.assertEqual(app.get_conversation_owner(30), 2)
 
+    def test_conversation_inbox_pending_and_reopen_workflow(self) -> None:
+        app.db_execute(
+            "INSERT INTO users (chat_id, first_name, last_message) VALUES (?, ?, ?)",
+            (31, "Inbox", "hello"),
+        )
+        app.record_user_activity(31)
+        app.record_user_activity(31)
+
+        conversation = app.get_conversation(31)
+        self.assertEqual(int(conversation["unread_count"]), 2)
+        self.assertEqual(len(app.get_conversation_queue("inbox")), 1)
+
+        app.mark_conversation_replied(31)
+        self.assertEqual(app.get_conversation_queue("inbox"), [])
+
+        app.record_user_activity(31, increment_unread=False)
+        app.db_execute(
+            "UPDATE conversations "
+            "SET last_user_message_at = datetime('now', '-60 minutes') "
+            "WHERE chat_id = ?",
+            (31,),
+        )
+        self.assertEqual(len(app.get_conversation_queue("pending")), 1)
+
+        app.close_conversation(31)
+        self.assertEqual(len(app.get_conversation_queue("closed")), 1)
+        app.reopen_conversation(31)
+        reopened = app.get_conversation(31)
+        self.assertEqual(reopened["status"], "open")
+        self.assertEqual(int(reopened["unread_count"]), 0)
+
     def test_broadcast_queue_snapshots_users_and_tracks_results(self) -> None:
         for chat_id in (40, 41, 42):
             app.db_execute(
@@ -175,6 +217,12 @@ class BotDatabaseTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(int(result["sent_count"]), 1)
         self.assertEqual(int(result["failed_count"]), 1)
+
+        retry_status, retry_count = app.retry_failed_broadcast(broadcast_id)
+        self.assertEqual((retry_status, retry_count), ("queued", 1))
+        retried_job = app.claim_next_broadcast_job()
+        self.assertEqual(retried_job["id"], broadcast_id)
+        self.assertEqual(app.claim_next_broadcast_recipient(broadcast_id), 41)
 
     def test_html_escape_limit_never_exceeds_budget(self) -> None:
         escaped = app.escape_html_limited("&" * 500, 100)
@@ -217,6 +265,54 @@ class BotDatabaseTests(unittest.TestCase):
         self.assertIn("Forbidden: bot was blocked", error)
         self.assertTrue(logging.getLogger("httpx").disabled)
         self.assertTrue(logging.getLogger("httpcore").disabled)
+
+    def test_telegram_rate_limit_uses_retry_after(self) -> None:
+        rate_limit_error = app.TelegramAPIError(
+            "sendMessage",
+            429,
+            "Too Many Requests",
+            retry_after=2,
+        )
+        tg_mock = AsyncMock(side_effect=[rate_limit_error, {"ok": True}])
+        sleep_mock = AsyncMock()
+        with (
+            patch.object(app, "tg", tg_mock),
+            patch.object(app.asyncio, "sleep", sleep_mock),
+        ):
+            sent = asyncio.run(app.send_message(1, "hello"))
+
+        self.assertTrue(sent)
+        self.assertEqual(tg_mock.await_count, 2)
+        sleep_mock.assert_awaited_once_with(2)
+
+    def test_owner_only_commands_and_audit_log(self) -> None:
+        previous_owners = app.OWNER_IDS
+        app.OWNER_IDS = {1}
+        send_mock = AsyncMock(return_value=True)
+        try:
+            with patch.object(app, "send_message", send_mock):
+                handled = asyncio.run(
+                    app.handle_admin_command(2, "/broadcast forbidden")
+                )
+            self.assertTrue(handled)
+            self.assertIn("OWNER_IDS", send_mock.await_args.args[1])
+
+            send_mock.reset_mock()
+            with patch.object(app, "send_message", send_mock):
+                handled = asyncio.run(app.handle_admin_command(1, "/broadcast"))
+            self.assertTrue(handled)
+            self.assertEqual(send_mock.await_args.args[1], "格式：/broadcast 内容")
+
+            app.add_admin_audit(1, "conversation_takeover", 55, "test")
+            row = app.db_fetchone(
+                "SELECT admin_id, action, target_chat_id "
+                "FROM admin_audit_logs ORDER BY id DESC LIMIT 1"
+            )
+            self.assertEqual(int(row["admin_id"]), 1)
+            self.assertEqual(row["action"], "conversation_takeover")
+            self.assertEqual(int(row["target_chat_id"]), 55)
+        finally:
+            app.OWNER_IDS = previous_owners
 
     def test_non_admin_cannot_execute_management_actions(self) -> None:
         callback = {

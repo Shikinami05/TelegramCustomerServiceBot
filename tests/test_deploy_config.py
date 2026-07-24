@@ -58,6 +58,12 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn("deploy/tg-bot.service.example", script)
         self.assertIn("systemctl daemon-reload", script)
 
+    def test_installer_seeds_owner_and_queue_defaults(self) -> None:
+        script = (PROJECT_DIR / "scripts" / "install.sh").read_text(encoding="utf-8")
+        self.assertIn("OWNER_IDS=%s", script)
+        self.assertIn("PENDING_REMINDER_MINUTES=30", script)
+        self.assertIn("BROADCAST_RATE_LIMIT_RETRIES=3", script)
+
 
 if __name__ == "__main__":
     unittest.main()

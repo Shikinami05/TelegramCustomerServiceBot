@@ -55,6 +55,7 @@ if [[ ! -f "$PROJECT_DIR/.env" ]]; then
         printf 'BOT_TOKEN=%s\n' "$BOT_TOKEN_INPUT"
         printf 'WEBHOOK_SECRET=%s\n' "$WEBHOOK_SECRET_INPUT"
         printf 'ADMIN_IDS=%s\n' "$ADMIN_IDS_INPUT"
+        printf 'OWNER_IDS=%s\n' "$ADMIN_IDS_INPUT"
         printf 'WEBHOOK_URL=%s\n' "$WEBHOOK_URL_INPUT"
         printf '\nDB_BACKUP_ENABLED=true\n'
         printf 'DB_BACKUP_INTERVAL_SECONDS=86400\n'
@@ -65,7 +66,10 @@ if [[ ! -f "$PROJECT_DIR/.env" ]]; then
         printf 'USER_RATE_LIMIT_COOLDOWN_SECONDS=300\n'
         printf 'MESSAGE_RETENTION_DAYS=180\n'
         printf '\nBROADCAST_SEND_DELAY_SECONDS=0.05\n'
+        printf 'BROADCAST_RATE_LIMIT_RETRIES=3\n'
         printf 'UPDATE_PROCESSING_TIMEOUT_SECONDS=300\n'
+        printf 'PENDING_REMINDER_MINUTES=30\n'
+        printf 'TELEGRAM_INLINE_RETRY_MAX_SECONDS=5\n'
         printf 'LOG_LEVEL=INFO\n'
     } > "$PROJECT_DIR/.env"
     chown "$APP_USER:$APP_USER" "$PROJECT_DIR/.env"
