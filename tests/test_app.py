@@ -188,6 +188,151 @@ class BotDatabaseTests(unittest.TestCase):
         self.assertEqual(reopened["status"], "open")
         self.assertEqual(int(reopened["unread_count"]), 0)
 
+    def test_admin_dashboard_and_numbered_queue_controls(self) -> None:
+        app.db_execute(
+            """
+            INSERT INTO users (
+                chat_id, username, first_name, last_message
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (32, "queue_user", "Queue", "latest message"),
+        )
+        app.record_user_activity(32)
+        app.db_execute(
+            """
+            UPDATE conversations
+            SET last_user_message_at = datetime('now', '-60 minutes')
+            WHERE chat_id = ?
+            """,
+            (32,),
+        )
+        app.claim_conversation(32, 2)
+
+        app.db_execute(
+            "INSERT INTO users (chat_id, first_name) VALUES (?, ?)",
+            (33, "Closed"),
+        )
+        app.close_conversation(33)
+
+        counts = app.get_queue_counts()
+        self.assertEqual(counts, {"inbox": 1, "pending": 1, "closed": 1})
+        dashboard = app.format_admin_dashboard(1)
+        self.assertIn("<b>留言工作台</b>", dashboard)
+        self.assertIn("待处理：<b>1</b>", dashboard)
+
+        rows = app.get_conversation_queue("inbox")
+        queue_text = app.format_conversation_queue("inbox", rows)
+        queue_keyboard = app.conversation_queue_keyboard(
+            rows,
+            "inbox",
+            viewer_admin_id=1,
+        )
+        first_row = queue_keyboard["inline_keyboard"][0]
+
+        self.assertIn("<b>1. @queue_user</b>", queue_text)
+        self.assertIn("1 条待处理", queue_text)
+        self.assertEqual(first_row[0]["text"], "1 接管")
+        self.assertEqual(first_row[0]["callback_data"], "takeover:32")
+        self.assertEqual(first_row[0]["style"], "primary")
+        self.assertEqual(first_row[1]["text"], "1 详情")
+        self.assertEqual(first_row[2]["text"], "1 处理")
+        self.assertEqual(first_row[2]["style"], "success")
+        self.assertEqual(
+            queue_keyboard["inline_keyboard"][-1][0]["callback_data"],
+            "admin:dashboard",
+        )
+
+    def test_queue_callback_reuses_the_current_message(self) -> None:
+        callback = {
+            "id": "queue-callback",
+            "from": {"id": 1},
+            "data": "queue:inbox",
+            "message": {
+                "message_id": 50,
+                "chat": {"id": 1, "type": "private"},
+            },
+        }
+        answer = AsyncMock(return_value=True)
+        edit = AsyncMock(return_value=True)
+        send = AsyncMock(return_value=True)
+        with (
+            patch.object(app, "answer_callback_query", answer),
+            patch.object(app, "edit_message_text", edit),
+            patch.object(app, "send_message", send),
+        ):
+            asyncio.run(app.handle_callback(callback))
+
+        answer.assert_awaited_once_with("queue-callback")
+        edit.assert_awaited_once()
+        self.assertIn("<b>待处理</b>", edit.await_args.args[2])
+        send.assert_not_awaited()
+
+    def test_admin_ui_views_fit_telegram_limits(self) -> None:
+        for chat_id in range(70, 80):
+            app.db_execute(
+                """
+                INSERT INTO users (
+                    chat_id, username, last_message
+                ) VALUES (?, ?, ?)
+                """,
+                (chat_id, f"user_{chat_id}", "<long>" * 1000),
+            )
+            app.record_user_activity(chat_id)
+
+        rows = app.get_conversation_queue("inbox")
+        queue_text = app.format_conversation_queue("inbox", rows)
+        queue_keyboard = app.conversation_queue_keyboard(
+            rows,
+            "inbox",
+            viewer_admin_id=1,
+        )
+        recent_text = app.format_recent_users(app.get_recent_users())
+
+        self.assertLessEqual(len(queue_text), app.TELEGRAM_TEXT_LIMIT)
+        self.assertLessEqual(len(recent_text), app.TELEGRAM_TEXT_LIMIT)
+        for keyboard_row in queue_keyboard["inline_keyboard"]:
+            for button in keyboard_row:
+                self.assertLessEqual(len(button["callback_data"].encode("utf-8")), 64)
+
+    def test_blacklist_button_requires_confirmation(self) -> None:
+        callback = {
+            "id": "blacklist-callback",
+            "from": {"id": 1},
+            "data": "blacklist:55",
+            "message": {
+                "message_id": 60,
+                "chat": {"id": 1, "type": "private"},
+            },
+        }
+        answer = AsyncMock(return_value=True)
+        send = AsyncMock(return_value=True)
+        with (
+            patch.object(app, "answer_callback_query", answer),
+            patch.object(app, "send_message", send),
+        ):
+            asyncio.run(app.handle_callback(callback))
+
+        self.assertFalse(app.is_blacklisted(55))
+        confirmation_markup = send.await_args.kwargs["reply_markup"]
+        self.assertEqual(
+            confirmation_markup["inline_keyboard"][0][0]["callback_data"],
+            "blacklist_confirm:55",
+        )
+        self.assertEqual(
+            confirmation_markup["inline_keyboard"][0][0]["style"],
+            "danger",
+        )
+
+        callback["id"] = "blacklist-confirm"
+        callback["data"] = "blacklist_confirm:55"
+        with (
+            patch.object(app, "answer_callback_query", answer),
+            patch.object(app, "send_message", send),
+        ):
+            asyncio.run(app.handle_callback(callback))
+
+        self.assertTrue(app.is_blacklisted(55))
+
     def test_broadcast_queue_snapshots_users_and_tracks_results(self) -> None:
         for chat_id in (40, 41, 42):
             app.db_execute(
@@ -228,6 +373,16 @@ class BotDatabaseTests(unittest.TestCase):
         escaped = app.escape_html_limited("&" * 500, 100)
         self.assertLessEqual(len(escaped), 100)
 
+    def test_inline_button_styles_are_semantic_and_validated(self) -> None:
+        welcome_buttons = app.welcome_keyboard()["inline_keyboard"][0]
+        self.assertEqual(welcome_buttons[0]["style"], "primary")
+        self.assertNotIn("style", welcome_buttons[1])
+
+        with self.assertRaises(ValueError):
+            app.inline_keyboard([[("Invalid", "invalid:1", "neon")]])
+        with self.assertRaises(ValueError):
+            app.inline_keyboard([[("Too", "many", "primary", "parts")]])
+
     def test_command_normalization_and_welcome_positioning(self) -> None:
         self.assertEqual(app.normalize_command_text("/START@ExampleBot"), "/start")
         self.assertEqual(
@@ -236,7 +391,7 @@ class BotDatabaseTests(unittest.TestCase):
         )
         self.assertEqual(
             app.WELCOME_TEXT,
-            "你好，这里是统一留言聊天入口。\n\n"
+            "<b>统一留言聊天入口</b>\n\n"
             "请直接在这里发送消息，我看到后会通过 Bot 回复你。",
         )
 
@@ -284,6 +439,28 @@ class BotDatabaseTests(unittest.TestCase):
         self.assertTrue(sent)
         self.assertEqual(tg_mock.await_count, 2)
         sleep_mock.assert_awaited_once_with(2)
+
+    def test_refreshing_unchanged_admin_view_is_not_an_error(self) -> None:
+        tg_mock = AsyncMock(
+            side_effect=app.TelegramAPIError(
+                "editMessageText",
+                400,
+                "Bad Request: message is not modified",
+            )
+        )
+        with patch.object(app, "tg", tg_mock):
+            edited = asyncio.run(
+                app.edit_message_text(
+                    1,
+                    50,
+                    "<b>留言工作台</b>",
+                    reply_markup=app.inline_keyboard(
+                        [[("刷新", "admin:dashboard")]]
+                    ),
+                )
+            )
+
+        self.assertTrue(edited)
 
     def test_owner_only_commands_and_audit_log(self) -> None:
         previous_owners = app.OWNER_IDS

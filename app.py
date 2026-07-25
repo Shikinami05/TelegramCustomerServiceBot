@@ -144,9 +144,41 @@ async def lifespan(_: FastAPI):
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
 
 WELCOME_TEXT = (
-    "你好，这里是统一留言聊天入口。\n\n"
+    "<b>统一留言聊天入口</b>\n\n"
     "请直接在这里发送消息，我看到后会通过 Bot 回复你。"
 )
+
+QUEUE_LABELS = {
+    "inbox": "待处理",
+    "pending": "超时",
+    "closed": "已处理",
+}
+
+BROADCAST_STATUS_LABELS = {
+    "pending": "等待确认",
+    "queued": "等待发送",
+    "running": "发送中",
+    "completed": "已完成",
+    "canceled": "已取消",
+}
+
+AUDIT_ACTION_LABELS = {
+    "reply_mode_enter": "进入回复",
+    "reply_mode_exit": "退出回复",
+    "message_sent": "发送回复",
+    "conversation_takeover": "接管会话",
+    "conversation_resolved": "标记已处理",
+    "conversation_reopened": "重新打开",
+    "blacklist_add": "加入黑名单",
+    "blacklist_remove": "解除黑名单",
+    "broadcast_created": "创建群发",
+    "broadcast_confirmed": "确认群发",
+    "broadcast_canceled": "取消群发",
+    "broadcast_retry": "重试群发",
+}
+
+ButtonSpec = tuple[str, str] | tuple[str, str, str]
+INLINE_BUTTON_STYLES = {"primary", "success", "danger"}
 
 
 # =========================
@@ -573,6 +605,7 @@ class TelegramAPIError(RuntimeError):
         )
         self.method = method
         self.status_code = status_code
+        self.description = description
         self.retry_after = retry_after
 
 
@@ -726,6 +759,44 @@ async def answer_callback_query(callback_query_id: str, text: str = "") -> bool:
     return True
 
 
+async def edit_message_text(
+    chat_id: int,
+    message_id: int,
+    text: str,
+    reply_markup: dict[str, Any] | None = None,
+) -> bool:
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    try:
+        await tg("editMessageText", payload)
+    except TelegramAPIError as exc:
+        if "message is not modified" in exc.description.lower():
+            return True
+        logger.warning(
+            "editMessageText failed chat_id=%s message_id=%s error=%s",
+            chat_id,
+            message_id,
+            exc,
+        )
+        return False
+    except Exception as exc:
+        logger.warning(
+            "editMessageText failed chat_id=%s message_id=%s error=%s",
+            chat_id,
+            message_id,
+            exc,
+        )
+        return False
+    return True
+
+
 async def copy_message(
     to_chat_id: int,
     from_chat_id: int,
@@ -785,13 +856,23 @@ async def copy_message(
             return False
 
 
-def inline_keyboard(rows: list[list[tuple[str, str]]]) -> dict[str, Any]:
-    return {
-        "inline_keyboard": [
-            [{"text": text, "callback_data": data} for text, data in row]
-            for row in rows
-        ]
-    }
+def inline_keyboard(rows: list[list[ButtonSpec]]) -> dict[str, Any]:
+    keyboard: list[list[dict[str, str]]] = []
+    for row in rows:
+        keyboard_row: list[dict[str, str]] = []
+        for button_spec in row:
+            if len(button_spec) not in {2, 3}:
+                raise ValueError("inline button must contain text, data, and optional style")
+            text, data = button_spec[:2]
+            button = {"text": text, "callback_data": data}
+            if len(button_spec) == 3:
+                style = button_spec[2]
+                if style not in INLINE_BUTTON_STYLES:
+                    raise ValueError(f"unsupported inline button style: {style}")
+                button["style"] = style
+            keyboard_row.append(button)
+        keyboard.append(keyboard_row)
+    return {"inline_keyboard": keyboard}
 
 
 # =========================
@@ -830,6 +911,21 @@ def user_label(user: dict[str, Any]) -> str:
     if username:
         return f"@{username}"
     return name or str(user.get("id"))
+
+
+def compact_timestamp(value: Any) -> str:
+    if not value:
+        return "-"
+    return str(value).replace("T", " ")[:16]
+
+
+def row_user_label(row: sqlite3.Row) -> str:
+    if row["username"]:
+        return f"@{row['username']}"
+    name = " ".join(
+        value for value in (row["first_name"], row["last_name"]) if value
+    ).strip()
+    return name or str(row["chat_id"])
 
 
 def message_content(message: dict[str, Any]) -> str:
@@ -990,15 +1086,18 @@ def format_history(
     lines: list[str] = []
     used_chars = 0
     for row in rows:
-        sender = "用户" if row["sender_type"] == "user" else "回复"
+        sender = "用户" if row["sender_type"] == "user" else "管理员"
         edited = "（已编辑）" if row["edited_at"] else ""
         text = escape_html_limited(row["text"], 300)
-        line = f"{row['created_at']} {sender}{edited}：{text}"
-        if lines and used_chars + len(line) + 1 > max_chars:
+        line = (
+            f"<b>{sender}{edited}</b> · {compact_timestamp(row['created_at'])}\n"
+            f"{text}"
+        )
+        if lines and used_chars + len(line) + 2 > max_chars:
             break
         lines.append(line)
-        used_chars += len(line) + 1
-    return "\n".join(lines)
+        used_chars += len(line) + 2
+    return "\n\n".join(lines)
 
 
 def check_user_rate_limit(chat_id: int) -> tuple[bool, bool, int]:
@@ -1279,29 +1378,175 @@ def get_conversation_queue(queue_name: str, limit: int = 10) -> list[sqlite3.Row
     )
 
 
+def get_queue_counts() -> dict[str, int]:
+    row = db_fetchone(
+        """
+        SELECT
+            SUM(CASE
+                WHEN status = 'open' AND unread_count > 0 THEN 1
+                ELSE 0
+            END) AS inbox,
+            SUM(CASE
+                WHEN status = 'open' AND unread_count > 0
+                 AND last_user_message_at <= datetime('now', ?)
+                THEN 1 ELSE 0
+            END) AS pending,
+            SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) AS closed
+        FROM conversations
+        """,
+        (f"-{PENDING_REMINDER_MINUTES} minutes",),
+    )
+    return {
+        queue_name: int(row[queue_name] or 0) if row else 0
+        for queue_name in QUEUE_LABELS
+    }
+
+
+def format_admin_dashboard(admin_id: int) -> str:
+    counts = get_queue_counts()
+    role = "负责人" if is_owner(admin_id) else "管理员"
+    target_chat_id = get_admin_state(admin_id)
+    reply_state = (
+        f"\n\n<b>正在回复</b>\n用户 <code>{target_chat_id}</code>"
+        if target_chat_id is not None
+        else ""
+    )
+    return (
+        "<b>留言工作台</b>\n"
+        f"<code>{admin_id}</code> · {role}\n\n"
+        f"待处理：<b>{counts['inbox']}</b>\n"
+        f"其中超时：<b>{counts['pending']}</b>\n"
+        f"已处理：<b>{counts['closed']}</b>"
+        f"{reply_state}"
+    )
+
+
 def format_conversation_queue(queue_name: str, rows: list[sqlite3.Row]) -> str:
     titles = {
-        "inbox": "待处理消息",
+        "inbox": "待处理",
         "pending": f"超时待处理（超过 {PENDING_REMINDER_MINUTES} 分钟）",
-        "closed": "最近已处理",
+        "closed": "已处理",
     }
-    lines = [titles[queue_name]]
-    for row in rows:
-        name = row["username"] or " ".join(
-            value
-            for value in (row["first_name"], row["last_name"])
-            if value
-        ).strip() or "-"
-        owner = row["owner_admin_id"] or "无人"
+    lines = [f"<b>{titles[queue_name]}</b>", f"当前显示 {len(rows)} 个会话"]
+    if not rows:
+        empty_messages = {
+            "inbox": "当前没有待处理消息。",
+            "pending": "当前没有超时消息。",
+            "closed": "当前没有已处理会话。",
+        }
+        lines.append(empty_messages[queue_name])
+        return "\n\n".join(lines)
+
+    for index, row in enumerate(rows, start=1):
+        name = escape_html_limited(row_user_label(row), 80)
+        owner_admin_id = row["owner_admin_id"]
+        owner = (
+            f"管理员 <code>{owner_admin_id}</code>"
+            if owner_admin_id is not None
+            else "未接管"
+        )
         unread = int(row["unread_count"] or 0)
-        timestamp = row["closed_at"] if queue_name == "closed" else row["last_user_message_at"]
+        timestamp = (
+            row["closed_at"]
+            if queue_name == "closed"
+            else row["last_user_message_at"]
+        )
+        if queue_name == "closed":
+            state_line = f"已处理 · {compact_timestamp(timestamp)}"
+        else:
+            state_line = (
+                f"{unread} 条待处理 · {owner} · {compact_timestamp(timestamp)}"
+            )
         lines.append(
-            f"<code>{row['chat_id']}</code> "
-            f"{escape_html_limited(str(name), 80)} "
-            f"未读 {unread} / 接管 {owner} / {timestamp or '-'}\n"
-            f"{escape_html_limited(row['last_message'] or '', 120)}"
+            f"<b>{index}. {name}</b>\n"
+            f"<code>{row['chat_id']}</code> · {state_line}\n"
+            f"{escape_html_limited(row['last_message'] or '无内容摘要', 160)}"
         )
     return "\n\n".join(lines)
+
+
+def get_recent_users(limit: int = 10) -> list[sqlite3.Row]:
+    return db_fetchall(
+        """
+        SELECT u.chat_id, u.username, u.first_name, u.last_name, u.last_message,
+               u.updated_at, b.chat_id AS blocked,
+               COALESCE(c.unread_count, 0) AS unread_count,
+               c.status AS conversation_status
+        FROM users u
+        LEFT JOIN blacklists b ON b.chat_id = u.chat_id
+        LEFT JOIN conversations c ON c.chat_id = u.chat_id
+        ORDER BY u.updated_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+
+
+def format_recent_users(rows: list[sqlite3.Row]) -> str:
+    lines = ["<b>最近用户</b>", f"当前显示 {len(rows)} 位用户"]
+    if not rows:
+        lines.append("暂无用户记录。")
+        return "\n\n".join(lines)
+
+    for index, row in enumerate(rows, start=1):
+        unread = int(row["unread_count"] or 0)
+        if row["blocked"]:
+            state = "黑名单"
+        elif unread > 0:
+            state = f"待处理 {unread}"
+        elif row["conversation_status"] == "closed":
+            state = "已处理"
+        else:
+            state = "暂无待处理"
+        lines.append(
+            f"<b>{index}. {escape_html_limited(row_user_label(row), 80)}</b>\n"
+            f"<code>{row['chat_id']}</code> · {state} · "
+            f"{compact_timestamp(row['updated_at'])}\n"
+            f"{escape_html_limited(row['last_message'] or '无内容摘要', 140)}"
+        )
+    return "\n\n".join(lines)
+
+
+def format_user_detail(chat_id: int) -> str:
+    user = db_fetchone("SELECT * FROM users WHERE chat_id = ?", (chat_id,))
+    if not user:
+        return f"<b>用户详情</b>\n\n未找到用户 <code>{chat_id}</code>。"
+
+    conversation = get_conversation(chat_id)
+    unread = int(conversation["unread_count"] or 0) if conversation else 0
+    owner_admin_id = conversation["owner_admin_id"] if conversation else None
+    if is_blacklisted(chat_id):
+        state = "黑名单"
+    elif conversation and conversation["status"] == "closed":
+        state = "已处理"
+    elif unread > 0:
+        state = f"待处理 {unread}"
+    else:
+        state = "暂无待处理"
+    owner = (
+        f"<code>{owner_admin_id}</code>" if owner_admin_id is not None else "未接管"
+    )
+    last_user_message_at = (
+        compact_timestamp(conversation["last_user_message_at"])
+        if conversation
+        else "-"
+    )
+    last_admin_reply_at = (
+        compact_timestamp(conversation["last_admin_reply_at"])
+        if conversation
+        else "-"
+    )
+    return (
+        "<b>用户详情</b>\n\n"
+        f"<b>{escape_html_limited(row_user_label(user), 100)}</b>\n"
+        f"ID：<code>{chat_id}</code>\n"
+        f"状态：{state}\n"
+        f"接管：{owner}\n"
+        f"最后留言：{last_user_message_at}\n"
+        f"最后回复：{last_admin_reply_at}\n\n"
+        "<b>最近记录</b>\n"
+        f"{format_history(chat_id, limit=10)}"
+    )
 
 
 def create_pending_broadcast(admin_id: int, content: str) -> str:
@@ -1602,17 +1847,25 @@ async def process_broadcast_job(job: sqlite3.Row) -> None:
                 failed_count = int(result["failed_count"])
                 reply_markup = (
                     inline_keyboard(
-                        [[("重试失败用户", f"broadcast_retry:{broadcast_id}")]]
+                        [
+                            [
+                                (
+                                    "重试失败用户",
+                                    f"broadcast_retry:{broadcast_id}",
+                                    "primary",
+                                )
+                            ]
+                        ]
                     )
                     if failed_count > 0
                     else None
                 )
                 await send_message(
                     int(result["admin_id"]),
-                    "群发完成\n\n"
-                    f"总计：{result['total_count']}\n"
-                    f"成功：{result['sent_count']}\n"
-                    f"失败：{failed_count}",
+                    "<b>群发完成</b>\n\n"
+                    f"成功：<b>{result['sent_count']}</b>\n"
+                    f"失败：<b>{failed_count}</b>\n"
+                    f"总计：{result['total_count']}",
                     reply_markup=reply_markup,
                 )
             return
@@ -1674,53 +1927,144 @@ def admin_user_keyboard(chat_id: int, viewer_admin_id: int | None = None) -> dic
     conversation = get_conversation(chat_id)
     is_closed = bool(conversation and conversation["status"] == "closed")
     owner_admin_id = get_conversation_owner(chat_id)
-    if is_closed:
-        reply_button = ("重新打开", f"reopen:{chat_id}")
-    elif owner_admin_id and viewer_admin_id and owner_admin_id != viewer_admin_id:
-        reply_button = ("接管会话", f"takeover:{chat_id}")
-    else:
-        reply_button = ("回复这个用户", f"reply:{chat_id}")
-
     if is_blacklisted(chat_id):
-        block_button = ("解除黑名单", f"unblacklist:{chat_id}")
+        return inline_keyboard(
+            [
+                [
+                    ("用户详情", f"detail:{chat_id}"),
+                    ("解除黑名单", f"unblacklist:{chat_id}", "success"),
+                ],
+                [("返回工作台", "admin:dashboard")],
+            ]
+        )
+
+    if is_closed:
+        return inline_keyboard(
+            [
+                [
+                    ("重新打开", f"reopen:{chat_id}", "primary"),
+                    ("用户详情", f"detail:{chat_id}"),
+                ],
+                [("加入黑名单", f"blacklist:{chat_id}")],
+                [("返回工作台", "admin:dashboard")],
+            ]
+        )
+
+    if owner_admin_id and viewer_admin_id and owner_admin_id != viewer_admin_id:
+        reply_button: ButtonSpec = ("接管", f"takeover:{chat_id}", "primary")
     else:
-        block_button = ("加入黑名单", f"blacklist:{chat_id}")
-    rows = [[reply_button, ("用户详情", f"detail:{chat_id}")]]
-    if not is_closed:
-        rows.append([("标记已处理", f"resolve:{chat_id}")])
-    rows.append([block_button])
-    return inline_keyboard(rows)
+        reply_button = ("回复", f"reply:{chat_id}", "primary")
+    return inline_keyboard(
+        [
+            [
+                reply_button,
+                ("标记已处理", f"resolve:{chat_id}", "success"),
+            ],
+            [
+                ("用户详情", f"detail:{chat_id}"),
+                ("加入黑名单", f"blacklist:{chat_id}"),
+            ],
+            [("返回工作台", "admin:dashboard")],
+        ]
+    )
+
+
+def admin_dashboard_keyboard() -> dict[str, Any]:
+    counts = get_queue_counts()
+    return inline_keyboard(
+        [
+            [
+                (f"待处理 {counts['inbox']}", "queue:inbox", "primary"),
+                (f"超时 {counts['pending']}", "queue:pending"),
+            ],
+            [
+                (f"已处理 {counts['closed']}", "queue:closed", "success"),
+                ("最近用户", "admin:users"),
+            ],
+            [("刷新", "admin:dashboard")],
+        ]
+    )
+
+
+def queue_navigation_rows() -> list[list[ButtonSpec]]:
+    counts = get_queue_counts()
+    return [
+        [
+            (f"待处理 {counts['inbox']}", "queue:inbox", "primary"),
+            (f"超时 {counts['pending']}", "queue:pending"),
+            (f"已处理 {counts['closed']}", "queue:closed", "success"),
+        ],
+        [("返回工作台", "admin:dashboard")],
+    ]
+
+
+def recent_users_keyboard(rows: list[sqlite3.Row]) -> dict[str, Any]:
+    keyboard_rows: list[list[ButtonSpec]] = []
+    current_row: list[ButtonSpec] = []
+    for index, row in enumerate(rows, start=1):
+        current_row.append((f"{index} 详情", f"detail:{row['chat_id']}"))
+        if len(current_row) == 2:
+            keyboard_rows.append(current_row)
+            current_row = []
+    if current_row:
+        keyboard_rows.append(current_row)
+    keyboard_rows.append([("返回工作台", "admin:dashboard")])
+    return inline_keyboard(keyboard_rows)
 
 
 def conversation_queue_keyboard(
     rows: list[sqlite3.Row],
     queue_name: str,
+    viewer_admin_id: int | None = None,
 ) -> dict[str, Any]:
-    keyboard_rows: list[list[tuple[str, str]]] = []
-    for row in rows:
+    keyboard_rows: list[list[ButtonSpec]] = []
+    for index, row in enumerate(rows, start=1):
         chat_id = int(row["chat_id"])
         if queue_name == "closed":
             keyboard_rows.append(
                 [
-                    (f"重开 {chat_id}", f"reopen:{chat_id}"),
-                    ("详情", f"detail:{chat_id}"),
+                    (f"{index} 重开", f"reopen:{chat_id}", "primary"),
+                    (f"{index} 详情", f"detail:{chat_id}"),
                 ]
+            )
+            continue
+
+        owner_admin_id = row["owner_admin_id"]
+        if (
+            owner_admin_id is not None
+            and viewer_admin_id is not None
+            and int(owner_admin_id) != viewer_admin_id
+        ):
+            primary_button: ButtonSpec = (
+                f"{index} 接管",
+                f"takeover:{chat_id}",
+                "primary",
             )
         else:
-            keyboard_rows.append(
-                [
-                    (f"回复 {chat_id}", f"reply:{chat_id}"),
-                    ("处理", f"resolve:{chat_id}"),
-                ]
+            primary_button = (
+                f"{index} 回复",
+                f"reply:{chat_id}",
+                "primary",
             )
+        keyboard_rows.append(
+            [
+                primary_button,
+                (f"{index} 详情", f"detail:{chat_id}"),
+                (f"{index} 处理", f"resolve:{chat_id}", "success"),
+            ]
+        )
+    keyboard_rows.extend(queue_navigation_rows())
     return inline_keyboard(keyboard_rows)
 
 
 def exit_reply_keyboard(chat_id: int) -> dict[str, Any]:
     return inline_keyboard(
         [
-            [("退出回复", f"cancel:{chat_id}")],
-            [("用户详情", f"detail:{chat_id}"), ("标记已处理", f"resolve:{chat_id}")],
+            [
+                ("退出回复", f"cancel:{chat_id}"),
+                ("标记已处理", f"resolve:{chat_id}", "success"),
+            ],
+            [("用户详情", f"detail:{chat_id}")],
         ]
     )
 
@@ -1728,9 +2072,76 @@ def exit_reply_keyboard(chat_id: int) -> dict[str, Any]:
 def welcome_keyboard() -> dict[str, Any]:
     return inline_keyboard(
         [
-            [("如何留言", "user_help")],
-            [("支持的消息", "user_guide")],
+            [
+                ("如何留言", "user_help", "primary"),
+                ("支持格式", "user_guide"),
+            ]
         ]
+    )
+
+
+async def present_admin_view(
+    admin_id: int,
+    text: str,
+    reply_markup: dict[str, Any],
+    callback: dict[str, Any] | None = None,
+) -> None:
+    if callback:
+        callback_message = callback.get("message") or {}
+        callback_chat = callback_message.get("chat") or {}
+        callback_chat_id = callback_chat.get("id")
+        callback_message_id = callback_message.get("message_id")
+        if isinstance(callback_chat_id, int) and isinstance(callback_message_id, int):
+            if await edit_message_text(
+                callback_chat_id,
+                callback_message_id,
+                text,
+                reply_markup=reply_markup,
+            ):
+                return
+    await send_message(admin_id, text, reply_markup=reply_markup)
+
+
+async def show_admin_dashboard(
+    admin_id: int,
+    callback: dict[str, Any] | None = None,
+) -> None:
+    await present_admin_view(
+        admin_id,
+        format_admin_dashboard(admin_id),
+        admin_dashboard_keyboard(),
+        callback,
+    )
+
+
+async def show_conversation_queue(
+    admin_id: int,
+    queue_name: str,
+    callback: dict[str, Any] | None = None,
+) -> None:
+    rows = get_conversation_queue(queue_name)
+    await present_admin_view(
+        admin_id,
+        format_conversation_queue(queue_name, rows),
+        conversation_queue_keyboard(
+            rows,
+            queue_name,
+            viewer_admin_id=admin_id,
+        ),
+        callback,
+    )
+
+
+async def show_recent_users(
+    admin_id: int,
+    callback: dict[str, Any] | None = None,
+) -> None:
+    rows = get_recent_users()
+    await present_admin_view(
+        admin_id,
+        format_recent_users(rows),
+        recent_users_keyboard(rows),
+        callback,
     )
 
 
@@ -1755,17 +2166,19 @@ async def notify_admins(
     conversation = get_conversation(chat_id)
     owner_admin_id = get_conversation_owner(chat_id)
     unread_count = int(conversation["unread_count"]) if conversation else 0
-    owner_line = (
-        f"当前接管：<code>{owner_admin_id}</code>\n" if owner_admin_id else "当前接管：无人\n"
+    owner_state = (
+        f"管理员 <code>{owner_admin_id}</code> 接管"
+        if owner_admin_id
+        else "未接管"
     )
     msg = (
-        f"{html.escape(title)}\n\n"
-        f"用户ID：<code>{chat_id}</code>\n"
-        f"用户：{escape_html_limited(user_label(user), 100)}\n"
-        f"{owner_line}"
-        f"待处理消息：{unread_count}\n"
-        f"内容：{escape_html_limited(text, 1200)}\n\n"
-        "此前历史：\n"
+        f"<b>{html.escape(title)}</b>\n"
+        f"{unread_count} 条待处理 · {owner_state}\n\n"
+        f"<b>{escape_html_limited(user_label(user), 100)}</b>\n"
+        f"ID：<code>{chat_id}</code>\n\n"
+        "<b>本条内容</b>\n"
+        f"{escape_html_limited(text, 1200)}\n\n"
+        "<b>最近记录</b>\n"
         f"{history}"
     )
 
@@ -1914,10 +2327,7 @@ async def handle_admin_command(admin_id: int, text: str) -> bool:
         return True
 
     if text == "/start" or text.startswith("/start "):
-        await send_message(
-            admin_id,
-            "管理入口已启用。请使用输入框左侧的菜单选择管理指令。",
-        )
+        await show_admin_dashboard(admin_id)
         return True
 
     if text == "/myid":
@@ -1942,61 +2352,11 @@ async def handle_admin_command(admin_id: int, text: str) -> bool:
         return True
 
     if text in {"/inbox", "/pending", "/closed"}:
-        queue_name = text[1:]
-        rows = get_conversation_queue(queue_name)
-        if not rows:
-            empty_messages = {
-                "inbox": "当前没有待处理消息。",
-                "pending": (
-                    f"没有超过 {PENDING_REMINDER_MINUTES} 分钟的待处理消息。"
-                ),
-                "closed": "暂无已处理会话。",
-            }
-            await send_message(admin_id, empty_messages[queue_name])
-            return True
-        await send_message(
-            admin_id,
-            format_conversation_queue(queue_name, rows),
-            reply_markup=conversation_queue_keyboard(rows, queue_name),
-        )
+        await show_conversation_queue(admin_id, text[1:])
         return True
 
     if text == "/users":
-        rows = db_fetchall(
-            """
-            SELECT u.chat_id, u.username, u.first_name, u.last_name, u.last_message,
-                   u.updated_at, b.chat_id AS blocked,
-                   COALESCE(c.unread_count, 0) AS unread_count,
-                   c.status AS conversation_status
-            FROM users u
-            LEFT JOIN blacklists b ON b.chat_id = u.chat_id
-            LEFT JOIN conversations c ON c.chat_id = u.chat_id
-            ORDER BY u.updated_at DESC
-            LIMIT 20
-            """
-        )
-        if not rows:
-            await send_message(admin_id, "暂无用户记录。")
-            return True
-
-        lines = ["最近用户："]
-        for row in rows:
-            name = row["username"] or " ".join(
-                x for x in [row["first_name"], row["last_name"]] if x
-            ).strip() or "-"
-            blocked = " [黑名单]" if row["blocked"] else ""
-            unread = (
-                f" [待处理 {row['unread_count']}]"
-                if int(row["unread_count"] or 0) > 0
-                else ""
-            )
-            closed = " [已处理]" if row["conversation_status"] == "closed" else ""
-            lines.append(
-                f"<code>{row['chat_id']}</code>{blocked}{unread}{closed} "
-                f"{escape_html_limited(name, 100)}："
-                f"{escape_html_limited(row['last_message'] or '', 100)}"
-            )
-        await send_message(admin_id, "\n".join(lines))
+        await show_recent_users(admin_id)
         return True
 
     if (
@@ -2035,7 +2395,8 @@ async def handle_admin_command(admin_id: int, text: str) -> bool:
         )
         await send_message(
             admin_id,
-            "已发送。",
+            "<b>消息已发送</b>\n\n"
+            f"用户：<code>{target_chat_id}</code>",
             reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
         )
         return True
@@ -2057,13 +2418,20 @@ async def handle_admin_command(admin_id: int, text: str) -> bool:
         total = active_user_count()
         await send_message(
             admin_id,
-            "请确认群发\n\n"
-            f"预计接收用户：{total}\n"
-            f"内容：{html.escape(content[:800])}",
+            "<b>确认群发</b>\n\n"
+            f"接收用户：<b>{total}</b>\n\n"
+            "<b>发送内容</b>\n"
+            f"{html.escape(content[:800])}",
             reply_markup=inline_keyboard(
                 [
-                    [("确认群发", f"broadcast_confirm:{broadcast_id}")],
-                    [("取消群发", f"broadcast_cancel:{broadcast_id}")],
+                    [
+                        (
+                            "确认群发",
+                            f"broadcast_confirm:{broadcast_id}",
+                            "primary",
+                        ),
+                        ("取消", f"broadcast_cancel:{broadcast_id}"),
+                    ],
                 ]
             ),
         )
@@ -2083,13 +2451,20 @@ async def handle_admin_command(admin_id: int, text: str) -> bool:
         if not rows:
             await send_message(admin_id, "暂无群发记录。")
             return True
-        lines = ["最近群发："]
-        for row in rows:
-            lines.append(
-                f"<code>{row['id']}</code> {html.escape(str(row['status']))} "
-                f"{row['sent_count']}/{row['total_count']}，失败 {row['failed_count']}"
+        lines = ["<b>最近群发</b>"]
+        for index, row in enumerate(rows, start=1):
+            status_label = BROADCAST_STATUS_LABELS.get(
+                str(row["status"]),
+                str(row["status"]),
             )
-        await send_message(admin_id, "\n".join(lines))
+            lines.append(
+                f"<b>{index}. {html.escape(status_label)}</b>\n"
+                f"任务：<code>{row['id']}</code>\n"
+                f"进度：{row['sent_count']}/{row['total_count']} · "
+                f"失败 {row['failed_count']}\n"
+                f"创建：{compact_timestamp(row['created_at'])}"
+            )
+        await send_message(admin_id, "\n\n".join(lines))
         return True
 
     if text == "/broadcast_retry" or text.startswith("/broadcast_retry "):
@@ -2125,29 +2500,34 @@ async def handle_admin_command(admin_id: int, text: str) -> bool:
             SELECT admin_id, action, target_chat_id, details, created_at
             FROM admin_audit_logs
             ORDER BY id DESC
-            LIMIT 20
+            LIMIT 15
             """
         )
         if not rows:
             await send_message(admin_id, "暂无管理员操作记录。")
             return True
-        lines = ["最近管理员操作："]
-        for row in rows:
+        lines = ["<b>最近管理员操作</b>"]
+        for index, row in enumerate(rows, start=1):
             target = (
-                f" / 用户 <code>{row['target_chat_id']}</code>"
+                f" · 用户 <code>{row['target_chat_id']}</code>"
                 if row["target_chat_id"] is not None
                 else ""
             )
             details = (
-                f" / {escape_html_limited(row['details'], 120)}"
+                f"\n{escape_html_limited(row['details'], 120)}"
                 if row["details"]
                 else ""
             )
-            lines.append(
-                f"{row['created_at']} / <code>{row['admin_id']}</code> / "
-                f"{html.escape(row['action'])}{target}{details}"
+            action_label = AUDIT_ACTION_LABELS.get(
+                str(row["action"]),
+                str(row["action"]),
             )
-        await send_message(admin_id, "\n".join(lines))
+            lines.append(
+                f"<b>{index}. {html.escape(action_label)}</b> · "
+                f"{compact_timestamp(row['created_at'])}\n"
+                f"管理员 <code>{row['admin_id']}</code>{target}{details}"
+            )
+        await send_message(admin_id, "\n\n".join(lines))
         return True
 
     if text == "/takeover" or text.startswith("/takeover "):
@@ -2161,7 +2541,9 @@ async def handle_admin_command(admin_id: int, text: str) -> bool:
         add_admin_audit(admin_id, "conversation_takeover", target_chat_id)
         await send_message(
             admin_id,
-            f"已接管会话：<code>{target_chat_id}</code>",
+            "<b>会话已接管</b>\n\n"
+            f"目标用户：<code>{target_chat_id}</code>\n"
+            "接下来发送的消息会转发给该用户。",
             reply_markup=exit_reply_keyboard(target_chat_id),
         )
         return True
@@ -2176,7 +2558,8 @@ async def handle_admin_command(admin_id: int, text: str) -> bool:
         add_admin_audit(admin_id, "conversation_resolved", target_chat_id)
         await send_message(
             admin_id,
-            f"已关闭会话：<code>{target_chat_id}</code>",
+            "<b>已标记处理</b>\n\n"
+            f"用户：<code>{target_chat_id}</code>",
             reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
         )
         return True
@@ -2196,7 +2579,15 @@ async def handle_admin_command(admin_id: int, text: str) -> bool:
             target_chat_id,
             f"reason={reason}" if reason else "",
         )
-        await send_message(admin_id, "已加入黑名单。")
+        await send_message(
+            admin_id,
+            "<b>已加入黑名单</b>\n\n"
+            f"用户：<code>{target_chat_id}</code>",
+            reply_markup=admin_user_keyboard(
+                target_chat_id,
+                viewer_admin_id=admin_id,
+            ),
+        )
         return True
 
     if text == "/unblacklist" or text.startswith("/unblacklist "):
@@ -2207,7 +2598,15 @@ async def handle_admin_command(admin_id: int, text: str) -> bool:
         target_chat_id = int(parts[1])
         unblacklist_user(target_chat_id)
         add_admin_audit(admin_id, "blacklist_remove", target_chat_id)
-        await send_message(admin_id, "已解除黑名单。")
+        await send_message(
+            admin_id,
+            "<b>已解除黑名单</b>\n\n"
+            f"用户：<code>{target_chat_id}</code>",
+            reply_markup=admin_user_keyboard(
+                target_chat_id,
+                viewer_admin_id=admin_id,
+            ),
+        )
         return True
 
     if text == "/blacklist_list":
@@ -2246,12 +2645,21 @@ async def handle_admin_message(message: dict[str, Any]) -> None:
         return
 
     if text.startswith("/"):
-        await send_message(admin_id, "未知管理员指令，请从输入框左侧菜单选择。")
+        await send_message(
+            admin_id,
+            "<b>未知管理员指令</b>\n\n请从命令菜单选择，或返回工作台。",
+            reply_markup=admin_dashboard_keyboard(),
+        )
         return
 
     target_chat_id = get_admin_state(admin_id)
     if not target_chat_id:
-        await send_message(admin_id, "请先点击“回复这个用户”，或使用 /reply 用户ID 内容。")
+        await send_message(
+            admin_id,
+            "<b>尚未选择回复对象</b>\n\n"
+            "请从待处理队列选择用户，或使用 /reply 用户ID 内容。",
+            reply_markup=admin_dashboard_keyboard(),
+        )
         return
 
     if is_blacklisted(target_chat_id):
@@ -2300,7 +2708,9 @@ async def handle_admin_message(message: dict[str, Any]) -> None:
     )
     await send_message(
         admin_id,
-        "已发送。继续输入可持续回复，或点击退出。",
+        "<b>消息已发送</b>\n\n"
+        f"目标用户：<code>{target_chat_id}</code>\n"
+        "回复模式仍然开启。",
         reply_markup=exit_reply_keyboard(target_chat_id),
     )
 
@@ -2337,6 +2747,25 @@ async def handle_callback(callback: dict[str, Any]) -> None:
         return
 
     action, raw_chat_id = data.split(":", 1)
+    if action == "admin":
+        if raw_chat_id == "dashboard":
+            await answer_callback_query(callback_id)
+            await show_admin_dashboard(admin_id, callback)
+        elif raw_chat_id == "users":
+            await answer_callback_query(callback_id)
+            await show_recent_users(admin_id, callback)
+        else:
+            await answer_callback_query(callback_id, "未知页面")
+        return
+
+    if action == "queue":
+        if raw_chat_id not in QUEUE_LABELS:
+            await answer_callback_query(callback_id, "未知队列")
+            return
+        await answer_callback_query(callback_id)
+        await show_conversation_queue(admin_id, raw_chat_id, callback)
+        return
+
     if action in {"broadcast_confirm", "broadcast_cancel", "broadcast_retry"}:
         if not is_owner(admin_id):
             await answer_callback_query(callback_id, "仅负责人可操作群发")
@@ -2427,8 +2856,9 @@ async def handle_callback(callback: dict[str, Any]) -> None:
         await answer_callback_query(callback_id, "已进入回复模式")
         await send_message(
             admin_id,
-            f"已进入持续回复模式。\n目标用户：<code>{target_chat_id}</code>\n\n"
-            "你现在发送普通消息，会自动转发给该用户。",
+            "<b>回复模式已开启</b>\n\n"
+            f"目标用户：<code>{target_chat_id}</code>\n"
+            "接下来发送的消息会转发给该用户。",
             reply_markup=exit_reply_keyboard(target_chat_id),
         )
         return
@@ -2456,8 +2886,9 @@ async def handle_callback(callback: dict[str, Any]) -> None:
         await answer_callback_query(callback_id, "已接管")
         await send_message(
             admin_id,
-            f"已接管会话：<code>{target_chat_id}</code>\n\n"
-            "你现在发送普通消息，会自动转发给该用户。",
+            "<b>会话已接管</b>\n\n"
+            f"目标用户：<code>{target_chat_id}</code>\n"
+            "接下来发送的消息会转发给该用户。",
             reply_markup=exit_reply_keyboard(target_chat_id),
         )
         return
@@ -2468,7 +2899,8 @@ async def handle_callback(callback: dict[str, Any]) -> None:
         await answer_callback_query(callback_id, "已标记处理")
         await send_message(
             admin_id,
-            f"已标记处理：<code>{target_chat_id}</code>",
+            "<b>已标记处理</b>\n\n"
+            f"用户：<code>{target_chat_id}</code>",
             reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
         )
         return
@@ -2479,51 +2911,48 @@ async def handle_callback(callback: dict[str, Any]) -> None:
         await answer_callback_query(callback_id, "已重新打开")
         await send_message(
             admin_id,
-            f"已重新打开会话：<code>{target_chat_id}</code>",
+            "<b>会话已重新打开</b>\n\n"
+            f"用户：<code>{target_chat_id}</code>",
             reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
         )
         return
 
     if action == "detail":
-        user = db_fetchone("SELECT * FROM users WHERE chat_id = ?", (target_chat_id,))
-        history = format_history(target_chat_id, limit=10)
-        blocked = "是" if is_blacklisted(target_chat_id) else "否"
-        conversation = get_conversation(target_chat_id)
-        if conversation:
-            owner = conversation["owner_admin_id"] or "无人"
-            session_status = f"{conversation['status']} / 接管：{owner}"
-        else:
-            session_status = "open / 接管：无人"
-        if user:
-            name = user["username"] or " ".join(
-                x for x in [user["first_name"], user["last_name"]] if x
-            ).strip() or "-"
-            text = (
-                "用户详情\n\n"
-                f"用户ID：<code>{target_chat_id}</code>\n"
-                f"用户：{html.escape(name)}\n"
-                f"黑名单：{blocked}\n"
-                f"会话：{html.escape(str(session_status))}\n"
-                f"待处理消息：{conversation['unread_count'] if conversation else 0}\n"
-                f"最后用户消息："
-                f"{conversation['last_user_message_at'] if conversation else '-'}\n"
-                f"最后管理员回复："
-                f"{conversation['last_admin_reply_at'] if conversation else '-'}\n"
-                f"最近更新：{user['updated_at']}\n\n"
-                "最近历史：\n"
-                f"{history}"
-            )
-        else:
-            text = f"未找到用户：<code>{target_chat_id}</code>"
         await answer_callback_query(callback_id)
         await send_message(
             admin_id,
-            text,
+            format_user_detail(target_chat_id),
             reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
         )
         return
 
     if action == "blacklist":
+        await answer_callback_query(callback_id)
+        await send_message(
+            admin_id,
+            "<b>确认加入黑名单</b>\n\n"
+            f"用户：<code>{target_chat_id}</code>\n"
+            "该用户的新留言将被拦截，不再通知管理员。",
+            reply_markup=inline_keyboard(
+                [
+                    [
+                        (
+                            "确认加入",
+                            f"blacklist_confirm:{target_chat_id}",
+                            "danger",
+                        ),
+                        ("取消", f"blacklist_cancel:{target_chat_id}"),
+                    ]
+                ]
+            ),
+        )
+        return
+
+    if action == "blacklist_cancel":
+        await answer_callback_query(callback_id, "已取消")
+        return
+
+    if action == "blacklist_confirm":
         blacklist_user(target_chat_id, admin_id, "管理员按钮添加")
         close_conversation(target_chat_id)
         add_admin_audit(
@@ -2535,7 +2964,8 @@ async def handle_callback(callback: dict[str, Any]) -> None:
         await answer_callback_query(callback_id, "已加入黑名单")
         await send_message(
             admin_id,
-            f"已将 <code>{target_chat_id}</code> 加入黑名单。",
+            "<b>已加入黑名单</b>\n\n"
+            f"用户：<code>{target_chat_id}</code>",
             reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
         )
         return
@@ -2546,7 +2976,8 @@ async def handle_callback(callback: dict[str, Any]) -> None:
         await answer_callback_query(callback_id, "已解除黑名单")
         await send_message(
             admin_id,
-            f"已解除 <code>{target_chat_id}</code> 的黑名单。",
+            "<b>已解除黑名单</b>\n\n"
+            f"用户：<code>{target_chat_id}</code>",
             reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
         )
         return
