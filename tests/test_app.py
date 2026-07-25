@@ -378,10 +378,28 @@ class BotDatabaseTests(unittest.TestCase):
         self.assertEqual(welcome_buttons[0]["style"], "primary")
         self.assertNotIn("style", welcome_buttons[1])
 
+        reply_buttons = app.exit_reply_keyboard(123)["inline_keyboard"][0]
+        self.assertEqual(reply_buttons[0]["text"], "退出回复")
+        self.assertEqual(reply_buttons[0]["style"], "danger")
+        self.assertEqual(reply_buttons[1]["style"], "success")
+
         with self.assertRaises(ValueError):
             app.inline_keyboard([[("Invalid", "invalid:1", "neon")]])
         with self.assertRaises(ValueError):
             app.inline_keyboard([[("Too", "many", "primary", "parts")]])
+
+    def test_broadcast_confirmation_uses_primary_and_danger_styles(self) -> None:
+        send = AsyncMock(return_value=True)
+        with patch.object(app, "send_message", send):
+            handled = asyncio.run(
+                app.handle_admin_command(1, "/broadcast planned maintenance")
+            )
+
+        self.assertTrue(handled)
+        buttons = send.await_args.kwargs["reply_markup"]["inline_keyboard"][0]
+        self.assertEqual(buttons[0]["style"], "primary")
+        self.assertEqual(buttons[1]["text"], "取消群发")
+        self.assertEqual(buttons[1]["style"], "danger")
 
     def test_command_normalization_and_welcome_positioning(self) -> None:
         self.assertEqual(app.normalize_command_text("/START@ExampleBot"), "/start")

@@ -2061,7 +2061,7 @@ def exit_reply_keyboard(chat_id: int) -> dict[str, Any]:
     return inline_keyboard(
         [
             [
-                ("退出回复", f"cancel:{chat_id}"),
+                ("退出回复", f"cancel:{chat_id}", "danger"),
                 ("标记已处理", f"resolve:{chat_id}", "success"),
             ],
             [("用户详情", f"detail:{chat_id}")],
@@ -2430,7 +2430,11 @@ async def handle_admin_command(admin_id: int, text: str) -> bool:
                             f"broadcast_confirm:{broadcast_id}",
                             "primary",
                         ),
-                        ("取消", f"broadcast_cancel:{broadcast_id}"),
+                        (
+                            "取消群发",
+                            f"broadcast_cancel:{broadcast_id}",
+                            "danger",
+                        ),
                     ],
                 ]
             ),
