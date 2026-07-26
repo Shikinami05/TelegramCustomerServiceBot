@@ -238,6 +238,9 @@ if ! wait_for_health; then
     false
 fi
 
+install -o root -g root -m 755 \
+    "$PROJECT_DIR/deploy/tg-bot-cli" /usr/local/bin/tg-bot
+
 ROLLBACK_ARMED=false
 if ! runuser -u "$APP_USER" -- \
     "$PYTHON_BIN" "$PROJECT_DIR/scripts/manage_webhook.py" --commands-only; then

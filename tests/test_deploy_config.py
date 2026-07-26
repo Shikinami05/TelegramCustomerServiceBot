@@ -65,6 +65,42 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn("BROADCAST_RATE_LIMIT_RETRIES=3", script)
         self.assertIn("DISPLAY_TIMEZONE=Asia/Hong_Kong", script)
 
+    def test_one_line_installer_and_management_command_are_wired(self) -> None:
+        bootstrap = (PROJECT_DIR / "scripts" / "bootstrap.sh").read_text(
+            encoding="utf-8"
+        )
+        command = (PROJECT_DIR / "scripts" / "tg-bot.sh").read_text(
+            encoding="utf-8"
+        )
+        install_script = (PROJECT_DIR / "scripts" / "install.sh").read_text(
+            encoding="utf-8"
+        )
+        update_script = (PROJECT_DIR / "scripts" / "update.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "https://github.com/Shikinami05/TelegramCustomerServiceBot.git",
+            bootstrap,
+        )
+        self.assertIn("--version latest", bootstrap)
+        self.assertIn("</dev/tty", bootstrap)
+        self.assertIn("INSTALL_WEBHOOK_URL", install_script)
+        self.assertIn("/usr/local/bin/tg-bot", install_script)
+        self.assertIn("/usr/local/bin/tg-bot", update_script)
+        for subcommand in (
+            "update)",
+            "backup)",
+            "status)",
+            "restart)",
+            "logs)",
+            "version)",
+            "webhook)",
+            "configure)",
+        ):
+            self.assertIn(subcommand, command)
+        self.assertIn("--kind manual", command)
+
     def test_release_install_update_and_rollback_controls_exist(self) -> None:
         install_script = (PROJECT_DIR / "scripts" / "install.sh").read_text(
             encoding="utf-8"

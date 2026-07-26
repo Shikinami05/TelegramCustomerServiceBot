@@ -65,52 +65,34 @@
 
 如果直接登录 root 且尚未安装服务，必须显式指定，例如 `sudo APP_USER=ubuntu bash scripts/install.sh`。
 
-## 从 GitHub 安装
+## 一行安装
 
-以运行 Bot 的普通 VPS 用户登录后执行：
-
-```bash
-sudo apt-get update
-sudo apt-get install -y git
-
-git clone https://github.com/Shikinami05/TelegramCustomerServiceBot.git ~/tg-bot
-cd ~/tg-bot
-
-sudo bash scripts/install.sh --version latest
-sudo bash scripts/configure-nginx.sh bot.example.com admin@example.com
-```
-
-安装指定稳定版本时，把 `latest` 替换为版本号（例如 `v1.0.0`）。版本参数只接受 `latest` 或稳定语义化 Tag；`.env` 和数据库只保存在 VPS，不会进入 GitHub。
-
-安装脚本会：
-
-- 安装 Python 与虚拟环境组件
-- 创建 `venv`
-- 安装锁定版本的依赖
-- 在首次安装时交互式创建 `.env`
-- 自动生成随机 `WEBHOOK_SECRET`
-- 将 `.env` 权限设置为 `600`
-- 安装并启动 systemd 服务
-- 运行语法检查和单元测试
-- 检查 `/healthz`
-
-`configure-nginx.sh` 会配置 Nginx、通过 Webroot 申请 HTTPS 证书、更新 `.env` 中的 `WEBHOOK_URL`，并设置 Telegram Webhook 与输入框命令菜单。默认使用 HTTPS `443`。
-
-对于已经存在的证书，新版 Certbot 会通过 `reconfigure` 把后续续期验证改为 Webroot；旧版 Certbot 会保留 Nginx 插件作为续期兼容兜底，不会强制重复签发证书。
-
-如果 `443` 已被 Xray REALITY 等服务占用，使用 Telegram 支持的 `8443`：
+以运行 Bot 的普通 VPS 用户登录，只执行这一行：
 
 ```bash
-sudo bash scripts/configure-nginx.sh bot.example.com admin@example.com 8443
+curl -fsSL https://raw.githubusercontent.com/Shikinami05/TelegramCustomerServiceBot/main/scripts/bootstrap.sh | sudo bash
 ```
 
-脚本会在修改 Nginx 前检查目标端口。发现端口由非 Nginx 程序占用时会停止，不会覆盖现有代理服务。使用 `8443` 时还需要在 UFW 和 VPS 服务商防火墙中允许 TCP `8443`。
+安装器会询问域名、证书邮箱、HTTPS 端口、Bot Token 和管理员 ID，然后完成 Git clone、稳定版选择、`.env`、systemd、Nginx、证书、Webhook 和命令菜单配置。检测到 `443` 已被 Xray 等程序占用时，会默认建议 Telegram 支持的 `8443`。
 
-脚本在 GitHub 上没有可执行权限时，可始终使用 `bash scripts/install.sh` 运行。也可以在 VPS 执行：
+真实 `.env` 和数据库只保存在 VPS，不会进入 GitHub。如果 `~/tg-bot` 已经是本项目，重复运行同一行会切换到公开 HTTPS 地址、安全更新到最新 Release，并安装下面的短命令；其他同名目录不会被覆盖。
 
-```bash
-chmod +x scripts/*.sh
-```
+## 常用命令
+
+| 功能 | 命令 |
+| --- | --- |
+| 更新到最新稳定版 | `sudo tg-bot update` |
+| 安装或回退指定版本 | `sudo tg-bot update v1.1.0` |
+| 手动备份数据库 | `sudo tg-bot backup` |
+| 查看服务与健康状态 | `sudo tg-bot status` |
+| 重启并检查服务 | `sudo tg-bot restart` |
+| 查看最近日志 | `sudo tg-bot logs` |
+| 查看当前版本 | `sudo tg-bot version` |
+| 查看 Webhook | `sudo tg-bot webhook` |
+| 重新配置 HTTPS | `sudo tg-bot configure bot.example.com admin@example.com 8443` |
+| 查看全部命令 | `sudo tg-bot help` |
+
+从 `v1.0.0` 或更早版本升级时，重新运行一次上面的一行安装命令；以后即可一直使用这些短命令。
 
 ## 环境变量
 
@@ -240,6 +222,14 @@ backups/bot-YYYYMMDD-HHMMSS.db
 
 默认保留最近 14 份。代码更新前，`scripts/update.sh` 也会先备份数据库。
 
+需要立即创建一份手动备份时：
+
+```bash
+sudo tg-bot backup
+```
+
+手动备份保存在 `backups/manual/`，默认保留最近 10 份。可以用 `sudo tg-bot backup 20` 修改保留数量。
+
 每次更新还会强制创建独立的回滚备份：
 
 ```text
@@ -252,27 +242,17 @@ backups/rollback/rollback-时间-提交.db
 
 ## 更新
 
-更新当前 Git 分支：
-
-```bash
-PROJECT_DIR="$(sudo systemctl show tg-bot -p WorkingDirectory --value)"
-cd "$PROJECT_DIR"
-sudo bash scripts/update.sh
-```
-
 更新到最新稳定 Release：
 
 ```bash
-sudo bash scripts/update.sh --version latest
+sudo tg-bot update
 ```
 
 安装或回退到指定 Release：
 
 ```bash
-sudo bash scripts/update.sh --version v1.0.0
+sudo tg-bot update v1.1.0
 ```
-
-不带 `--version` 时只允许当前分支向其上游执行 fast-forward 更新；处于 Tag 的 detached 状态时必须明确指定版本。
 
 更新前脚本会检查 Git 工作区、获取目标提交并创建数据库回滚备份。随后更新依赖、运行测试、同步 systemd 服务并检查 `/healthz`。任一步失败都会自动停止服务并恢复：
 
@@ -288,42 +268,33 @@ sudo bash scripts/update.sh --version v1.0.0
 查看当前部署版本、Git 引用、提交和工作区状态：
 
 ```bash
-cd "$(sudo systemctl show tg-bot -p WorkingDirectory --value)"
-bash scripts/version.sh
+sudo tg-bot version
 ```
 
-只输出简短版本：
-
-```bash
-bash scripts/version.sh --short
-```
-
-正式 Tag 部署会显示例如 `v1.0.0`；开发分支会显示例如 `v1.0.0+提交号`。
+正式 Tag 部署会显示例如 `v1.1.0`；开发分支会显示例如 `v1.1.0+提交号`。
 
 ## 发布 Release
 
 `VERSION` 保存当前语义化版本。准备新版本时，先通过 PR 更新该文件并合并到 `main`，然后在干净且与 `origin/main` 一致的本地仓库运行：
 
 ```bash
-bash scripts/create-release.sh v1.0.0
+bash scripts/create-release.sh v1.1.0
 ```
 
 脚本会验证版本、运行测试、创建 annotated Tag 并推送。`.github/workflows/release.yml` 会再次验证 Tag 和测试结果，然后使用仓库内置 `GITHUB_TOKEN` 创建带自动发行说明的 GitHub Release。
 
 ## Webhook
 
-设置或更新：
+重新配置 HTTPS、Webhook 和命令菜单：
 
 ```bash
-APP_USER="$(sudo systemctl show tg-bot -p User --value)"
-PROJECT_DIR="$(sudo systemctl show tg-bot -p WorkingDirectory --value)"
-sudo runuser -u "$APP_USER" -- "$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/scripts/manage_webhook.py"
+sudo tg-bot configure bot.example.com admin@example.com 8443
 ```
 
 查看当前状态：
 
 ```bash
-sudo runuser -u "$APP_USER" -- "$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/scripts/manage_webhook.py" --info
+sudo tg-bot webhook
 ```
 
 允许的 Telegram 更新类型：
@@ -341,13 +312,13 @@ https://bot.example.com:8443/tg/webhook
 ## 健康检查
 
 ```bash
-curl --fail http://127.0.0.1:9000/healthz
+sudo tg-bot status
 ```
 
 正常返回：
 
 ```json
-{"ok":true,"version":"1.0.0","db":"ok","broadcast_worker":"ok"}
+{"ok":true,"version":"1.1.0","db":"ok","broadcast_worker":"ok"}
 ```
 
 Nginx 模板不会把 `/healthz` 暴露到公网。
@@ -364,17 +335,6 @@ cd "$PROJECT_DIR"
 ```
 
 GitHub Actions 会在 Python 3.10 和 3.12 上自动执行这些检查，不需要生产环境密钥。
-
-## 运维命令
-
-```bash
-sudo systemctl status tg-bot --no-pager
-sudo systemctl restart tg-bot
-journalctl -u tg-bot -n 100 --no-pager
-journalctl -u tg-bot -f
-sudo nginx -t
-sudo systemctl reload nginx
-```
 
 ## GitHub 安全检查
 

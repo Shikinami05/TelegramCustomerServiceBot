@@ -56,6 +56,50 @@ class RollbackBackupTests(unittest.TestCase):
         self.assertTrue(backups[2].exists())
         self.assertTrue(backups[3].exists())
 
+    def test_manual_backups_are_pruned_separately(self) -> None:
+        backup_dir = self.backup.parent
+        first = backup_dir / "manual-1.db"
+        second = backup_dir / "manual-2.db"
+        third = backup_dir / "manual-3.db"
+        rollback = backup_dir / "rollback-keep.db"
+
+        manage_backup.create_backup(
+            self.database,
+            first,
+            keep=10,
+            kind="manual",
+        )
+        manage_backup.create_backup(
+            self.database,
+            second,
+            keep=10,
+            kind="manual",
+        )
+        os.utime(first, (1, 1))
+        os.utime(second, (2, 2))
+        rollback.write_bytes(b"separate rollback backup")
+
+        manage_backup.create_backup(
+            self.database,
+            third,
+            keep=2,
+            kind="manual",
+        )
+
+        self.assertFalse(first.exists())
+        self.assertTrue(second.exists())
+        self.assertTrue(third.exists())
+        self.assertTrue(rollback.exists())
+
+    def test_backup_kind_must_match_the_filename(self) -> None:
+        with self.assertRaises(ValueError):
+            manage_backup.create_backup(
+                self.database,
+                self.backup.parent / "rollback-wrong.db",
+                keep=5,
+                kind="manual",
+            )
+
     def test_corrupt_rollback_backup_does_not_replace_live_database(self) -> None:
         self.backup.parent.mkdir()
         self.backup.write_bytes(b"not a sqlite database")
