@@ -691,6 +691,7 @@ class BotDatabaseTests(unittest.TestCase):
             self.assertEqual(duplicate.status_code, 200)
             self.assertEqual(health.status_code, 200)
             self.assertTrue(health.json()["ok"])
+            self.assertEqual(health.json()["version"], app.APP_VERSION)
 
             failed = client.post(
                 "/tg/webhook",

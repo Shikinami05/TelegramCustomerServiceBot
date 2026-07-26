@@ -6,6 +6,36 @@ if [[ "${EUID}" -ne 0 ]]; then
     exit 1
 fi
 
+usage() {
+    cat <<'EOF'
+Usage: sudo bash scripts/install.sh [--version latest|v1.2.3]
+
+Without --version, installs the currently checked-out code.
+EOF
+}
+
+REQUESTED_VERSION=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --version)
+            if [[ $# -lt 2 ]]; then
+                echo "--version requires a value." >&2
+                exit 2
+            fi
+            REQUESTED_VERSION="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SERVICE_NAME="${SERVICE_NAME:-tg-bot}"
@@ -29,9 +59,21 @@ if ! command -v apt-get >/dev/null 2>&1; then
 fi
 
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv curl openssl
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    python3 python3-venv curl git openssl
 
 chown -R "$APP_USER:$APP_USER" "$PROJECT_DIR"
+if [[ -n "$REQUESTED_VERSION" ]]; then
+    require_clean_git_checkout "$PROJECT_DIR"
+    resolve_release_tag "$PROJECT_DIR" "$REQUESTED_VERSION"
+    git_as_app -C "$PROJECT_DIR" checkout --detach "$RELEASE_COMMIT"
+    echo "Selected release $RELEASE_TAG ($RELEASE_COMMIT)"
+fi
+if [[ ! -f "$PROJECT_DIR/VERSION" || ! -f "$PROJECT_DIR/app.py" ]]; then
+    echo "The selected checkout is not an installable release." >&2
+    exit 1
+fi
+
 if [[ ! -d "$PROJECT_DIR/venv" ]]; then
     runuser -u "$APP_USER" -- python3 -m venv "$PROJECT_DIR/venv"
 fi
@@ -87,7 +129,8 @@ sed \
 chmod 644 "$SERVICE_FILE"
 
 cd "$PROJECT_DIR"
-runuser -u "$APP_USER" -- "$PROJECT_DIR/venv/bin/python" -m py_compile app.py scripts/manage_webhook.py
+runuser -u "$APP_USER" -- "$PROJECT_DIR/venv/bin/python" -m py_compile \
+    app.py scripts/manage_webhook.py scripts/manage_backup.py
 runuser -u "$APP_USER" -- "$PROJECT_DIR/venv/bin/python" -m unittest discover -s tests -v
 
 systemctl daemon-reload
