@@ -100,6 +100,10 @@ class DeploymentConfigTests(unittest.TestCase):
 
         self.assertRegex(version, r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
         self.assertIn("contents: write", workflow)
+        self.assertIn(
+            '"refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"',
+            workflow,
+        )
         self.assertIn('gh release create "${GITHUB_REF_NAME}"', workflow)
         self.assertIn("does not match VERSION", release_script)
 
