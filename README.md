@@ -65,7 +65,7 @@
 
 如果直接登录 root 且尚未安装服务，必须显式指定，例如 `sudo APP_USER=ubuntu bash scripts/install.sh`。
 
-## 一行安装
+## 安装
 
 以运行 Bot 的普通 VPS 用户登录，只执行这一行：
 
@@ -73,26 +73,45 @@
 curl -fsSL https://raw.githubusercontent.com/Shikinami05/TelegramCustomerServiceBot/main/scripts/bootstrap.sh | sudo bash
 ```
 
-安装器会询问域名、证书邮箱、HTTPS 端口、Bot Token 和管理员 ID，然后完成 Git clone、稳定版选择、`.env`、systemd、Nginx、证书、Webhook 和命令菜单配置。检测到 `443` 已被 Xray 等程序占用时，会默认建议 Telegram 支持的 `8443`。
+安装脚本支持：
 
-真实 `.env` 和数据库只保存在 VPS，不会进入 GitHub。如果 `~/tg-bot` 已经是本项目，重复运行同一行会切换到公开 HTTPS 地址、安全更新到最新 Release，并安装下面的短命令；其他同名目录不会被覆盖。
+- Debian 和 Ubuntu
+- 自动识别运行 Bot 的普通 Linux 用户
+- 全新安装及现有 `~/tg-bot` 安装迁移
+- 自动选择最新稳定 GitHub Release
+- 交互输入域名、证书邮箱、Bot Token 和管理员 ID
+- 自动创建 `.env`、随机 `WEBHOOK_SECRET` 和 Python 虚拟环境
+- 自动配置 systemd、Nginx、HTTPS 证书、Webhook 和 Telegram 命令菜单
+- HTTPS `443` 和 Telegram 支持的 `8443`
+- 检测到 `443` 被 Xray 等程序占用时默认建议 `8443`
+- 安装前测试及服务健康检查
 
-## 常用命令
+真实 `.env` 和数据库只保存在 VPS，不会进入 GitHub。如果 `~/tg-bot` 已经是本项目，重复运行同一条安装命令会切换到公开 HTTPS 地址并安全更新；其他同名目录不会被覆盖。
 
-| 功能 | 命令 |
+## 管理脚本支持的命令
+
+| 命令 | 功能和参数 |
 | --- | --- |
-| 更新到最新稳定版 | `sudo tg-bot update` |
-| 安装或回退指定版本 | `sudo tg-bot update v1.1.0` |
-| 手动备份数据库 | `sudo tg-bot backup` |
-| 查看服务与健康状态 | `sudo tg-bot status` |
-| 重启并检查服务 | `sudo tg-bot restart` |
-| 查看最近日志 | `sudo tg-bot logs` |
-| 查看当前版本 | `sudo tg-bot version` |
-| 查看 Webhook | `sudo tg-bot webhook` |
-| 重新配置 HTTPS | `sudo tg-bot configure bot.example.com admin@example.com 8443` |
-| 查看全部命令 | `sudo tg-bot help` |
+| `sudo tg-bot update [latest\|v1.2.3]` | 更新到最新稳定版，或安装、回退到指定稳定版本；默认 `latest` |
+| `sudo tg-bot backup [KEEP]` | 创建 SQLite 手动备份；默认保留最近 10 份 |
+| `sudo tg-bot status` | 查看 systemd 服务状态和 `/healthz` |
+| `sudo tg-bot restart` | 重启服务并等待健康检查通过 |
+| `sudo tg-bot logs [LINES]` | 查看最近日志；默认显示 100 行 |
+| `sudo tg-bot version` | 查看版本、Git 引用、提交和工作区状态 |
+| `sudo tg-bot webhook` | 查看 Telegram Webhook 状态 |
+| `sudo tg-bot configure DOMAIN EMAIL [443\|8443]` | 配置 Nginx、HTTPS、Webhook 和命令菜单；默认端口 `443` |
+| `sudo tg-bot help` | 显示脚本支持的全部命令 |
 
-从 `v1.0.0` 或更早版本升级时，重新运行一次上面的一行安装命令；以后即可一直使用这些短命令。
+例如：
+
+```bash
+sudo tg-bot update
+sudo tg-bot backup 20
+sudo tg-bot logs 200
+sudo tg-bot configure bot.example.com admin@example.com 8443
+```
+
+从 `v1.0.0` 或更早版本升级时，重新运行一次上面的安装命令；以后即可使用 `tg-bot` 管理脚本。
 
 ## 环境变量
 
