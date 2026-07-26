@@ -20,7 +20,8 @@
 - 新消息通知按“用户、本条内容、最近记录”分区，不重复展示当前消息
 - `/start` 打开留言工作台，可用按钮切换待处理、超时、已处理和最近用户
 - `/inbox` 显示尚未处理的新消息，`/pending` 显示超时待处理会话
-- 队列内容与操作按钮使用相同编号，便于在手机上快速对应
+- 队列和最近用户每页显示 10 条，内容与操作按钮使用相同编号
+- 时间按 `DISPLAY_TIMEZONE` 转换后展示，数据库仍保存 UTC 时间
 - 按钮颜色按用途区分：蓝色为主要操作、绿色为完成或恢复、红色为退出、取消或风险确认
 - `/closed` 显示最近已处理会话，可通过按钮重新打开
 - 持续回复模式，支持文字和媒体
@@ -169,6 +170,7 @@ BROADCAST_RATE_LIMIT_RETRIES=3
 UPDATE_PROCESSING_TIMEOUT_SECONDS=300
 PENDING_REMINDER_MINUTES=30
 TELEGRAM_INLINE_RETRY_MAX_SECONDS=5
+DISPLAY_TIMEZONE=Asia/Hong_Kong
 LOG_LEVEL=INFO
 ```
 
@@ -177,6 +179,8 @@ LOG_LEVEL=INFO
 `OWNER_IDS` 可以省略；省略时所有 `ADMIN_IDS` 都视为负责人，以保持旧配置兼容。配置后，只有负责人能使用群发、群发失败重试和 `/audit`。`OWNER_IDS` 中的账号会自动获得管理员权限。
 
 `PENDING_REMINDER_MINUTES` 控制 `/pending` 的超时阈值。普通消息只会在 `retry_after` 不超过 `TELEGRAM_INLINE_RETRY_MAX_SECONDS` 时短暂等待，避免 Webhook 长时间阻塞；后台群发不受这个短等待上限影响。
+
+`DISPLAY_TIMEZONE` 使用 IANA 时区名称，只影响管理员界面的时间显示，不改变 SQLite 中的 UTC 时间。默认值为 `Asia/Hong_Kong`；例如可改为 `Asia/Shanghai` 或 `UTC`。无效名称会让服务在启动时直接报错，避免静默显示错误时间。
 
 ## 管理员命令
 

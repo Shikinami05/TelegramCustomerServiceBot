@@ -9,10 +9,11 @@ import time
 import uuid
 from collections.abc import Iterator
 from contextlib import asynccontextmanager, contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from dotenv import load_dotenv
@@ -45,6 +46,14 @@ def env_float(name: str, default: float, minimum: float = 0.0) -> float:
         raise RuntimeError(f"{name} must be at least {minimum}")
     return value
 
+
+def load_display_timezone(name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise RuntimeError(f"DISPLAY_TIMEZONE is invalid: {name}") from exc
+
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 ADMIN_IDS = {
@@ -75,6 +84,8 @@ TELEGRAM_INLINE_RETRY_MAX_SECONDS = env_int(
     "TELEGRAM_INLINE_RETRY_MAX_SECONDS", 5, 0
 )
 BROADCAST_RATE_LIMIT_RETRIES = env_int("BROADCAST_RATE_LIMIT_RETRIES", 3, 0)
+DISPLAY_TIMEZONE_NAME = os.getenv("DISPLAY_TIMEZONE", "Asia/Hong_Kong").strip()
+DISPLAY_TIMEZONE = load_display_timezone(DISPLAY_TIMEZONE_NAME)
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 if not BOT_TOKEN:
@@ -153,6 +164,7 @@ QUEUE_LABELS = {
     "pending": "超时",
     "closed": "已处理",
 }
+ADMIN_PAGE_SIZE = 10
 
 BROADCAST_STATUS_LABELS = {
     "pending": "等待确认",
@@ -916,7 +928,17 @@ def user_label(user: dict[str, Any]) -> str:
 def compact_timestamp(value: Any) -> str:
     if not value:
         return "-"
-    return str(value).replace("T", " ")[:16]
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        normalized = str(value).strip().replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return normalized.replace("T", " ")[:16]
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(DISPLAY_TIMEZONE).strftime("%Y-%m-%d %H:%M")
 
 
 def row_user_label(row: sqlite3.Row) -> str:
@@ -1340,28 +1362,45 @@ def close_conversation(chat_id: int) -> None:
     clear_admin_states_for_target(chat_id)
 
 
-def get_conversation_queue(queue_name: str, limit: int = 10) -> list[sqlite3.Row]:
+def conversation_queue_filter(
+    queue_name: str,
+) -> tuple[str, str, tuple[Any, ...]]:
     where_clause: str
     order_clause: str
-    params: tuple[Any, ...]
+    params: tuple[Any, ...] = ()
     if queue_name == "inbox":
         where_clause = "c.status = 'open' AND c.unread_count > 0"
-        order_clause = "c.last_user_message_at DESC"
-        params = (limit,)
+        order_clause = "c.last_user_message_at DESC, c.chat_id DESC"
     elif queue_name == "pending":
         where_clause = (
             "c.status = 'open' AND c.unread_count > 0 "
             "AND c.last_user_message_at <= datetime('now', ?)"
         )
-        order_clause = "c.last_user_message_at ASC"
-        params = (f"-{PENDING_REMINDER_MINUTES} minutes", limit)
+        order_clause = "c.last_user_message_at ASC, c.chat_id ASC"
+        params = (f"-{PENDING_REMINDER_MINUTES} minutes",)
     elif queue_name == "closed":
         where_clause = "c.status = 'closed'"
-        order_clause = "c.closed_at DESC"
-        params = (limit,)
+        order_clause = "c.closed_at DESC, c.chat_id DESC"
     else:
         raise ValueError(f"unsupported queue: {queue_name}")
+    return where_clause, order_clause, params
 
+
+def count_conversation_queue(queue_name: str) -> int:
+    where_clause, _, params = conversation_queue_filter(queue_name)
+    row = db_fetchone(
+        f"SELECT COUNT(*) AS total FROM conversations c WHERE {where_clause}",
+        params,
+    )
+    return int(row["total"]) if row else 0
+
+
+def get_conversation_queue(
+    queue_name: str,
+    limit: int = ADMIN_PAGE_SIZE,
+    offset: int = 0,
+) -> list[sqlite3.Row]:
+    where_clause, order_clause, filter_params = conversation_queue_filter(queue_name)
     return db_fetchall(
         f"""
         SELECT c.chat_id, c.owner_admin_id, c.status, c.unread_count,
@@ -1372,10 +1411,35 @@ def get_conversation_queue(queue_name: str, limit: int = 10) -> list[sqlite3.Row
         LEFT JOIN users u ON u.chat_id = c.chat_id
         WHERE {where_clause}
         ORDER BY {order_clause}
-        LIMIT ?
+        LIMIT ? OFFSET ?
         """,
-        params,
+        (*filter_params, limit, offset),
     )
+
+
+def paginate(
+    page: int,
+    total_count: int,
+    page_size: int = ADMIN_PAGE_SIZE,
+) -> tuple[int, int, int]:
+    total_pages = max(1, (total_count + page_size - 1) // page_size)
+    normalized_page = min(max(page, 1), total_pages)
+    offset = (normalized_page - 1) * page_size
+    return normalized_page, total_pages, offset
+
+
+def parse_callback_page(raw_page: str | None) -> int | None:
+    if raw_page is None:
+        return 1
+    if (
+        not raw_page
+        or len(raw_page) > 9
+        or not raw_page.isascii()
+        or not raw_page.isdigit()
+    ):
+        return None
+    page = int(raw_page)
+    return page if page >= 1 else None
 
 
 def get_queue_counts() -> dict[str, int]:
@@ -1413,7 +1477,8 @@ def format_admin_dashboard(admin_id: int) -> str:
     )
     return (
         "<b>留言工作台</b>\n"
-        f"<code>{admin_id}</code> · {role}\n\n"
+        f"<code>{admin_id}</code> · {role}\n"
+        f"显示时区：<code>{escape_html_limited(DISPLAY_TIMEZONE_NAME, 64)}</code>\n\n"
         f"待处理：<b>{counts['inbox']}</b>\n"
         f"其中超时：<b>{counts['pending']}</b>\n"
         f"已处理：<b>{counts['closed']}</b>"
@@ -1421,13 +1486,24 @@ def format_admin_dashboard(admin_id: int) -> str:
     )
 
 
-def format_conversation_queue(queue_name: str, rows: list[sqlite3.Row]) -> str:
+def format_conversation_queue(
+    queue_name: str,
+    rows: list[sqlite3.Row],
+    page: int = 1,
+    total_pages: int = 1,
+    total_count: int | None = None,
+) -> str:
     titles = {
         "inbox": "待处理",
         "pending": f"超时待处理（超过 {PENDING_REMINDER_MINUTES} 分钟）",
         "closed": "已处理",
     }
-    lines = [f"<b>{titles[queue_name]}</b>", f"当前显示 {len(rows)} 个会话"]
+    total = len(rows) if total_count is None else total_count
+    lines = [
+        f"<b>{titles[queue_name]}</b>",
+        f"共 {total} 个会话 · 第 {page}/{total_pages} 页\n"
+        f"显示时区：<code>{escape_html_limited(DISPLAY_TIMEZONE_NAME, 64)}</code>",
+    ]
     if not rows:
         empty_messages = {
             "inbox": "当前没有待处理消息。",
@@ -1437,7 +1513,8 @@ def format_conversation_queue(queue_name: str, rows: list[sqlite3.Row]) -> str:
         lines.append(empty_messages[queue_name])
         return "\n\n".join(lines)
 
-    for index, row in enumerate(rows, start=1):
+    start_index = (page - 1) * ADMIN_PAGE_SIZE
+    for index, row in enumerate(rows, start=start_index + 1):
         name = escape_html_limited(row_user_label(row), 80)
         owner_admin_id = row["owner_admin_id"]
         owner = (
@@ -1465,7 +1542,15 @@ def format_conversation_queue(queue_name: str, rows: list[sqlite3.Row]) -> str:
     return "\n\n".join(lines)
 
 
-def get_recent_users(limit: int = 10) -> list[sqlite3.Row]:
+def count_recent_users() -> int:
+    row = db_fetchone("SELECT COUNT(*) AS total FROM users")
+    return int(row["total"]) if row else 0
+
+
+def get_recent_users(
+    limit: int = ADMIN_PAGE_SIZE,
+    offset: int = 0,
+) -> list[sqlite3.Row]:
     return db_fetchall(
         """
         SELECT u.chat_id, u.username, u.first_name, u.last_name, u.last_message,
@@ -1475,20 +1560,31 @@ def get_recent_users(limit: int = 10) -> list[sqlite3.Row]:
         FROM users u
         LEFT JOIN blacklists b ON b.chat_id = u.chat_id
         LEFT JOIN conversations c ON c.chat_id = u.chat_id
-        ORDER BY u.updated_at DESC
-        LIMIT ?
+        ORDER BY u.updated_at DESC, u.chat_id DESC
+        LIMIT ? OFFSET ?
         """,
-        (limit,),
+        (limit, offset),
     )
 
 
-def format_recent_users(rows: list[sqlite3.Row]) -> str:
-    lines = ["<b>最近用户</b>", f"当前显示 {len(rows)} 位用户"]
+def format_recent_users(
+    rows: list[sqlite3.Row],
+    page: int = 1,
+    total_pages: int = 1,
+    total_count: int | None = None,
+) -> str:
+    total = len(rows) if total_count is None else total_count
+    lines = [
+        "<b>最近用户</b>",
+        f"共 {total} 位用户 · 第 {page}/{total_pages} 页\n"
+        f"显示时区：<code>{escape_html_limited(DISPLAY_TIMEZONE_NAME, 64)}</code>",
+    ]
     if not rows:
         lines.append("暂无用户记录。")
         return "\n\n".join(lines)
 
-    for index, row in enumerate(rows, start=1):
+    start_index = (page - 1) * ADMIN_PAGE_SIZE
+    for index, row in enumerate(rows, start=start_index + 1):
         unread = int(row["unread_count"] or 0)
         if row["blocked"]:
             state = "黑名单"
@@ -1974,40 +2070,72 @@ def admin_dashboard_keyboard() -> dict[str, Any]:
     return inline_keyboard(
         [
             [
-                (f"待处理 {counts['inbox']}", "queue:inbox", "primary"),
-                (f"超时 {counts['pending']}", "queue:pending"),
+                (f"待处理 {counts['inbox']}", "queue:inbox:1", "primary"),
+                (f"超时 {counts['pending']}", "queue:pending:1"),
             ],
             [
-                (f"已处理 {counts['closed']}", "queue:closed", "success"),
-                ("最近用户", "admin:users"),
+                (f"已处理 {counts['closed']}", "queue:closed:1", "success"),
+                ("最近用户", "admin:users:1"),
             ],
             [("刷新", "admin:dashboard")],
         ]
     )
 
 
-def queue_navigation_rows() -> list[list[ButtonSpec]]:
+def pagination_navigation_row(
+    callback_prefix: str,
+    page: int,
+    total_pages: int,
+) -> list[ButtonSpec]:
+    row: list[ButtonSpec] = []
+    if page > 1:
+        row.append(("上一页", f"{callback_prefix}:{page - 1}"))
+    row.append((f"第 {page}/{total_pages} 页", f"{callback_prefix}:{page}"))
+    if page < total_pages:
+        row.append(("下一页", f"{callback_prefix}:{page + 1}"))
+    return row
+
+
+def queue_navigation_rows(
+    queue_name: str,
+    page: int,
+    total_pages: int,
+) -> list[list[ButtonSpec]]:
     counts = get_queue_counts()
-    return [
+    rows: list[list[ButtonSpec]] = [
         [
-            (f"待处理 {counts['inbox']}", "queue:inbox", "primary"),
-            (f"超时 {counts['pending']}", "queue:pending"),
-            (f"已处理 {counts['closed']}", "queue:closed", "success"),
+            (f"待处理 {counts['inbox']}", "queue:inbox:1", "primary"),
+            (f"超时 {counts['pending']}", "queue:pending:1"),
+            (f"已处理 {counts['closed']}", "queue:closed:1", "success"),
         ],
-        [("返回工作台", "admin:dashboard")],
     ]
+    if total_pages > 1:
+        rows.append(
+            pagination_navigation_row(f"queue:{queue_name}", page, total_pages)
+        )
+    rows.append([("返回工作台", "admin:dashboard")])
+    return rows
 
 
-def recent_users_keyboard(rows: list[sqlite3.Row]) -> dict[str, Any]:
+def recent_users_keyboard(
+    rows: list[sqlite3.Row],
+    page: int = 1,
+    total_pages: int = 1,
+) -> dict[str, Any]:
     keyboard_rows: list[list[ButtonSpec]] = []
     current_row: list[ButtonSpec] = []
-    for index, row in enumerate(rows, start=1):
+    start_index = (page - 1) * ADMIN_PAGE_SIZE
+    for index, row in enumerate(rows, start=start_index + 1):
         current_row.append((f"{index} 详情", f"detail:{row['chat_id']}"))
         if len(current_row) == 2:
             keyboard_rows.append(current_row)
             current_row = []
     if current_row:
         keyboard_rows.append(current_row)
+    if total_pages > 1:
+        keyboard_rows.append(
+            pagination_navigation_row("admin:users", page, total_pages)
+        )
     keyboard_rows.append([("返回工作台", "admin:dashboard")])
     return inline_keyboard(keyboard_rows)
 
@@ -2016,9 +2144,12 @@ def conversation_queue_keyboard(
     rows: list[sqlite3.Row],
     queue_name: str,
     viewer_admin_id: int | None = None,
+    page: int = 1,
+    total_pages: int = 1,
 ) -> dict[str, Any]:
     keyboard_rows: list[list[ButtonSpec]] = []
-    for index, row in enumerate(rows, start=1):
+    start_index = (page - 1) * ADMIN_PAGE_SIZE
+    for index, row in enumerate(rows, start=start_index + 1):
         chat_id = int(row["chat_id"])
         if queue_name == "closed":
             keyboard_rows.append(
@@ -2053,7 +2184,7 @@ def conversation_queue_keyboard(
                 (f"{index} 处理", f"resolve:{chat_id}", "success"),
             ]
         )
-    keyboard_rows.extend(queue_navigation_rows())
+    keyboard_rows.extend(queue_navigation_rows(queue_name, page, total_pages))
     return inline_keyboard(keyboard_rows)
 
 
@@ -2117,16 +2248,31 @@ async def show_admin_dashboard(
 async def show_conversation_queue(
     admin_id: int,
     queue_name: str,
+    page: int = 1,
     callback: dict[str, Any] | None = None,
 ) -> None:
-    rows = get_conversation_queue(queue_name)
+    total_count = count_conversation_queue(queue_name)
+    page, total_pages, offset = paginate(page, total_count)
+    rows = get_conversation_queue(
+        queue_name,
+        limit=ADMIN_PAGE_SIZE,
+        offset=offset,
+    )
     await present_admin_view(
         admin_id,
-        format_conversation_queue(queue_name, rows),
+        format_conversation_queue(
+            queue_name,
+            rows,
+            page=page,
+            total_pages=total_pages,
+            total_count=total_count,
+        ),
         conversation_queue_keyboard(
             rows,
             queue_name,
             viewer_admin_id=admin_id,
+            page=page,
+            total_pages=total_pages,
         ),
         callback,
     )
@@ -2134,13 +2280,21 @@ async def show_conversation_queue(
 
 async def show_recent_users(
     admin_id: int,
+    page: int = 1,
     callback: dict[str, Any] | None = None,
 ) -> None:
-    rows = get_recent_users()
+    total_count = count_recent_users()
+    page, total_pages, offset = paginate(page, total_count)
+    rows = get_recent_users(limit=ADMIN_PAGE_SIZE, offset=offset)
     await present_admin_view(
         admin_id,
-        format_recent_users(rows),
-        recent_users_keyboard(rows),
+        format_recent_users(
+            rows,
+            page=page,
+            total_pages=total_pages,
+            total_count=total_count,
+        ),
+        recent_users_keyboard(rows, page=page, total_pages=total_pages),
         callback,
     )
 
@@ -2752,22 +2906,37 @@ async def handle_callback(callback: dict[str, Any]) -> None:
 
     action, raw_chat_id = data.split(":", 1)
     if action == "admin":
-        if raw_chat_id == "dashboard":
+        view_name, separator, raw_page = raw_chat_id.partition(":")
+        if view_name == "dashboard" and not separator:
             await answer_callback_query(callback_id)
             await show_admin_dashboard(admin_id, callback)
-        elif raw_chat_id == "users":
+        elif view_name == "users":
+            page = parse_callback_page(raw_page if separator else None)
+            if page is None:
+                await answer_callback_query(callback_id, "页码无效")
+                return
             await answer_callback_query(callback_id)
-            await show_recent_users(admin_id, callback)
+            await show_recent_users(admin_id, page=page, callback=callback)
         else:
             await answer_callback_query(callback_id, "未知页面")
         return
 
     if action == "queue":
-        if raw_chat_id not in QUEUE_LABELS:
+        queue_name, separator, raw_page = raw_chat_id.partition(":")
+        if queue_name not in QUEUE_LABELS:
             await answer_callback_query(callback_id, "未知队列")
             return
+        page = parse_callback_page(raw_page if separator else None)
+        if page is None:
+            await answer_callback_query(callback_id, "页码无效")
+            return
         await answer_callback_query(callback_id)
-        await show_conversation_queue(admin_id, raw_chat_id, callback)
+        await show_conversation_queue(
+            admin_id,
+            queue_name,
+            page=page,
+            callback=callback,
+        )
         return
 
     if action in {"broadcast_confirm", "broadcast_cancel", "broadcast_retry"}:
