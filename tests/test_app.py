@@ -6,6 +6,7 @@ import stat
 import tempfile
 import unittest
 import warnings
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -242,6 +243,102 @@ class BotDatabaseTests(unittest.TestCase):
             "admin:dashboard",
         )
 
+    def test_display_timezone_converts_utc_and_rejects_invalid_names(self) -> None:
+        previous_timezone = app.DISPLAY_TIMEZONE
+        try:
+            app.DISPLAY_TIMEZONE = app.load_display_timezone("Asia/Hong_Kong")
+            self.assertEqual(
+                app.compact_timestamp("2026-07-26 00:15:00"),
+                "2026-07-26 08:15",
+            )
+            self.assertEqual(
+                app.compact_timestamp(
+                    datetime(2026, 7, 26, 0, 15, tzinfo=timezone.utc)
+                ),
+                "2026-07-26 08:15",
+            )
+        finally:
+            app.DISPLAY_TIMEZONE = previous_timezone
+
+        with self.assertRaises(RuntimeError):
+            app.load_display_timezone("Invalid/Timezone")
+        with self.assertRaises(RuntimeError):
+            app.load_display_timezone("")
+
+    def test_queue_and_recent_users_paginate_with_global_numbering(self) -> None:
+        for index in range(25):
+            chat_id = 1000 + index
+            app.db_execute(
+                """
+                INSERT INTO users (
+                    chat_id, username, last_message, updated_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    chat_id,
+                    f"page_user_{index}",
+                    f"message {index}",
+                    f"2026-07-26 00:{index:02d}:00",
+                ),
+            )
+            app.record_user_activity(chat_id)
+
+        self.assertEqual(app.count_conversation_queue("inbox"), 25)
+        self.assertEqual(app.count_recent_users(), 25)
+        self.assertEqual(app.paginate(999, 25), (3, 3, 20))
+
+        queue_rows = app.get_conversation_queue("inbox", limit=10, offset=10)
+        queue_text = app.format_conversation_queue(
+            "inbox",
+            queue_rows,
+            page=2,
+            total_pages=3,
+            total_count=25,
+        )
+        queue_keyboard = app.conversation_queue_keyboard(
+            queue_rows,
+            "inbox",
+            viewer_admin_id=1,
+            page=2,
+            total_pages=3,
+        )
+        self.assertEqual(len(queue_rows), 10)
+        self.assertIn("共 25 个会话 · 第 2/3 页", queue_text)
+        self.assertIn("<b>11.", queue_text)
+        self.assertEqual(
+            queue_keyboard["inline_keyboard"][0][0]["text"],
+            "11 回复",
+        )
+        queue_callbacks = {
+            button["callback_data"]
+            for row in queue_keyboard["inline_keyboard"]
+            for button in row
+        }
+        self.assertIn("queue:inbox:1", queue_callbacks)
+        self.assertIn("queue:inbox:3", queue_callbacks)
+
+        recent_rows = app.get_recent_users(limit=10, offset=20)
+        recent_text = app.format_recent_users(
+            recent_rows,
+            page=3,
+            total_pages=3,
+            total_count=25,
+        )
+        recent_keyboard = app.recent_users_keyboard(
+            recent_rows,
+            page=3,
+            total_pages=3,
+        )
+        self.assertEqual(len(recent_rows), 5)
+        self.assertIn("共 25 位用户 · 第 3/3 页", recent_text)
+        self.assertIn("<b>21.", recent_text)
+        recent_callbacks = {
+            button["callback_data"]
+            for row in recent_keyboard["inline_keyboard"]
+            for button in row
+        }
+        self.assertIn("admin:users:2", recent_callbacks)
+
     def test_queue_callback_reuses_the_current_message(self) -> None:
         callback = {
             "id": "queue-callback",
@@ -266,6 +363,42 @@ class BotDatabaseTests(unittest.TestCase):
         edit.assert_awaited_once()
         self.assertIn("<b>待处理</b>", edit.await_args.args[2])
         send.assert_not_awaited()
+
+    def test_paginated_callbacks_require_admin_and_validate_ascii_page(self) -> None:
+        show_queue = AsyncMock()
+        answer = AsyncMock(return_value=True)
+        callback = {
+            "id": "queue-page-denied",
+            "from": {"id": 999},
+            "data": "queue:inbox:2",
+            "message": {"chat": {"id": 999, "type": "private"}},
+        }
+        with (
+            patch.object(app, "answer_callback_query", answer),
+            patch.object(app, "show_conversation_queue", show_queue),
+        ):
+            asyncio.run(app.handle_callback(callback))
+
+        answer.assert_awaited_once_with("queue-page-denied", "无权限")
+        show_queue.assert_not_awaited()
+
+        answer.reset_mock()
+        callback.update(
+            {
+                "id": "queue-page-invalid",
+                "from": {"id": 1},
+                "data": "queue:inbox:１２",
+                "message": {"chat": {"id": 1, "type": "private"}},
+            }
+        )
+        with (
+            patch.object(app, "answer_callback_query", answer),
+            patch.object(app, "show_conversation_queue", show_queue),
+        ):
+            asyncio.run(app.handle_callback(callback))
+
+        answer.assert_awaited_once_with("queue-page-invalid", "页码无效")
+        show_queue.assert_not_awaited()
 
     def test_admin_ui_views_fit_telegram_limits(self) -> None:
         for chat_id in range(70, 80):

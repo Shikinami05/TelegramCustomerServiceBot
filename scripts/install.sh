@@ -70,6 +70,7 @@ if [[ ! -f "$PROJECT_DIR/.env" ]]; then
         printf 'UPDATE_PROCESSING_TIMEOUT_SECONDS=300\n'
         printf 'PENDING_REMINDER_MINUTES=30\n'
         printf 'TELEGRAM_INLINE_RETRY_MAX_SECONDS=5\n'
+        printf 'DISPLAY_TIMEZONE=Asia/Hong_Kong\n'
         printf 'LOG_LEVEL=INFO\n'
     } > "$PROJECT_DIR/.env"
     chown "$APP_USER:$APP_USER" "$PROJECT_DIR/.env"

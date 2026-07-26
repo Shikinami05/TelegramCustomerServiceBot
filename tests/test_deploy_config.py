@@ -63,6 +63,7 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn("OWNER_IDS=%s", script)
         self.assertIn("PENDING_REMINDER_MINUTES=30", script)
         self.assertIn("BROADCAST_RATE_LIMIT_RETRIES=3", script)
+        self.assertIn("DISPLAY_TIMEZONE=Asia/Hong_Kong", script)
 
 
 if __name__ == "__main__":
