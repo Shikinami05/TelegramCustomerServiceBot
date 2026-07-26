@@ -67,9 +67,7 @@
 
 ## 从 GitHub 安装
 
-公开仓库可以直接通过 HTTPS 安装，不需要配置 Deploy Key。`.env` 和数据库仍然只保存在 VPS，不会进入 GitHub。
-
-先以将要运行 Bot 的普通 VPS 用户登录。此时 `~` 就是这个用户真实的主目录，不需要写死 `/home/用户名`：
+以运行 Bot 的普通 VPS 用户登录后执行：
 
 ```bash
 sudo apt-get update
@@ -82,52 +80,7 @@ sudo bash scripts/install.sh --version latest
 sudo bash scripts/configure-nginx.sh bot.example.com admin@example.com
 ```
 
-如果以后把 Fork 或仓库改为私有，可以继续使用只读 Deploy Key：
-
-```bash
-mkdir -p ~/.ssh
-chmod 700 ~/.ssh
-ssh-keygen -t ed25519 -f ~/.ssh/tg-bot-deploy -C tg-bot-deploy
-cat ~/.ssh/tg-bot-deploy.pub
-```
-
-把公钥添加为 GitHub 仓库的只读 Deploy Key，再为这个专用密钥配置 SSH 别名：
-
-```sshconfig
-Host github-tg-bot
-    HostName github.com
-    User git
-    IdentityFile ~/.ssh/tg-bot-deploy
-    IdentitiesOnly yes
-```
-
-将上面的内容加入 `~/.ssh/config`，并设置权限：
-
-```bash
-chmod 600 ~/.ssh/config
-ssh -T git@github-tg-bot
-git clone git@github-tg-bot:OWNER/REPOSITORY.git ~/tg-bot
-cd ~/tg-bot
-
-sudo bash scripts/install.sh --version latest
-sudo bash scripts/configure-nginx.sh bot.example.com admin@example.com
-```
-
-默认安装当前检出的代码。正式部署建议选择最新稳定 Release：
-
-```bash
-sudo bash scripts/install.sh --version latest
-```
-
-也可以安装指定版本：
-
-```bash
-sudo bash scripts/install.sh --version v1.0.0
-```
-
-版本参数只接受 `latest` 或稳定语义化 Tag（例如 `v1.2.3`），不会接受任意分支、提交或路径。Tag 中的版本还必须与该提交里的 `VERSION` 文件一致。
-
-`install.sh` 会从 `SUDO_USER` 识别当前普通用户；安装完成后，其他脚本会优先读取 systemd 服务中的真实用户。若仓库需要安装给另一个用户，请明确运行 `sudo APP_USER=目标用户 bash scripts/install.sh`。
+安装指定稳定版本时，把 `latest` 替换为版本号（例如 `v1.0.0`）。版本参数只接受 `latest` 或稳定语义化 Tag；`.env` 和数据库只保存在 VPS，不会进入 GitHub。
 
 安装脚本会：
 
