@@ -99,6 +99,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "bot.db"
 DB_BACKUP_DIR = Path(os.getenv("DB_BACKUP_DIR", str(BASE_DIR / "backups")))
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
+APP_VERSION = (BASE_DIR / "VERSION").read_text(encoding="ascii").strip()
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -3166,7 +3167,12 @@ async def healthz() -> dict[str, str | bool]:
         raise HTTPException(status_code=503, detail="db unavailable") from exc
     if broadcast_worker_task is None or broadcast_worker_task.done():
         raise HTTPException(status_code=503, detail="broadcast worker unavailable")
-    return {"ok": True, "db": "ok", "broadcast_worker": "ok"}
+    return {
+        "ok": True,
+        "version": APP_VERSION,
+        "db": "ok",
+        "broadcast_worker": "ok",
+    }
 
 
 @app.post("/tg/webhook")

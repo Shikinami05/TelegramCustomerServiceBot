@@ -44,3 +44,92 @@ resolve_app_identity() {
     export APP_USER APP_HOME
     echo "Using application user $APP_USER ($source_name), home $APP_HOME"
 }
+
+git_as_app() {
+    runuser -u "$APP_USER" -- git "$@"
+}
+
+validate_release_tag() {
+    local version="$1"
+    [[ "$version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+}
+
+require_clean_git_checkout() {
+    local project_dir="$1"
+
+    if [[ ! -d "$project_dir/.git" ]]; then
+        echo "The project must be a Git checkout: $project_dir" >&2
+        return 1
+    fi
+    if [[ -n "$(git_as_app -C "$project_dir" status --porcelain)" ]]; then
+        echo "The Git checkout has local changes; operation aborted." >&2
+        return 1
+    fi
+}
+
+resolve_release_tag() {
+    local project_dir="$1"
+    local requested_version="$2"
+    local available_tags=""
+    local candidate=""
+    local declared_version=""
+    local remote_ref=""
+    local remote_refs=""
+    local remote_sha=""
+
+    if [[ "$requested_version" != "latest" ]] \
+        && ! validate_release_tag "$requested_version"; then
+        echo "Version must be 'latest' or a stable tag such as v1.2.3." >&2
+        return 1
+    fi
+
+    remote_refs="$(
+        git_as_app -C "$project_dir" ls-remote --tags --refs origin 'v*'
+    )"
+    while read -r remote_sha remote_ref; do
+        candidate="${remote_ref#refs/tags/}"
+        if validate_release_tag "$candidate"; then
+            available_tags+="${candidate}"$'\n'
+        fi
+    done <<< "$remote_refs"
+
+    if [[ "$requested_version" == "latest" ]]; then
+        requested_version="$(
+            printf '%s' "$available_tags" |
+                sort --version-sort --reverse |
+                sed -n '1p'
+        )"
+        if [[ -z "$requested_version" ]]; then
+            echo "No stable release tags were found." >&2
+            return 1
+        fi
+    elif ! grep -Fxq "$requested_version" <<< "$available_tags"; then
+        echo "Release tag does not exist on origin: $requested_version" >&2
+        return 1
+    fi
+
+    git_as_app -C "$project_dir" fetch origin \
+        "refs/tags/${requested_version}:refs/tags/${requested_version}"
+    if [[ "$(
+        git_as_app -C "$project_dir" cat-file -t \
+            "refs/tags/${requested_version}"
+    )" != "tag" ]]; then
+        echo "Release tag must be an annotated tag: $requested_version" >&2
+        return 1
+    fi
+    RELEASE_COMMIT="$(
+        git_as_app -C "$project_dir" rev-parse \
+            --verify "refs/tags/${requested_version}^{commit}"
+    )"
+    declared_version="$(
+        git_as_app -C "$project_dir" show "${RELEASE_COMMIT}:VERSION" |
+            tr -d '[:space:]'
+    )"
+    if [[ "v${declared_version}" != "$requested_version" ]]; then
+        echo "Tag $requested_version does not match VERSION ($declared_version)." >&2
+        return 1
+    fi
+
+    RELEASE_TAG="$requested_version"
+    export RELEASE_TAG RELEASE_COMMIT
+}

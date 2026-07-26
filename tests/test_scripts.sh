@@ -62,4 +62,37 @@ if resolve_app_identity "tg-bot" >/dev/null 2>&1; then
     exit 1
 fi
 
+validate_release_tag "v1.2.3"
+validate_release_tag "v0.0.0"
+for invalid_tag in "1.2.3" "v01.2.3" "v1.2" "v1.2.3-rc1" "main"; do
+    if validate_release_tag "$invalid_tag"; then
+        echo "invalid release tag was accepted: $invalid_tag" >&2
+        exit 1
+    fi
+done
+
+release_test_dir="$(mktemp -d)"
+trap 'rm -rf "$release_test_dir"' EXIT
+release_repo="$release_test_dir/repo"
+release_remote="$release_test_dir/remote.git"
+git init --quiet "$release_repo"
+git init --quiet --bare "$release_remote"
+git -C "$release_repo" config user.name "Release Test"
+git -C "$release_repo" config user.email "release@example.com"
+printf '1.2.3\n' > "$release_repo/VERSION"
+git -C "$release_repo" add VERSION
+git -C "$release_repo" commit --quiet -m "release"
+git -C "$release_repo" tag -a v1.2.3 -m "Release v1.2.3"
+git -C "$release_repo" remote add origin "$release_remote"
+git -C "$release_repo" push --quiet origin HEAD --tags
+
+runuser() {
+    shift 3
+    "$@"
+}
+APP_USER="release-test"
+resolve_release_tag "$release_repo" "latest" >/dev/null
+[[ "$RELEASE_TAG" == "v1.2.3" ]]
+[[ "$RELEASE_COMMIT" == "$(git -C "$release_repo" rev-parse HEAD)" ]]
+
 echo "Deployment identity tests passed."

@@ -43,6 +43,8 @@
 - Telegram HTTP 连接复用
 - 管理员通知自动控制在 Telegram 消息长度限制内
 - SQLite WAL、自动迁移、在线备份和可选历史数据保留
+- 支持按 GitHub Release 版本安装、更新和查看当前部署版本
+- 更新失败时自动恢复代码、依赖、systemd 配置和 SQLite 数据库
 - 数据库与备份目录在 Linux 上强制使用私有权限（文件 `600`、目录 `700`）
 - `/healthz` 同时检查数据库和群发后台任务
 - systemd 示例只监听 `127.0.0.1:9000`
@@ -100,6 +102,20 @@ cd ~/tg-bot
 sudo bash scripts/install.sh
 sudo bash scripts/configure-nginx.sh bot.example.com admin@example.com
 ```
+
+默认安装当前检出的代码。正式部署建议选择最新稳定 Release：
+
+```bash
+sudo bash scripts/install.sh --version latest
+```
+
+也可以安装指定版本：
+
+```bash
+sudo bash scripts/install.sh --version v1.0.0
+```
+
+版本参数只接受 `latest` 或稳定语义化 Tag（例如 `v1.2.3`），不会接受任意分支、提交或路径。Tag 中的版本还必须与该提交里的 `VERSION` 文件一致。
 
 `install.sh` 会从 `SUDO_USER` 识别当前普通用户；安装完成后，其他脚本会优先读取 systemd 服务中的真实用户。若仓库需要安装给另一个用户，请明确运行 `sudo APP_USER=目标用户 bash scripts/install.sh`。
 
@@ -261,11 +277,19 @@ backups/bot-YYYYMMDD-HHMMSS.db
 
 默认保留最近 14 份。代码更新前，`scripts/update.sh` 也会先备份数据库。
 
+每次更新还会强制创建独立的回滚备份：
+
+```text
+backups/rollback/rollback-时间-提交.db
+```
+
+默认保留最近 5 份，可在执行更新时通过 `ROLLBACK_BACKUP_KEEP` 调整。
+
 本机备份不能替代异地备份；重要数据应定期同步到另一台机器或对象存储。
 
 ## 更新
 
-GitHub 仓库没有本地改动时：
+更新当前 Git 分支：
 
 ```bash
 PROJECT_DIR="$(sudo systemctl show tg-bot -p WorkingDirectory --value)"
@@ -273,7 +297,55 @@ cd "$PROJECT_DIR"
 sudo bash scripts/update.sh
 ```
 
-更新脚本使用 `git pull --ff-only`，遇到本地代码修改会停止，不会强制覆盖。它会同步仓库中的 systemd 服务模板并执行 `daemon-reload`，让后续安全加固真正应用到现有 VPS。服务通过健康检查后会自动同步普通用户和管理员的 Telegram 输入框命令菜单；菜单同步失败只记录警告，不影响已经成功的代码更新。
+更新到最新稳定 Release：
+
+```bash
+sudo bash scripts/update.sh --version latest
+```
+
+安装或回退到指定 Release：
+
+```bash
+sudo bash scripts/update.sh --version v1.0.0
+```
+
+不带 `--version` 时只允许当前分支向其上游执行 fast-forward 更新；处于 Tag 的 detached 状态时必须明确指定版本。
+
+更新前脚本会检查 Git 工作区、获取目标提交并创建数据库回滚备份。随后更新依赖、运行测试、同步 systemd 服务并检查 `/healthz`。任一步失败都会自动停止服务并恢复：
+
+- 更新前 Git 提交和分支状态
+- 原版本 Python 依赖
+- 原 systemd 服务文件
+- 更新前 SQLite 数据库
+
+自动回滚完成后还会再次检查健康状态。若回滚本身未能完整完成，脚本以状态码 `70` 退出并给出需要检查的 `journalctl` 命令。服务正常后，Telegram 菜单同步失败只会记录警告，不触发代码回滚。
+
+## 版本
+
+查看当前部署版本、Git 引用、提交和工作区状态：
+
+```bash
+cd "$(sudo systemctl show tg-bot -p WorkingDirectory --value)"
+bash scripts/version.sh
+```
+
+只输出简短版本：
+
+```bash
+bash scripts/version.sh --short
+```
+
+正式 Tag 部署会显示例如 `v1.0.0`；开发分支会显示例如 `v1.0.0+提交号`。
+
+## 发布 Release
+
+`VERSION` 保存当前语义化版本。准备新版本时，先通过 PR 更新该文件并合并到 `main`，然后在干净且与 `origin/main` 一致的本地仓库运行：
+
+```bash
+bash scripts/create-release.sh v1.0.0
+```
+
+脚本会验证版本、运行测试、创建 annotated Tag 并推送。`.github/workflows/release.yml` 会再次验证 Tag 和测试结果，然后使用仓库内置 `GITHUB_TOKEN` 创建带自动发行说明的 GitHub Release。
 
 ## Webhook
 
@@ -312,7 +384,7 @@ curl --fail http://127.0.0.1:9000/healthz
 正常返回：
 
 ```json
-{"ok":true,"db":"ok","broadcast_worker":"ok"}
+{"ok":true,"version":"1.0.0","db":"ok","broadcast_worker":"ok"}
 ```
 
 Nginx 模板不会把 `/healthz` 暴露到公网。
@@ -324,7 +396,7 @@ Telegram API 错误日志只记录方法、HTTP 状态和错误描述，不记�
 ```bash
 PROJECT_DIR="$(sudo systemctl show tg-bot -p WorkingDirectory --value)"
 cd "$PROJECT_DIR"
-./venv/bin/python -m py_compile app.py scripts/manage_webhook.py
+./venv/bin/python -m py_compile app.py scripts/manage_webhook.py scripts/manage_backup.py
 ./venv/bin/python -m unittest discover -s tests -v
 ```
 
