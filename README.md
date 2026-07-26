@@ -1,4 +1,4 @@
-# Telegram 双向留言 Bot
+# Telegram Customer Service Bot
 
 这是一个基于 FastAPI、Telegram Webhook 和 SQLite 的双向留言 Bot。用户通过 Bot 留言，无需直接私聊个人账号；管理员会收到带历史记录的通知，并可接管会话持续回复。
 
@@ -67,7 +67,7 @@
 
 ## 从 GitHub 安装
 
-建议先使用私有仓库。VPS 使用只读 Deploy Key 拉取代码，`.env` 和数据库只保存在 VPS。
+公开仓库可以直接通过 HTTPS 安装，不需要配置 Deploy Key。`.env` 和数据库仍然只保存在 VPS，不会进入 GitHub。
 
 先以将要运行 Bot 的普通 VPS 用户登录。此时 `~` 就是这个用户真实的主目录，不需要写死 `/home/用户名`：
 
@@ -75,6 +75,16 @@
 sudo apt-get update
 sudo apt-get install -y git
 
+git clone https://github.com/Shikinami05/TelegramCustomerServiceBot.git ~/tg-bot
+cd ~/tg-bot
+
+sudo bash scripts/install.sh --version latest
+sudo bash scripts/configure-nginx.sh bot.example.com admin@example.com
+```
+
+如果以后把 Fork 或仓库改为私有，可以继续使用只读 Deploy Key：
+
+```bash
 mkdir -p ~/.ssh
 chmod 700 ~/.ssh
 ssh-keygen -t ed25519 -f ~/.ssh/tg-bot-deploy -C tg-bot-deploy
@@ -99,7 +109,7 @@ ssh -T git@github-tg-bot
 git clone git@github-tg-bot:OWNER/REPOSITORY.git ~/tg-bot
 cd ~/tg-bot
 
-sudo bash scripts/install.sh
+sudo bash scripts/install.sh --version latest
 sudo bash scripts/configure-nginx.sh bot.example.com admin@example.com
 ```
 
