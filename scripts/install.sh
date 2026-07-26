@@ -84,7 +84,10 @@ if [[ ! -f "$PROJECT_DIR/.env" ]]; then
     read -r -s -p "BOT_TOKEN: " BOT_TOKEN_INPUT
     echo
     read -r -p "ADMIN_IDS (comma separated): " ADMIN_IDS_INPUT
-    read -r -p "Webhook URL (for example https://bot.example.com/tg/webhook): " WEBHOOK_URL_INPUT
+    WEBHOOK_URL_INPUT="${INSTALL_WEBHOOK_URL:-}"
+    if [[ -z "$WEBHOOK_URL_INPUT" ]]; then
+        read -r -p "Webhook URL (for example https://bot.example.com/tg/webhook): " WEBHOOK_URL_INPUT
+    fi
     WEBHOOK_SECRET_INPUT="$(openssl rand -hex 32)"
 
     if [[ -z "$BOT_TOKEN_INPUT" || -z "$ADMIN_IDS_INPUT" || -z "$WEBHOOK_URL_INPUT" ]]; then
@@ -148,6 +151,8 @@ if ! curl --fail --silent --show-error http://127.0.0.1:9000/healthz; then
     journalctl -u "$SERVICE_NAME" -n 80 --no-pager
     exit 1
 fi
+install -o root -g root -m 755 \
+    "$PROJECT_DIR/deploy/tg-bot-cli" /usr/local/bin/tg-bot
 echo
 echo "Bot service installation complete."
-echo "Next: sudo bash scripts/configure-nginx.sh DOMAIN EMAIL"
+echo "Next: sudo tg-bot configure DOMAIN EMAIL [443|8443]"

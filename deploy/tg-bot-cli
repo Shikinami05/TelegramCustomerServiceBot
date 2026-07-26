@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SERVICE_NAME="${SERVICE_NAME:-tg-bot}"
+PROJECT_DIR="$(
+    systemctl show "$SERVICE_NAME" --property=WorkingDirectory --value
+)"
+
+if [[ -z "$PROJECT_DIR" || ! -f "$PROJECT_DIR/scripts/tg-bot.sh" ]]; then
+    echo "Unable to locate the installed tg-bot project." >&2
+    exit 1
+fi
+
+exec bash "$PROJECT_DIR/scripts/tg-bot.sh" "$@"

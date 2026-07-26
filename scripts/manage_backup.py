@@ -46,9 +46,13 @@ def copy_database(
         temp_path.unlink(missing_ok=True)
 
 
-def prune_backups(directory: Path, keep: int) -> None:
+def prune_backups(
+    directory: Path,
+    keep: int,
+    kind: str = "rollback",
+) -> None:
     backups = sorted(
-        directory.glob("rollback-*.db"),
+        directory.glob(f"{kind}-*.db"),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
@@ -56,13 +60,22 @@ def prune_backups(directory: Path, keep: int) -> None:
         old_backup.unlink(missing_ok=True)
 
 
-def create_backup(database: Path, output: Path, keep: int) -> None:
+def create_backup(
+    database: Path,
+    output: Path,
+    keep: int,
+    kind: str = "rollback",
+) -> None:
     if not database.is_file():
         raise FileNotFoundError(f"Database does not exist: {database}")
     if database.resolve() == output.resolve():
         raise ValueError("Backup output must differ from the live database")
+    if kind not in {"manual", "rollback"}:
+        raise ValueError("Backup kind must be manual or rollback")
+    if not output.name.startswith(f"{kind}-"):
+        raise ValueError(f"{kind} backup filename must start with {kind}-")
     copy_database(database, output)
-    prune_backups(output.parent, keep)
+    prune_backups(output.parent, keep, kind)
 
 
 def restore_backup(database: Path, source: Path) -> None:
@@ -83,6 +96,11 @@ def build_parser() -> argparse.ArgumentParser:
     create_parser.add_argument("--database", type=Path, default=DEFAULT_DATABASE)
     create_parser.add_argument("--output", type=Path, required=True)
     create_parser.add_argument("--keep", type=int, default=5)
+    create_parser.add_argument(
+        "--kind",
+        choices=("manual", "rollback"),
+        default="rollback",
+    )
 
     restore_parser = subparsers.add_parser("restore")
     restore_parser.add_argument("--database", type=Path, default=DEFAULT_DATABASE)
@@ -95,7 +113,12 @@ def main() -> None:
     if args.command == "create":
         if args.keep < 1:
             raise SystemExit("--keep must be at least 1")
-        create_backup(args.database.resolve(), args.output.resolve(), args.keep)
+        create_backup(
+            args.database.resolve(),
+            args.output.resolve(),
+            args.keep,
+            args.kind,
+        )
         print(args.output.resolve())
         return
     restore_backup(args.database.resolve(), args.input.resolve())
