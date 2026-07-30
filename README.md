@@ -358,6 +358,8 @@ bash scripts/create-release.sh v1.3.0
 
 脚本会验证版本、运行测试、创建 annotated Tag 并推送。`.github/workflows/release.yml` 会再次验证 Tag 和测试结果，然后使用仓库内置 `GITHUB_TOKEN` 创建带自动发行说明的 GitHub Release。
 
+本机无法连接 GitHub 时，也可以在仓库的 `Actions` 页面选择 `Release`，点击 `Run workflow` 并输入与 `VERSION` 一致的版本号。工作流只从 `main` 创建经过校验的 annotated Tag，再执行同一套测试和 Release 发布流程。
+
 ## Webhook
 
 重新配置 HTTPS、Webhook 和命令菜单：
