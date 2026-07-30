@@ -38,6 +38,7 @@
 ### 可靠性与安全
 
 - 强制校验 `WEBHOOK_SECRET`
+- Webhook 只接受 JSON，应用层限制为 1 MiB，Nginx 部署模板同步限制请求大小
 - Turnstile Token 与 Telegram Mini App 身份均在服务端验证
 - 所有管理命令和管理按钮均校验 `ADMIN_IDS`
 - Webhook 更新使用 `processing/done/failed` 状态，失败后允许 Telegram 重试
@@ -102,6 +103,9 @@ curl -fsSL https://raw.githubusercontent.com/Shikinami05/TelegramCustomerService
 | `sudo tg-bot logs [LINES]` | 查看最近日志；默认显示 100 行 |
 | `sudo tg-bot version` | 查看版本、Git 引用、提交和工作区状态 |
 | `sudo tg-bot webhook` | 查看 Telegram Webhook 状态 |
+| `sudo tg-bot turnstile status` | 查看 Turnstile 是否启用及配置完整性，不显示密钥 |
+| `sudo tg-bot turnstile enable` | 交互式填写或保留 Turnstile 密钥并启用 |
+| `sudo tg-bot turnstile disable` | 关闭 Turnstile，保留密钥便于以后重新启用 |
 | `sudo tg-bot configure DOMAIN EMAIL [443\|8443]` | 配置 Nginx、HTTPS、Webhook 和命令菜单；默认端口 `443` |
 | `sudo tg-bot help` | 显示脚本支持的全部命令 |
 
@@ -111,6 +115,7 @@ curl -fsSL https://raw.githubusercontent.com/Shikinami05/TelegramCustomerService
 sudo tg-bot update
 sudo tg-bot backup 20
 sudo tg-bot logs 200
+sudo tg-bot turnstile status
 sudo tg-bot configure bot.example.com admin@example.com 8443
 ```
 
@@ -200,12 +205,17 @@ Turnstile 不要求域名经过 Cloudflare 代理。如果域名启用了 Cloudf
 
 ```bash
 sudo tg-bot update
-sudo tg-bot configure bot.example.com admin@example.com 8443
-nano ~/tg-bot/.env
-sudo tg-bot restart
+sudo tg-bot turnstile enable
 ```
 
-在 `.env` 中填写 `TURNSTILE_ENABLED=true`、Site Key 和 Secret Key。`TURNSTILE_VERIFY_URL` 必须与实际 HTTPS 域名和端口一致。
+脚本会隐藏 Secret Key 输入，并从现有 Webhook 地址生成验证地址。可随时查看状态或关闭：
+
+```bash
+sudo tg-bot turnstile status
+sudo tg-bot turnstile disable
+```
+
+启用前脚本会确认 Nginx 已包含验证路由；如果提示路由不存在，先执行一次 `sudo tg-bot configure DOMAIN EMAIL [443|8443]`。配置修改后会重启服务并检查 `/healthz`，失败时自动恢复原 `.env`。关闭功能只修改开关，不会删除 Site Key 或 Secret Key。
 
 ## 管理员命令
 
@@ -316,7 +326,7 @@ sudo tg-bot update
 安装或回退到指定 Release：
 
 ```bash
-sudo tg-bot update v1.2.0
+sudo tg-bot update v1.3.0
 ```
 
 更新前脚本会检查 Git 工作区、获取目标提交并创建数据库回滚备份。随后更新依赖、运行测试、同步 systemd 服务并检查 `/healthz`。任一步失败都会自动停止服务并恢复：
@@ -336,14 +346,14 @@ sudo tg-bot update v1.2.0
 sudo tg-bot version
 ```
 
-正式 Tag 部署会显示例如 `v1.2.0`；开发分支会显示例如 `v1.2.0+提交号`。
+正式 Tag 部署会显示例如 `v1.3.0`；开发分支会显示例如 `v1.3.0+提交号`。
 
 ## 发布 Release
 
 `VERSION` 保存当前语义化版本。准备新版本时，先通过 PR 更新该文件并合并到 `main`，然后在干净且与 `origin/main` 一致的本地仓库运行：
 
 ```bash
-bash scripts/create-release.sh v1.2.0
+bash scripts/create-release.sh v1.3.0
 ```
 
 脚本会验证版本、运行测试、创建 annotated Tag 并推送。`.github/workflows/release.yml` 会再次验证 Tag 和测试结果，然后使用仓库内置 `GITHUB_TOKEN` 创建带自动发行说明的 GitHub Release。
@@ -383,7 +393,7 @@ sudo tg-bot status
 正常返回：
 
 ```json
-{"ok":true,"version":"1.2.0","db":"ok","broadcast_worker":"ok"}
+{"ok":true,"version":"1.3.0","db":"ok","broadcast_worker":"ok"}
 ```
 
 Nginx 模板不会把 `/healthz` 暴露到公网。
@@ -395,7 +405,7 @@ Telegram API 错误日志只记录方法、HTTP 状态和错误描述，不记�
 ```bash
 PROJECT_DIR="$(sudo systemctl show tg-bot -p WorkingDirectory --value)"
 cd "$PROJECT_DIR"
-./venv/bin/python -m py_compile app.py scripts/manage_webhook.py scripts/manage_backup.py
+./venv/bin/python -m py_compile app.py scripts/manage_webhook.py scripts/manage_backup.py scripts/manage_turnstile.py
 ./venv/bin/python -m unittest discover -s tests -v
 ```
 

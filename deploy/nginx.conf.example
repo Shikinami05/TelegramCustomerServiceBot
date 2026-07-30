@@ -25,7 +25,7 @@ server {
     ssl_session_cache shared:TelegramBotTLS:10m;
     ssl_session_tickets off;
 
-    client_max_body_size 20m;
+    client_max_body_size 1m;
 
     location = /tg/webhook {
         limit_except POST {

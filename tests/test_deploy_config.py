@@ -52,6 +52,7 @@ class DeploymentConfigTests(unittest.TestCase):
         )
         self.assertIn("location = /verify", template)
         self.assertIn("location = /verify/complete", template)
+        self.assertIn("client_max_body_size 1m", template)
         self.assertIn("client_max_body_size 16k", template)
         self.assertNotIn("location = /healthz", template)
 
@@ -117,10 +118,13 @@ class DeploymentConfigTests(unittest.TestCase):
             "logs)",
             "version)",
             "webhook)",
+            "turnstile)",
             "configure)",
         ):
             self.assertIn(subcommand, command)
         self.assertIn("--kind manual", command)
+        self.assertIn("manage_turnstile.py", command)
+        self.assertIn("restoring the previous .env", command)
 
     def test_release_install_update_and_rollback_controls_exist(self) -> None:
         install_script = (PROJECT_DIR / "scripts" / "install.sh").read_text(

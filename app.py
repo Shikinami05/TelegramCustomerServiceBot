@@ -61,6 +61,49 @@ def env_bool(name: str, default: bool = False) -> bool:
     raise RuntimeError(f"{name} must be true or false")
 
 
+def turnstile_verify_hostname(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("invalid Turnstile verification URL") from exc
+    hostname = parsed.hostname or ""
+    hostname_labels = hostname.split(".")
+    if (
+        parsed.scheme != "https"
+        or not hostname
+        or not hostname.isascii()
+        or len(hostname) > 253
+        or port == 0
+        or any(
+            not label
+            or len(label) > 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or any(
+                not (character.isalnum() or character == "-")
+                for character in label
+            )
+            for label in hostname_labels
+        )
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path != "/verify"
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "Turnstile verification URL must be an HTTPS /verify URL "
+            "without credentials, query, or fragment"
+    )
+    expected_netloc = hostname
+    if port is not None:
+        expected_netloc = f"{hostname}:{port}"
+    if parsed.netloc.lower() != expected_netloc.lower():
+        raise ValueError("invalid Turnstile verification URL host")
+    return hostname.lower()
+
+
 def load_display_timezone(name: str) -> ZoneInfo:
     try:
         return ZoneInfo(name)
@@ -98,6 +141,7 @@ TELEGRAM_INLINE_RETRY_MAX_SECONDS = env_int(
     "TELEGRAM_INLINE_RETRY_MAX_SECONDS", 5, 0
 )
 BROADCAST_RATE_LIMIT_RETRIES = env_int("BROADCAST_RATE_LIMIT_RETRIES", 3, 0)
+WEBHOOK_MAX_BODY_BYTES = 1024 * 1024
 TURNSTILE_ENABLED = env_bool("TURNSTILE_ENABLED", False)
 TURNSTILE_SITE_KEY = os.getenv("TURNSTILE_SITE_KEY", "").strip()
 TURNSTILE_SECRET_KEY = os.getenv("TURNSTILE_SECRET_KEY", "").strip()
@@ -124,14 +168,10 @@ if TURNSTILE_ENABLED:
             "TURNSTILE_SITE_KEY, TURNSTILE_SECRET_KEY and "
             "TURNSTILE_VERIFY_URL are required when Turnstile is enabled"
         )
-    turnstile_url = urlsplit(TURNSTILE_VERIFY_URL)
-    if (
-        turnstile_url.scheme != "https"
-        or not turnstile_url.hostname
-        or turnstile_url.query
-        or turnstile_url.fragment
-    ):
-        raise RuntimeError("TURNSTILE_VERIFY_URL must be an HTTPS URL")
+    try:
+        turnstile_verify_hostname(TURNSTILE_VERIFY_URL)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "bot.db"
@@ -1316,6 +1356,18 @@ def claim_verification_prompt(chat_id: int) -> bool:
         return cursor.rowcount == 1
 
 
+def release_verification_prompt(chat_id: int) -> None:
+    db_execute(
+        """
+        UPDATE user_verifications
+        SET last_prompted_at = NULL
+        WHERE chat_id = ?
+          AND verified_at IS NULL
+        """,
+        (chat_id,),
+    )
+
+
 def mark_user_verified(chat_id: int) -> None:
     db_execute(
         """
@@ -1416,7 +1468,11 @@ async def verify_turnstile_token(token: str) -> bool:
         logger.info("Turnstile verification rejected error_codes=%s", error_codes)
         return False
 
-    expected_hostname = urlsplit(TURNSTILE_VERIFY_URL).hostname or ""
+    try:
+        expected_hostname = turnstile_verify_hostname(TURNSTILE_VERIFY_URL)
+    except ValueError:
+        logger.error("Turnstile verification URL is invalid")
+        return False
     response_hostname = str(data.get("hostname", ""))
     response_action = str(data.get("action", ""))
     return (
@@ -2592,11 +2648,13 @@ async def send_welcome(chat_id: int) -> None:
 
 async def send_verification_prompt(chat_id: int) -> None:
     if claim_verification_prompt(chat_id):
-        await send_message(
+        sent = await send_message(
             chat_id,
             VERIFICATION_REQUIRED_TEXT,
             reply_markup=verification_keyboard(),
         )
+        if not sent:
+            release_verification_prompt(chat_id)
 
 
 def normalize_command_text(text: str) -> str:
@@ -3441,6 +3499,29 @@ def turnstile_page_response() -> HTMLResponse:
     )
 
 
+async def read_limited_request_body(request: Request, max_bytes: int) -> bytes:
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="invalid content length",
+            ) from exc
+        if declared_length < 0:
+            raise HTTPException(status_code=400, detail="invalid content length")
+        if declared_length > max_bytes:
+            raise HTTPException(status_code=413, detail="request too large")
+
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > max_bytes:
+            raise HTTPException(status_code=413, detail="request too large")
+    return bytes(body)
+
+
 @app.get("/verify", response_class=HTMLResponse)
 async def turnstile_verification_page() -> HTMLResponse:
     if not TURNSTILE_ENABLED:
@@ -3460,9 +3541,7 @@ async def complete_turnstile_verification(request: Request) -> JSONResponse:
     )
     if content_type != "application/json":
         raise HTTPException(status_code=415, detail="JSON request required")
-    body = await request.body()
-    if len(body) > 16384:
-        raise HTTPException(status_code=413, detail="request too large")
+    body = await read_limited_request_body(request, 16384)
     try:
         payload = json.loads(body)
     except json.JSONDecodeError as exc:
@@ -3522,7 +3601,19 @@ async def telegram_webhook(
     ):
         raise HTTPException(status_code=403, detail="invalid secret token")
 
-    update = await request.json()
+    content_type = (
+        request.headers.get("content-type", "")
+        .partition(";")[0]
+        .strip()
+        .lower()
+    )
+    if content_type != "application/json":
+        raise HTTPException(status_code=415, detail="JSON request required")
+    body = await read_limited_request_body(request, WEBHOOK_MAX_BODY_BYTES)
+    try:
+        update = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="invalid update JSON") from exc
     if not isinstance(update, dict):
         raise HTTPException(status_code=400, detail="invalid update")
 

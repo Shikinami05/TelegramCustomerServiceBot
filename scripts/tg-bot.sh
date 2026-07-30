@@ -18,6 +18,8 @@ Commands:
   logs [LINES]                 Show recent service logs (default: 100)
   version                      Show the deployed version
   webhook                      Show Telegram webhook status
+  turnstile status|enable|disable
+                               Manage Cloudflare Turnstile
   configure DOMAIN EMAIL [PORT] Configure HTTPS and webhook (443 or 8443)
   help                         Show this help
 EOF
@@ -29,6 +31,26 @@ if [[ "${EUID}" -ne 0 ]]; then
 fi
 
 source "$SCRIPT_DIR/common.sh"
+
+wait_for_health() {
+    for _ in {1..20}; do
+        if curl --fail --silent http://127.0.0.1:9000/healthz >/dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+restart_and_check() {
+    systemctl restart "$SERVICE_NAME"
+    if ! wait_for_health; then
+        journalctl -u "$SERVICE_NAME" -n 80 --no-pager >&2 || true
+        return 1
+    fi
+    curl --fail --silent --show-error http://127.0.0.1:9000/healthz
+    echo
+}
 
 command_name="${1:-help}"
 if [[ $# -gt 0 ]]; then
@@ -84,15 +106,7 @@ case "$command_name" in
             usage >&2
             exit 2
         fi
-        systemctl restart "$SERVICE_NAME"
-        for _ in {1..20}; do
-            if curl --fail --silent http://127.0.0.1:9000/healthz >/dev/null; then
-                break
-            fi
-            sleep 1
-        done
-        curl --fail --silent --show-error http://127.0.0.1:9000/healthz
-        echo
+        restart_and_check
         ;;
     logs)
         if [[ $# -gt 1 ]]; then
@@ -122,6 +136,68 @@ case "$command_name" in
         resolve_app_identity "$SERVICE_NAME"
         exec runuser -u "$APP_USER" -- \
             "$PYTHON_BIN" "$SCRIPT_DIR/manage_webhook.py" --info
+        ;;
+    turnstile)
+        if [[ $# -ne 1 ]] \
+            || [[ "$1" != "status" && "$1" != "enable" && "$1" != "disable" ]]; then
+            usage >&2
+            exit 2
+        fi
+        action="$1"
+        resolve_app_identity "$SERVICE_NAME"
+        env_file="$PROJECT_DIR/.env"
+        helper="$SCRIPT_DIR/manage_turnstile.py"
+        if [[ ! -x "$PYTHON_BIN" || ! -f "$helper" || ! -f "$env_file" ]]; then
+            echo "The installed environment or Turnstile helper is missing." >&2
+            exit 1
+        fi
+        if [[ "$action" == "status" ]]; then
+            exec runuser -u "$APP_USER" -- "$PYTHON_BIN" "$helper" status
+        fi
+        if [[ "$action" == "enable" ]]; then
+            nginx_config="$(nginx -T 2>&1)" || {
+                echo "Unable to inspect the active Nginx configuration." >&2
+                exit 1
+            }
+            if [[ "$nginx_config" != *"location = /verify {"* ]] \
+                || [[ "$nginx_config" != *"location = /verify/complete {"* ]]; then
+                echo "Turnstile verification routes are not active in Nginx." >&2
+                echo "Configure HTTPS first: sudo tg-bot configure DOMAIN EMAIL [443|8443]" >&2
+                exit 1
+            fi
+        fi
+
+        env_backup="$(mktemp)"
+        cp --preserve=mode,ownership,timestamps "$env_file" "$env_backup"
+        cleanup_turnstile_backup() {
+            rm -f "$env_backup"
+        }
+        trap cleanup_turnstile_backup EXIT
+
+        if [[ "$action" == "enable" ]]; then
+            if ! runuser -u "$APP_USER" -- \
+                "$PYTHON_BIN" "$helper" enable </dev/tty; then
+                exit 1
+            fi
+        elif ! runuser -u "$APP_USER" -- \
+            "$PYTHON_BIN" "$helper" disable; then
+            exit 1
+        fi
+        chown "$APP_USER:$APP_USER" "$env_file"
+        chmod 600 "$env_file"
+
+        if ! restart_and_check; then
+            echo "Service health check failed; restoring the previous .env." >&2
+            install -o "$APP_USER" -g "$APP_USER" -m 600 \
+                "$env_backup" "$env_file"
+            systemctl restart "$SERVICE_NAME" || true
+            if ! wait_for_health; then
+                echo "The service still needs attention after rollback." >&2
+            fi
+            exit 1
+        fi
+        rm -f "$env_backup"
+        trap - EXIT
         ;;
     configure)
         if [[ $# -lt 2 || $# -gt 3 ]]; then
