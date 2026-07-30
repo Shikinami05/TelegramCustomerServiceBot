@@ -114,8 +114,8 @@ if [[ ! -f "$PROJECT_DIR/.env" ]]; then
         echo "BOT_TOKEN, ADMIN_IDS and Webhook URL are required." >&2
         exit 1
     fi
-    if [[ "$WEBHOOK_URL_INPUT" != https://*/tg/webhook ]]; then
-        echo "Webhook URL must be HTTPS and end with /tg/webhook." >&2
+    if [[ ! "$WEBHOOK_URL_INPUT" =~ ^https://[A-Za-z0-9.-]+(:443|:8443)?/tg/webhook$ ]]; then
+        echo "Webhook URL must use an HTTPS domain, optional port 443 or 8443, and end with /tg/webhook." >&2
         exit 1
     fi
     TURNSTILE_VERIFY_URL_INPUT="${WEBHOOK_URL_INPUT%/tg/webhook}/verify"
@@ -175,7 +175,8 @@ chmod 644 "$SERVICE_FILE"
 
 cd "$PROJECT_DIR"
 runuser -u "$APP_USER" -- "$PROJECT_DIR/venv/bin/python" -m py_compile \
-    app.py scripts/manage_webhook.py scripts/manage_backup.py
+    app.py scripts/manage_webhook.py scripts/manage_backup.py \
+    scripts/manage_turnstile.py
 runuser -u "$APP_USER" -- "$PROJECT_DIR/venv/bin/python" -m unittest discover -s tests -v
 
 systemctl daemon-reload

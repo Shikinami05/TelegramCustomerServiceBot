@@ -83,6 +83,7 @@
     "use strict";
     const telegram = window.Telegram && window.Telegram.WebApp;
     const statusElement = () => document.getElementById("status");
+    let widgetId = null;
 
     function setStatus(message, className = "") {
       const element = statusElement();
@@ -102,16 +103,28 @@
             turnstile_token: turnstileToken
           })
         });
-        const result = await response.json();
-        if (!response.ok || !result.ok) {
-          throw new Error(result.message || "验证失败，请重新尝试。");
+        let result = null;
+        try {
+          result = await response.json();
+        } catch {
+          result = null;
+        }
+        if (!response.ok || !result || !result.ok) {
+          const message = result && typeof result.message === "string"
+            ? result.message
+            : "验证失败，请重新尝试。";
+          setStatus(message, "error");
+          if (window.turnstile && widgetId !== null) {
+            window.turnstile.reset(widgetId);
+          }
+          return;
         }
         setStatus("验证完成，现在可以返回聊天发送留言。", "success");
         window.setTimeout(() => telegram.close(), 1200);
-      } catch (error) {
-        setStatus(error.message || "验证服务暂时不可用，请稍后重试。", "error");
-        if (window.turnstile) {
-          window.turnstile.reset();
+      } catch {
+        setStatus("验证服务暂时不可用，请稍后重试。", "error");
+        if (window.turnstile && widgetId !== null) {
+          window.turnstile.reset(widgetId);
         }
       }
     }
@@ -129,7 +142,7 @@
       }
       setStatus("请完成下方验证。");
       const challenge = document.getElementById("challenge");
-      window.turnstile.render(challenge, {
+      widgetId = window.turnstile.render(challenge, {
         sitekey: __SITE_KEY_JSON__,
         action: "telegram_verify",
         size: challenge.clientWidth >= 300 ? "flexible" : "compact",

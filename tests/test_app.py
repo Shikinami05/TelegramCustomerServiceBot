@@ -193,6 +193,26 @@ class BotDatabaseTests(unittest.TestCase):
             self.assertFalse(app.is_user_verified(12))
 
     def test_turnstile_siteverify_checks_hostname_and_action(self) -> None:
+        self.assertEqual(
+            app.turnstile_verify_hostname(
+                "https://bot.example.com:8443/verify"
+            ),
+            "bot.example.com",
+        )
+        for invalid_url in (
+            "http://bot.example.com/verify",
+            "https://user@bot.example.com/verify",
+            "https://bot.example.com/other",
+            "https://bot.example.com/verify?next=/",
+            "https://bot.example.com:invalid/verify",
+            "https://bot.example.com:0/verify",
+            "https://bot example.com/verify",
+            "https://-bot.example.com/verify",
+        ):
+            with self.subTest(invalid_url=invalid_url):
+                with self.assertRaises(ValueError):
+                    app.turnstile_verify_hostname(invalid_url)
+
         response = httpx.Response(
             200,
             request=httpx.Request("POST", app.TURNSTILE_SITEVERIFY_URL),
@@ -253,7 +273,11 @@ class BotDatabaseTests(unittest.TestCase):
                 "TURNSTILE_VERIFY_URL",
                 "https://bot.example.com/verify",
             ),
-            patch.object(app, "send_message", new=AsyncMock()) as send_mock,
+            patch.object(
+                app,
+                "send_message",
+                new=AsyncMock(return_value=True),
+            ) as send_mock,
             patch.object(app, "notify_admins", new=AsyncMock()) as notify_mock,
         ):
             asyncio.run(app.handle_user_message(message))
@@ -284,6 +308,26 @@ class BotDatabaseTests(unittest.TestCase):
             app.mark_user_verified(13)
             asyncio.run(app.handle_user_message(message))
             notify_mock.assert_awaited_once()
+
+    def test_failed_verification_prompt_can_be_retried_immediately(self) -> None:
+        send_mock = AsyncMock(side_effect=[False, True])
+        with patch.object(app, "send_message", send_mock):
+            asyncio.run(app.send_verification_prompt(15))
+            row = app.db_fetchone(
+                "SELECT last_prompted_at FROM user_verifications "
+                "WHERE chat_id = ?",
+                (15,),
+            )
+            self.assertIsNone(row["last_prompted_at"])
+
+            asyncio.run(app.send_verification_prompt(15))
+
+        self.assertEqual(send_mock.await_count, 2)
+        row = app.db_fetchone(
+            "SELECT last_prompted_at FROM user_verifications WHERE chat_id = ?",
+            (15,),
+        )
+        self.assertIsNotNone(row["last_prompted_at"])
 
     def test_turnstile_page_and_completion_endpoint(self) -> None:
         init_data = self.telegram_init_data(14)
@@ -913,6 +957,37 @@ class BotDatabaseTests(unittest.TestCase):
         with TestClient(app.app) as client:
             denied = client.post("/tg/webhook", json={"update_id": 200})
             self.assertEqual(denied.status_code, 403)
+
+            unsupported = client.post(
+                "/tg/webhook",
+                content=b"{}",
+                headers={
+                    **headers,
+                    "Content-Type": "text/plain",
+                },
+            )
+            self.assertEqual(unsupported.status_code, 415)
+
+            malformed = client.post(
+                "/tg/webhook",
+                content=b"{",
+                headers={
+                    **headers,
+                    "Content-Type": "application/json",
+                },
+            )
+            self.assertEqual(malformed.status_code, 400)
+
+            with patch.object(app, "WEBHOOK_MAX_BODY_BYTES", 16):
+                oversized = client.post(
+                    "/tg/webhook",
+                    content=b'{"update_id": 200}',
+                    headers={
+                        **headers,
+                        "Content-Type": "application/json",
+                    },
+                )
+            self.assertEqual(oversized.status_code, 413)
 
             first = client.post(
                 "/tg/webhook", json={"update_id": 201}, headers=headers
