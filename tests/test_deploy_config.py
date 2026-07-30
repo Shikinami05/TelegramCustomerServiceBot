@@ -161,9 +161,13 @@ class DeploymentConfigTests(unittest.TestCase):
 
         self.assertRegex(version, r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
         self.assertIn("contents: write", workflow)
+        self.assertIn("branches:", workflow)
+        self.assertIn("- main", workflow)
+        self.assertIn("- VERSION", workflow)
         self.assertIn("workflow_dispatch:", workflow)
-        self.assertIn("Create annotated release tag", workflow)
-        self.assertIn('git tag -a "${RELEASE_TAG}"', workflow)
+        self.assertIn("Prepare annotated release tag", workflow)
+        self.assertIn('git tag -a "${release_tag}"', workflow)
+        self.assertIn("should_release=false", workflow)
         self.assertIn(
             '"refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"',
             workflow,
