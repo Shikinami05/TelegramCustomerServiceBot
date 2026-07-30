@@ -161,12 +161,16 @@ class DeploymentConfigTests(unittest.TestCase):
 
         self.assertRegex(version, r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
         self.assertIn("contents: write", workflow)
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("Create annotated release tag", workflow)
+        self.assertIn('git tag -a "${RELEASE_TAG}"', workflow)
         self.assertIn(
-            '"refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"',
+            '"refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"',
             workflow,
         )
-        self.assertIn('gh release create "${GITHUB_REF_NAME}"', workflow)
+        self.assertIn('gh release create "${RELEASE_TAG}"', workflow)
         self.assertIn("does not match VERSION", release_script)
+        self.assertIn("scripts/manage_turnstile.py", release_script)
 
 
 if __name__ == "__main__":

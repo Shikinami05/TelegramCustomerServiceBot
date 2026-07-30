@@ -57,7 +57,9 @@ if git -C "$PROJECT_DIR" show-ref --tags --verify \
 fi
 
 cd "$PROJECT_DIR"
-"$PYTHON_BIN" -m py_compile app.py scripts/manage_webhook.py scripts/manage_backup.py
+"$PYTHON_BIN" -m py_compile \
+    app.py scripts/manage_webhook.py scripts/manage_backup.py \
+    scripts/manage_turnstile.py
 "$PYTHON_BIN" -m unittest discover -s tests -v
 bash -n scripts/*.sh
 bash tests/test_scripts.sh
