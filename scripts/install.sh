@@ -89,10 +89,46 @@ if [[ ! -f "$PROJECT_DIR/.env" ]]; then
         read -r -p "Webhook URL (for example https://bot.example.com/tg/webhook): " WEBHOOK_URL_INPUT
     fi
     WEBHOOK_SECRET_INPUT="$(openssl rand -hex 32)"
+    TURNSTILE_ENABLED_INPUT=false
+    TURNSTILE_SITE_KEY_INPUT=""
+    TURNSTILE_SECRET_KEY_INPUT=""
+    read -r -p "Enable Cloudflare Turnstile before users can leave messages? [y/N]: " \
+        TURNSTILE_CHOICE
+    case "${TURNSTILE_CHOICE,,}" in
+        y|yes)
+            TURNSTILE_ENABLED_INPUT=true
+            read -r -p "Cloudflare Turnstile Site Key: " TURNSTILE_SITE_KEY_INPUT
+            read -r -s -p "Cloudflare Turnstile Secret Key: " \
+                TURNSTILE_SECRET_KEY_INPUT
+            echo
+            ;;
+        ""|n|no)
+            ;;
+        *)
+            echo "Turnstile choice must be y or n." >&2
+            exit 2
+            ;;
+    esac
 
     if [[ -z "$BOT_TOKEN_INPUT" || -z "$ADMIN_IDS_INPUT" || -z "$WEBHOOK_URL_INPUT" ]]; then
         echo "BOT_TOKEN, ADMIN_IDS and Webhook URL are required." >&2
         exit 1
+    fi
+    if [[ "$WEBHOOK_URL_INPUT" != https://*/tg/webhook ]]; then
+        echo "Webhook URL must be HTTPS and end with /tg/webhook." >&2
+        exit 1
+    fi
+    TURNSTILE_VERIFY_URL_INPUT="${WEBHOOK_URL_INPUT%/tg/webhook}/verify"
+    if [[ "$TURNSTILE_ENABLED_INPUT" == "true" ]]; then
+        if [[ -z "$TURNSTILE_SITE_KEY_INPUT" || -z "$TURNSTILE_SECRET_KEY_INPUT" ]]; then
+            echo "Turnstile Site Key and Secret Key are required." >&2
+            exit 1
+        fi
+        if [[ "$TURNSTILE_SITE_KEY_INPUT" =~ [[:space:]] \
+            || "$TURNSTILE_SECRET_KEY_INPUT" =~ [[:space:]] ]]; then
+            echo "Turnstile keys must not contain whitespace." >&2
+            exit 1
+        fi
     fi
 
     install -o "$APP_USER" -g "$APP_USER" -m 600 /dev/null "$PROJECT_DIR/.env"
@@ -102,6 +138,12 @@ if [[ ! -f "$PROJECT_DIR/.env" ]]; then
         printf 'ADMIN_IDS=%s\n' "$ADMIN_IDS_INPUT"
         printf 'OWNER_IDS=%s\n' "$ADMIN_IDS_INPUT"
         printf 'WEBHOOK_URL=%s\n' "$WEBHOOK_URL_INPUT"
+        printf '\nTURNSTILE_ENABLED=%s\n' "$TURNSTILE_ENABLED_INPUT"
+        printf 'TURNSTILE_SITE_KEY=%s\n' "$TURNSTILE_SITE_KEY_INPUT"
+        printf 'TURNSTILE_SECRET_KEY=%s\n' "$TURNSTILE_SECRET_KEY_INPUT"
+        printf 'TURNSTILE_VERIFY_URL=%s\n' "$TURNSTILE_VERIFY_URL_INPUT"
+        printf 'TURNSTILE_VERIFY_DAYS=30\n'
+        printf 'TURNSTILE_INIT_DATA_MAX_AGE_SECONDS=600\n'
         printf '\nDB_BACKUP_ENABLED=true\n'
         printf 'DB_BACKUP_INTERVAL_SECONDS=86400\n'
         printf 'DB_BACKUP_KEEP=14\n'

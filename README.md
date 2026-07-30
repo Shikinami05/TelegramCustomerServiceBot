@@ -2,13 +2,14 @@
 
 这是一个基于 FastAPI、Telegram Webhook 和 SQLite 的双向留言 Bot。用户通过 Bot 留言，无需直接私聊个人账号；管理员会收到带历史记录的通知，并可接管会话持续回复。
 
-当前版本不包含广告或 AI 内容审核。垃圾消息通过发送频率限制和管理员手动黑名单处理，避免自动审核误伤正常用户。
+当前版本不包含广告或 AI 内容审核。垃圾消息通过可选 Cloudflare Turnstile、发送频率限制和管理员手动黑名单处理，避免自动内容审核误伤正常用户。
 
 ## 主要功能
 
 ### 用户侧
 
 - `/start` 留言入口
+- 可选首次留言前 Cloudflare Turnstile 人机验证
 - 支持文字、图片、文件、语音、视频等消息
 - 消息送达确认
 - 编辑消息会更新原历史记录，并通知管理员“用户修改了消息”
@@ -37,6 +38,7 @@
 ### 可靠性与安全
 
 - 强制校验 `WEBHOOK_SECRET`
+- Turnstile Token 与 Telegram Mini App 身份均在服务端验证
 - 所有管理命令和管理按钮均校验 `ADMIN_IDS`
 - Webhook 更新使用 `processing/done/failed` 状态，失败后允许 Telegram 重试
 - Telegram 触发 flood control 时按 `retry_after` 等待；群发失败用户可单独重试
@@ -80,6 +82,7 @@ curl -fsSL https://raw.githubusercontent.com/Shikinami05/TelegramCustomerService
 - 全新安装及现有 `~/tg-bot` 安装迁移
 - 自动选择最新稳定 GitHub Release
 - 交互输入域名、证书邮箱、Bot Token 和管理员 ID
+- 可选启用 Cloudflare Turnstile，并隐藏输入 Secret Key
 - 自动创建 `.env`、随机 `WEBHOOK_SECRET` 和 Python 虚拟环境
 - 自动配置 systemd、Nginx、HTTPS 证书、Webhook 和 Telegram 命令菜单
 - HTTPS `443` 和 Telegram 支持的 `8443`
@@ -150,6 +153,14 @@ BROADCAST_RATE_LIMIT_RETRIES=3
 UPDATE_PROCESSING_TIMEOUT_SECONDS=300
 PENDING_REMINDER_MINUTES=30
 TELEGRAM_INLINE_RETRY_MAX_SECONDS=5
+
+TURNSTILE_ENABLED=false
+TURNSTILE_SITE_KEY=
+TURNSTILE_SECRET_KEY=
+TURNSTILE_VERIFY_URL=https://bot.example.com/verify
+TURNSTILE_VERIFY_DAYS=30
+TURNSTILE_INIT_DATA_MAX_AGE_SECONDS=600
+
 DISPLAY_TIMEZONE=Asia/Hong_Kong
 LOG_LEVEL=INFO
 ```
@@ -161,6 +172,40 @@ LOG_LEVEL=INFO
 `PENDING_REMINDER_MINUTES` 控制 `/pending` 的超时阈值。普通消息只会在 `retry_after` 不超过 `TELEGRAM_INLINE_RETRY_MAX_SECONDS` 时短暂等待，避免 Webhook 长时间阻塞；后台群发不受这个短等待上限影响。
 
 `DISPLAY_TIMEZONE` 使用 IANA 时区名称，只影响管理员界面的时间显示，不改变 SQLite 中的 UTC 时间。默认值为 `Asia/Hong_Kong`；例如可改为 `Asia/Shanghai` 或 `UTC`。无效名称会让服务在启动时直接报错，避免静默显示错误时间。
+
+## Cloudflare Turnstile（可选）
+
+安装时会询问：
+
+```text
+Enable Cloudflare Turnstile before users can leave messages? [y/N]
+```
+
+直接回车或选择 `n` 时功能保持关闭。选择 `y` 后，安装器会继续询问 Site Key，并隐藏输入 Secret Key。需要先在 Cloudflare Turnstile 创建 Managed Widget，把 Bot 域名加入允许列表。
+
+启用后的流程：
+
+1. 新用户发送 `/start` 或留言
+2. Bot 只发送“完成人机验证”按钮，不保存本条内容，也不通知管理员
+3. Telegram 内打开 `/verify` 页面并完成 Turnstile
+4. 后端验证 Telegram `initData` 签名、时效、Turnstile Token、Action 和 Hostname
+5. 验证状态写入 SQLite，默认有效 30 天
+6. 验证通过后用户才能发送留言
+
+管理员自动跳过验证。Turnstile Site Key 会出现在网页中，Secret Key 只保存在权限为 `600` 的 `.env`。`/verify/complete` 请求体限制为 16 KiB，验证页面禁止缓存并使用 CSP；Turnstile Token 必须经过 Cloudflare Siteverify 服务端确认。
+
+Turnstile 不要求域名经过 Cloudflare 代理。如果域名启用了 Cloudflare Proxy、WAF 或 Under Attack Mode，必须确保 `/tg/webhook` 跳过所有交互式挑战，否则 Telegram 无法投递 Webhook。
+
+现有安装启用时：
+
+```bash
+sudo tg-bot update
+sudo tg-bot configure bot.example.com admin@example.com 8443
+nano ~/tg-bot/.env
+sudo tg-bot restart
+```
+
+在 `.env` 中填写 `TURNSTILE_ENABLED=true`、Site Key 和 Secret Key。`TURNSTILE_VERIFY_URL` 必须与实际 HTTPS 域名和端口一致。
 
 ## 管理员命令
 
@@ -228,6 +273,7 @@ bot.db
 - `broadcast_recipients`：群发接收人及发送结果
 - `processed_updates`：Webhook 幂等和失败重试状态
 - `user_rate_limits`：用户临时频率限制
+- `user_verifications`：Turnstile 验证状态和有效期
 
 旧数据库会在启动时自动增加新字段，不需要删除 `bot.db`。
 
@@ -270,7 +316,7 @@ sudo tg-bot update
 安装或回退到指定 Release：
 
 ```bash
-sudo tg-bot update v1.1.0
+sudo tg-bot update v1.2.0
 ```
 
 更新前脚本会检查 Git 工作区、获取目标提交并创建数据库回滚备份。随后更新依赖、运行测试、同步 systemd 服务并检查 `/healthz`。任一步失败都会自动停止服务并恢复：
@@ -290,14 +336,14 @@ sudo tg-bot update v1.1.0
 sudo tg-bot version
 ```
 
-正式 Tag 部署会显示例如 `v1.1.0`；开发分支会显示例如 `v1.1.0+提交号`。
+正式 Tag 部署会显示例如 `v1.2.0`；开发分支会显示例如 `v1.2.0+提交号`。
 
 ## 发布 Release
 
 `VERSION` 保存当前语义化版本。准备新版本时，先通过 PR 更新该文件并合并到 `main`，然后在干净且与 `origin/main` 一致的本地仓库运行：
 
 ```bash
-bash scripts/create-release.sh v1.1.0
+bash scripts/create-release.sh v1.2.0
 ```
 
 脚本会验证版本、运行测试、创建 annotated Tag 并推送。`.github/workflows/release.yml` 会再次验证 Tag 和测试结果，然后使用仓库内置 `GITHUB_TOKEN` 创建带自动发行说明的 GitHub Release。
@@ -337,7 +383,7 @@ sudo tg-bot status
 正常返回：
 
 ```json
-{"ok":true,"version":"1.1.0","db":"ok","broadcast_worker":"ok"}
+{"ok":true,"version":"1.2.0","db":"ok","broadcast_worker":"ok"}
 ```
 
 Nginx 模板不会把 `/healthz` 暴露到公网。

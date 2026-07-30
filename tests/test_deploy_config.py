@@ -50,6 +50,10 @@ class DeploymentConfigTests(unittest.TestCase):
             "return 301 https://$host:8443$request_uri;",
             rendered,
         )
+        self.assertIn("location = /verify", template)
+        self.assertIn("location = /verify/complete", template)
+        self.assertIn("client_max_body_size 16k", template)
+        self.assertNotIn("location = /healthz", template)
 
     def test_updates_refresh_scoped_command_menus(self) -> None:
         script = (PROJECT_DIR / "scripts" / "update.sh").read_text(encoding="utf-8")
@@ -64,6 +68,23 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn("PENDING_REMINDER_MINUTES=30", script)
         self.assertIn("BROADCAST_RATE_LIMIT_RETRIES=3", script)
         self.assertIn("DISPLAY_TIMEZONE=Asia/Hong_Kong", script)
+        self.assertIn("Enable Cloudflare Turnstile", script)
+        self.assertIn("TURNSTILE_ENABLED=%s", script)
+        self.assertIn("TURNSTILE_SECRET_KEY=%s", script)
+        self.assertIn("TURNSTILE_VERIFY_URL=%s", script)
+
+        nginx_script = (
+            PROJECT_DIR / "scripts" / "configure-nginx.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'TURNSTILE_VERIFY_URL_VALUE="https://${DOMAIN_NAME}/verify"',
+            nginx_script,
+        )
+        self.assertIn(
+            'TURNSTILE_VERIFY_URL_VALUE="https://${DOMAIN_NAME}:${HTTPS_PORT}/verify"',
+            nginx_script,
+        )
+        self.assertIn('systemctl restart "$SERVICE_NAME"', nginx_script)
 
     def test_one_line_installer_and_management_command_are_wired(self) -> None:
         bootstrap = (PROJECT_DIR / "scripts" / "bootstrap.sh").read_text(
