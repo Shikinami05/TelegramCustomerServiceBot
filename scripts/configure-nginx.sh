@@ -142,8 +142,10 @@ fi
 
 if [[ "$HTTPS_PORT" == "443" ]]; then
     WEBHOOK_URL_VALUE="https://${DOMAIN_NAME}/tg/webhook"
+    TURNSTILE_VERIFY_URL_VALUE="https://${DOMAIN_NAME}/verify"
 else
     WEBHOOK_URL_VALUE="https://${DOMAIN_NAME}:${HTTPS_PORT}/tg/webhook"
+    TURNSTILE_VERIFY_URL_VALUE="https://${DOMAIN_NAME}:${HTTPS_PORT}/verify"
 fi
 
 if grep -q '^WEBHOOK_URL=' "$ENV_FILE"; then
@@ -151,8 +153,27 @@ if grep -q '^WEBHOOK_URL=' "$ENV_FILE"; then
 else
     printf '\nWEBHOOK_URL=%s\n' "$WEBHOOK_URL_VALUE" >> "$ENV_FILE"
 fi
+if grep -q '^TURNSTILE_VERIFY_URL=' "$ENV_FILE"; then
+    sed -i \
+        "s|^TURNSTILE_VERIFY_URL=.*$|TURNSTILE_VERIFY_URL=$TURNSTILE_VERIFY_URL_VALUE|" \
+        "$ENV_FILE"
+else
+    printf 'TURNSTILE_VERIFY_URL=%s\n' "$TURNSTILE_VERIFY_URL_VALUE" >> "$ENV_FILE"
+fi
 chown "$APP_USER:$APP_USER" "$ENV_FILE"
 chmod 600 "$ENV_FILE"
+
+systemctl restart "$SERVICE_NAME"
+for _ in {1..20}; do
+    if curl --fail --silent http://127.0.0.1:9000/healthz >/dev/null; then
+        break
+    fi
+    sleep 1
+done
+if ! curl --fail --silent --show-error http://127.0.0.1:9000/healthz >/dev/null; then
+    journalctl -u "$SERVICE_NAME" -n 80 --no-pager
+    exit 1
+fi
 
 runuser -u "$APP_USER" -- \
     "$PROJECT_DIR/venv/bin/python" "$PROJECT_DIR/scripts/manage_webhook.py"

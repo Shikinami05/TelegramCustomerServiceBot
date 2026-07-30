@@ -1,13 +1,18 @@
 import asyncio
+import hashlib
+import hmac
+import json
 import logging
 import os
 import sqlite3
 import stat
 import tempfile
+import time
 import unittest
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlencode
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -39,6 +44,31 @@ class BotDatabaseTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
+
+    @staticmethod
+    def telegram_init_data(chat_id: int, auth_date: int | None = None) -> str:
+        fields = {
+            "auth_date": str(auth_date or int(time.time())),
+            "query_id": "test-query",
+            "user": json.dumps(
+                {"id": chat_id, "first_name": "Verified"},
+                separators=(",", ":"),
+            ),
+        }
+        data_check_string = "\n".join(
+            f"{key}={fields[key]}" for key in sorted(fields)
+        )
+        secret_key = hmac.new(
+            b"WebAppData",
+            app.BOT_TOKEN.encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+        fields["hash"] = hmac.new(
+            secret_key,
+            data_check_string.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return urlencode(fields)
 
     def test_failed_update_can_retry_but_done_update_cannot(self) -> None:
         self.assertTrue(app.claim_update(100))
@@ -133,6 +163,211 @@ class BotDatabaseTests(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertFalse(should_notify)
         self.assertGreater(retry_after, 0)
+
+    def test_turnstile_init_data_and_verification_expiry(self) -> None:
+        init_data = self.telegram_init_data(12)
+        self.assertEqual(app.validate_telegram_init_data(init_data), 12)
+
+        with self.assertRaises(ValueError):
+            app.validate_telegram_init_data(init_data.replace("Verified", "Forged"))
+        with self.assertRaises(ValueError):
+            app.validate_telegram_init_data(
+                self.telegram_init_data(
+                    12,
+                    auth_date=int(time.time())
+                    - app.TURNSTILE_INIT_DATA_MAX_AGE_SECONDS
+                    - 1,
+                )
+            )
+
+        with patch.object(app, "TURNSTILE_ENABLED", True):
+            self.assertFalse(app.is_user_verified(12))
+            app.mark_user_verified(12)
+            self.assertTrue(app.is_user_verified(12))
+            app.db_execute(
+                "UPDATE user_verifications "
+                "SET expires_at = datetime('now', '-1 second') "
+                "WHERE chat_id = ?",
+                (12,),
+            )
+            self.assertFalse(app.is_user_verified(12))
+
+    def test_turnstile_siteverify_checks_hostname_and_action(self) -> None:
+        response = httpx.Response(
+            200,
+            request=httpx.Request("POST", app.TURNSTILE_SITEVERIFY_URL),
+            json={
+                "success": True,
+                "hostname": "bot.example.com",
+                "action": app.TURNSTILE_VERIFY_ACTION,
+            },
+        )
+        client = AsyncMock()
+        client.post.return_value = response
+        with (
+            patch.object(app, "telegram_client", client),
+            patch.object(
+                app,
+                "TURNSTILE_VERIFY_URL",
+                "https://bot.example.com:8443/verify",
+            ),
+            patch.object(app, "TURNSTILE_SECRET_KEY", "secret-key"),
+        ):
+            self.assertTrue(asyncio.run(app.verify_turnstile_token("valid-token")))
+            submitted = client.post.await_args.kwargs["json"]
+            self.assertEqual(submitted["secret"], "secret-key")
+            self.assertEqual(submitted["response"], "valid-token")
+            self.assertIn("idempotency_key", submitted)
+
+            response._content = json.dumps(
+                {
+                    "success": True,
+                    "hostname": "attacker.example",
+                    "action": app.TURNSTILE_VERIFY_ACTION,
+                }
+            ).encode()
+            self.assertFalse(asyncio.run(app.verify_turnstile_token("wrong-host")))
+
+            response._content = json.dumps(
+                {
+                    "success": True,
+                    "hostname": "bot.example.com",
+                    "action": "different_action",
+                }
+            ).encode()
+            self.assertFalse(asyncio.run(app.verify_turnstile_token("wrong-action")))
+
+        self.assertFalse(asyncio.run(app.verify_turnstile_token("x" * 2049)))
+
+    def test_unverified_user_is_prompted_before_message_delivery(self) -> None:
+        message = {
+            "from": {"id": 13, "first_name": "Pending"},
+            "chat": {"id": 13, "type": "private"},
+            "message_id": 1,
+            "text": "advertisement",
+        }
+        with (
+            patch.object(app, "TURNSTILE_ENABLED", True),
+            patch.object(
+                app,
+                "TURNSTILE_VERIFY_URL",
+                "https://bot.example.com/verify",
+            ),
+            patch.object(app, "send_message", new=AsyncMock()) as send_mock,
+            patch.object(app, "notify_admins", new=AsyncMock()) as notify_mock,
+        ):
+            asyncio.run(app.handle_user_message(message))
+
+            self.assertEqual(send_mock.await_count, 1)
+            reply_markup = send_mock.await_args.kwargs["reply_markup"]
+            self.assertEqual(
+                reply_markup["inline_keyboard"][0][0]["web_app"]["url"],
+                "https://bot.example.com/verify",
+            )
+            notify_mock.assert_not_awaited()
+            self.assertIsNone(
+                app.db_fetchone(
+                    "SELECT id FROM message_logs WHERE chat_id = ?",
+                    (13,),
+                )
+            )
+            user = app.db_fetchone(
+                "SELECT last_message FROM users WHERE chat_id = ?",
+                (13,),
+            )
+            self.assertEqual(user["last_message"], "[等待人机验证]")
+
+            send_mock.reset_mock()
+            asyncio.run(app.handle_user_message(message))
+            send_mock.assert_not_awaited()
+
+            app.mark_user_verified(13)
+            asyncio.run(app.handle_user_message(message))
+            notify_mock.assert_awaited_once()
+
+    def test_turnstile_page_and_completion_endpoint(self) -> None:
+        init_data = self.telegram_init_data(14)
+        with (
+            patch.object(app, "TURNSTILE_ENABLED", True),
+            patch.object(app, "TURNSTILE_SITE_KEY", "site-key"),
+            patch.object(app, "TURNSTILE_SECRET_KEY", "secret-key"),
+            patch.object(
+                app,
+                "TURNSTILE_VERIFY_URL",
+                "https://bot.example.com/verify",
+            ),
+            patch.object(
+                app,
+                "verify_turnstile_token",
+                new=AsyncMock(return_value=True),
+            ) as verify_mock,
+            patch.object(app, "send_welcome", new=AsyncMock()) as welcome_mock,
+        ):
+            client = TestClient(app.app)
+            try:
+                page = client.get("/verify")
+                self.assertEqual(page.status_code, 200)
+                self.assertIn("site-key", page.text)
+                self.assertNotIn("secret-key", page.text)
+                self.assertIn(
+                    "https://challenges.cloudflare.com",
+                    page.headers["content-security-policy"],
+                )
+                self.assertIn(
+                    'size: challenge.clientWidth >= 300 ? "flexible" : "compact"',
+                    page.text,
+                )
+                self.assertEqual(page.headers["cache-control"], "no-store")
+
+                completed = client.post(
+                    "/verify/complete",
+                    json={
+                        "init_data": init_data,
+                        "turnstile_token": "turnstile-token",
+                    },
+                )
+                self.assertEqual(completed.status_code, 200)
+                self.assertTrue(completed.json()["ok"])
+                verify_mock.assert_awaited_once_with("turnstile-token")
+                welcome_mock.assert_awaited_once_with(14)
+                self.assertTrue(app.is_user_verified(14))
+
+                rejected = client.post(
+                    "/verify/complete",
+                    json={
+                        "init_data": f"{init_data}tampered",
+                        "turnstile_token": "unused-token",
+                    },
+                )
+                self.assertEqual(rejected.status_code, 403)
+                verify_mock.assert_awaited_once_with("turnstile-token")
+
+                wrong_content_type = client.post(
+                    "/verify/complete",
+                    content=b"{}",
+                    headers={"Content-Type": "text/plain"},
+                )
+                self.assertEqual(wrong_content_type.status_code, 415)
+
+                oversized = client.post(
+                    "/verify/complete",
+                    content=b"{" + b" " * 16384 + b"}",
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(oversized.status_code, 413)
+            finally:
+                client.close()
+
+        with patch.object(app, "TURNSTILE_ENABLED", False):
+            client = TestClient(app.app)
+            try:
+                self.assertEqual(client.get("/verify").status_code, 404)
+                self.assertEqual(
+                    client.post("/verify/complete", json={}).status_code,
+                    404,
+                )
+            finally:
+                client.close()
 
     def test_edited_message_updates_history_and_current_message_can_be_excluded(self) -> None:
         app.add_message_log(20, "user", 20, "first", telegram_message_id=1)

@@ -1,9 +1,12 @@
 import asyncio
 import contextlib
+import hashlib
 import hmac
 import html
+import json
 import logging
 import os
+import secrets
 import sqlite3
 import time
 import uuid
@@ -13,11 +16,13 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 
 if os.name == "posix":
     os.umask(0o077)
@@ -45,6 +50,15 @@ def env_float(name: str, default: float, minimum: float = 0.0) -> float:
     if value < minimum:
         raise RuntimeError(f"{name} must be at least {minimum}")
     return value
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    raw_value = os.getenv(name, str(default)).strip().lower()
+    if raw_value in {"1", "true", "yes", "on"}:
+        return True
+    if raw_value in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} must be true or false")
 
 
 def load_display_timezone(name: str) -> ZoneInfo:
@@ -84,6 +98,16 @@ TELEGRAM_INLINE_RETRY_MAX_SECONDS = env_int(
     "TELEGRAM_INLINE_RETRY_MAX_SECONDS", 5, 0
 )
 BROADCAST_RATE_LIMIT_RETRIES = env_int("BROADCAST_RATE_LIMIT_RETRIES", 3, 0)
+TURNSTILE_ENABLED = env_bool("TURNSTILE_ENABLED", False)
+TURNSTILE_SITE_KEY = os.getenv("TURNSTILE_SITE_KEY", "").strip()
+TURNSTILE_SECRET_KEY = os.getenv("TURNSTILE_SECRET_KEY", "").strip()
+TURNSTILE_VERIFY_URL = os.getenv("TURNSTILE_VERIFY_URL", "").strip()
+TURNSTILE_VERIFY_DAYS = env_int("TURNSTILE_VERIFY_DAYS", 30, 1)
+TURNSTILE_INIT_DATA_MAX_AGE_SECONDS = env_int(
+    "TURNSTILE_INIT_DATA_MAX_AGE_SECONDS",
+    600,
+    60,
+)
 DISPLAY_TIMEZONE_NAME = os.getenv("DISPLAY_TIMEZONE", "Asia/Hong_Kong").strip()
 DISPLAY_TIMEZONE = load_display_timezone(DISPLAY_TIMEZONE_NAME)
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -94,12 +118,33 @@ if not WEBHOOK_SECRET:
     raise RuntimeError("WEBHOOK_SECRET is missing")
 if not ADMIN_IDS:
     raise RuntimeError("ADMIN_IDS is missing")
+if TURNSTILE_ENABLED:
+    if not TURNSTILE_SITE_KEY or not TURNSTILE_SECRET_KEY or not TURNSTILE_VERIFY_URL:
+        raise RuntimeError(
+            "TURNSTILE_SITE_KEY, TURNSTILE_SECRET_KEY and "
+            "TURNSTILE_VERIFY_URL are required when Turnstile is enabled"
+        )
+    turnstile_url = urlsplit(TURNSTILE_VERIFY_URL)
+    if (
+        turnstile_url.scheme != "https"
+        or not turnstile_url.hostname
+        or turnstile_url.query
+        or turnstile_url.fragment
+    ):
+        raise RuntimeError("TURNSTILE_VERIFY_URL must be an HTTPS URL")
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "bot.db"
 DB_BACKUP_DIR = Path(os.getenv("DB_BACKUP_DIR", str(BASE_DIR / "backups")))
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 APP_VERSION = (BASE_DIR / "VERSION").read_text(encoding="ascii").strip()
+TURNSTILE_VERIFY_ACTION = "telegram_verify"
+TURNSTILE_SITEVERIFY_URL = (
+    "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+)
+TURNSTILE_PAGE_TEMPLATE = (
+    BASE_DIR / "templates" / "turnstile.html"
+).read_text(encoding="utf-8")
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -158,6 +203,10 @@ app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
 WELCOME_TEXT = (
     "<b>统一留言聊天入口</b>\n\n"
     "请直接在这里发送消息，我看到后会通过 Bot 回复你。"
+)
+VERIFICATION_REQUIRED_TEXT = (
+    "<b>发送留言前需要完成人机验证</b>\n\n"
+    "验证只用于拦截自动化垃圾消息，完成后即可正常留言。"
 )
 
 QUEUE_LABELS = {
@@ -343,6 +392,16 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_verifications (
+                chat_id INTEGER PRIMARY KEY,
+                verified_at DATETIME,
+                expires_at DATETIME,
+                last_prompted_at DATETIME
+            )
+            """
+        )
 
         ensure_column(conn, "message_logs", "telegram_message_id", "INTEGER")
         ensure_column(conn, "message_logs", "edited_at", "DATETIME")
@@ -390,6 +449,10 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_created "
             "ON admin_audit_logs(created_at DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_verifications_expires "
+            "ON user_verifications(expires_at)"
         )
         conn.commit()
     secure_database_files()
@@ -552,6 +615,13 @@ def purge_expired_data() -> None:
         conn.execute(
             "DELETE FROM user_rate_limits WHERE window_started_at < ?",
             (int(time.time()) - 7 * 86400,),
+        )
+        conn.execute(
+            """
+            DELETE FROM user_verifications
+            WHERE expires_at IS NOT NULL
+              AND expires_at <= CURRENT_TIMESTAMP
+            """
         )
         conn.commit()
 
@@ -1211,6 +1281,152 @@ def blacklist_user(chat_id: int, admin_id: int, reason: str = "") -> None:
 
 def unblacklist_user(chat_id: int) -> None:
     db_execute("DELETE FROM blacklists WHERE chat_id = ?", (chat_id,))
+
+
+def is_user_verified(chat_id: int) -> bool:
+    if not TURNSTILE_ENABLED or is_admin(chat_id):
+        return True
+    return db_fetchone(
+        """
+        SELECT chat_id
+        FROM user_verifications
+        WHERE chat_id = ?
+          AND verified_at IS NOT NULL
+          AND expires_at > CURRENT_TIMESTAMP
+        """,
+        (chat_id,),
+    ) is not None
+
+
+def claim_verification_prompt(chat_id: int) -> bool:
+    with db_connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO user_verifications (chat_id, last_prompted_at)
+            VALUES (?, CURRENT_TIMESTAMP)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                last_prompted_at = CURRENT_TIMESTAMP
+            WHERE user_verifications.last_prompted_at IS NULL
+               OR user_verifications.last_prompted_at
+                  < datetime('now', '-30 seconds')
+            """,
+            (chat_id,),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+
+
+def mark_user_verified(chat_id: int) -> None:
+    db_execute(
+        """
+        INSERT INTO user_verifications (
+            chat_id, verified_at, expires_at, last_prompted_at
+        )
+        VALUES (
+            ?, CURRENT_TIMESTAMP, datetime('now', ?), CURRENT_TIMESTAMP
+        )
+        ON CONFLICT(chat_id) DO UPDATE SET
+            verified_at = CURRENT_TIMESTAMP,
+            expires_at = excluded.expires_at,
+            last_prompted_at = CURRENT_TIMESTAMP
+        """,
+        (chat_id, f"+{TURNSTILE_VERIFY_DAYS} days"),
+    )
+    db_execute("DELETE FROM user_rate_limits WHERE chat_id = ?", (chat_id,))
+
+
+def validate_telegram_init_data(init_data: str) -> int:
+    if not init_data or len(init_data) > 8192:
+        raise ValueError("invalid init data length")
+    try:
+        pairs = parse_qsl(init_data, keep_blank_values=True, strict_parsing=True)
+    except ValueError as exc:
+        raise ValueError("invalid init data") from exc
+
+    fields: dict[str, str] = {}
+    for key, value in pairs:
+        if key in fields:
+            raise ValueError("duplicate init data field")
+        fields[key] = value
+
+    received_hash = fields.pop("hash", "")
+    if len(received_hash) != 64:
+        raise ValueError("invalid init data hash")
+    data_check_string = "\n".join(
+        f"{key}={fields[key]}" for key in sorted(fields)
+    )
+    secret_key = hmac.new(
+        b"WebAppData",
+        BOT_TOKEN.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    calculated_hash = hmac.new(
+        secret_key,
+        data_check_string.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(calculated_hash, received_hash.lower()):
+        raise ValueError("invalid init data signature")
+
+    try:
+        auth_date = int(fields["auth_date"])
+    except (KeyError, ValueError) as exc:
+        raise ValueError("invalid auth date") from exc
+    now = int(time.time())
+    if (
+        auth_date > now + 60
+        or now - auth_date > TURNSTILE_INIT_DATA_MAX_AGE_SECONDS
+    ):
+        raise ValueError("expired init data")
+
+    try:
+        user = json.loads(fields["user"])
+        chat_id = user["id"]
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid Telegram user") from exc
+    if isinstance(chat_id, bool) or not isinstance(chat_id, int) or chat_id <= 0:
+        raise ValueError("invalid Telegram user ID")
+    return chat_id
+
+
+async def verify_turnstile_token(token: str) -> bool:
+    if not token or len(token) > 2048:
+        return False
+    payload = {
+        "secret": TURNSTILE_SECRET_KEY,
+        "response": token,
+        "idempotency_key": str(uuid.uuid4()),
+    }
+    try:
+        if telegram_client is None:
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.post(TURNSTILE_SITEVERIFY_URL, json=payload)
+        else:
+            response = await telegram_client.post(
+                TURNSTILE_SITEVERIFY_URL,
+                json=payload,
+                timeout=10,
+            )
+        data = response.json()
+    except (httpx.RequestError, ValueError):
+        logger.warning("Turnstile Siteverify request failed")
+        return False
+    if response.is_error or not isinstance(data, dict) or not data.get("success"):
+        error_codes = data.get("error-codes", []) if isinstance(data, dict) else []
+        logger.info("Turnstile verification rejected error_codes=%s", error_codes)
+        return False
+
+    expected_hostname = urlsplit(TURNSTILE_VERIFY_URL).hostname or ""
+    response_hostname = str(data.get("hostname", ""))
+    response_action = str(data.get("action", ""))
+    return (
+        bool(expected_hostname)
+        and hmac.compare_digest(
+            response_hostname.lower(),
+            expected_hostname.lower(),
+        )
+        and hmac.compare_digest(response_action, TURNSTILE_VERIFY_ACTION)
+    )
 
 
 def set_admin_state(admin_id: int, target_chat_id: int) -> None:
@@ -2212,6 +2428,20 @@ def welcome_keyboard() -> dict[str, Any]:
     )
 
 
+def verification_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "完成人机验证",
+                    "web_app": {"url": TURNSTILE_VERIFY_URL},
+                    "style": "primary",
+                }
+            ]
+        ]
+    }
+
+
 async def present_admin_view(
     admin_id: int,
     text: str,
@@ -2360,6 +2590,15 @@ async def send_welcome(chat_id: int) -> None:
     )
 
 
+async def send_verification_prompt(chat_id: int) -> None:
+    if claim_verification_prompt(chat_id):
+        await send_message(
+            chat_id,
+            VERIFICATION_REQUIRED_TEXT,
+            reply_markup=verification_keyboard(),
+        )
+
+
 def normalize_command_text(text: str) -> str:
     if not text.startswith("/"):
         return text
@@ -2374,9 +2613,8 @@ async def handle_user_message(message: dict[str, Any]) -> None:
     text = message_content(message)
     message_id = int(message["message_id"])
 
-    upsert_user(user, text)
-
     if is_blacklisted(chat_id):
+        upsert_user(user, text)
         allowed, _, _ = check_user_rate_limit(chat_id)
         if allowed:
             add_message_log(
@@ -2387,6 +2625,13 @@ async def handle_user_message(message: dict[str, Any]) -> None:
                 telegram_message_id=message_id,
             )
         return
+
+    if not is_user_verified(chat_id):
+        upsert_user(user, "[等待人机验证]")
+        await send_verification_prompt(chat_id)
+        return
+
+    upsert_user(user, text)
 
     command_text = normalize_command_text(message.get("text") or "")
     if command_text == "/start" or command_text.startswith("/start "):
@@ -2433,9 +2678,13 @@ async def handle_user_edited_message(message: dict[str, Any]) -> None:
     message_id = int(message["message_id"])
     text = message_content(message)
 
-    upsert_user(user, text)
     if is_blacklisted(chat_id) or text == "/start":
         return
+    if not is_user_verified(chat_id):
+        upsert_user(user, "[等待人机验证]")
+        return
+
+    upsert_user(user, text)
 
     allowed, should_notify, retry_after = check_user_rate_limit(chat_id)
     if not allowed:
@@ -3157,6 +3406,93 @@ async def handle_callback(callback: dict[str, Any]) -> None:
         return
 
     await answer_callback_query(callback_id)
+
+
+def turnstile_page_response() -> HTMLResponse:
+    nonce = secrets.token_urlsafe(24)
+    site_key_json = json.dumps(TURNSTILE_SITE_KEY).replace("<", "\\u003c")
+    content = (
+        TURNSTILE_PAGE_TEMPLATE
+        .replace("__NONCE__", nonce)
+        .replace("__SITE_KEY_JSON__", site_key_json)
+    )
+    content_security_policy = (
+        "default-src 'none'; "
+        f"script-src 'nonce-{nonce}' 'strict-dynamic' "
+        "https://telegram.org https://challenges.cloudflare.com; "
+        f"style-src 'nonce-{nonce}'; "
+        "frame-src https://challenges.cloudflare.com; "
+        "connect-src 'self' https://challenges.cloudflare.com; "
+        "img-src data: https://challenges.cloudflare.com; "
+        "base-uri 'none'; form-action 'none'; "
+        "frame-ancestors 'self' https://web.telegram.org https://*.telegram.org"
+    )
+    return HTMLResponse(
+        content,
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Security-Policy": content_security_policy,
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+            "Permissions-Policy": (
+                "camera=(), microphone=(), geolocation=(), payment=()"
+            ),
+        },
+    )
+
+
+@app.get("/verify", response_class=HTMLResponse)
+async def turnstile_verification_page() -> HTMLResponse:
+    if not TURNSTILE_ENABLED:
+        raise HTTPException(status_code=404, detail="not found")
+    return turnstile_page_response()
+
+
+@app.post("/verify/complete")
+async def complete_turnstile_verification(request: Request) -> JSONResponse:
+    if not TURNSTILE_ENABLED:
+        raise HTTPException(status_code=404, detail="not found")
+    content_type = (
+        request.headers.get("content-type", "")
+        .partition(";")[0]
+        .strip()
+        .lower()
+    )
+    if content_type != "application/json":
+        raise HTTPException(status_code=415, detail="JSON request required")
+    body = await request.body()
+    if len(body) > 16384:
+        raise HTTPException(status_code=413, detail="request too large")
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="invalid request") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="invalid request")
+
+    init_data = payload.get("init_data")
+    turnstile_token = payload.get("turnstile_token")
+    if not isinstance(init_data, str) or not isinstance(turnstile_token, str):
+        raise HTTPException(status_code=400, detail="invalid request")
+    try:
+        chat_id = validate_telegram_init_data(init_data)
+    except ValueError:
+        return JSONResponse(
+            {"ok": False, "message": "Telegram 身份已失效，请返回 Bot 重新打开验证。"},
+            status_code=403,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    if not await verify_turnstile_token(turnstile_token):
+        return JSONResponse(
+            {"ok": False, "message": "人机验证未通过，请重新尝试。"},
+            status_code=400,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    mark_user_verified(chat_id)
+    await send_welcome(chat_id)
+    return JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/healthz")

@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>人机验证</title>
+  <style nonce="__NONCE__">
+    :root {
+      color-scheme: light dark;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+      --page: #f4f6f8;
+      --surface: #ffffff;
+      --text: #18212b;
+      --muted: #637083;
+      --border: #d8dee6;
+      --accent: #2f6d58;
+      --danger: #a33a3a;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --page: #15191e;
+        --surface: #1f252c;
+        --text: #eef2f5;
+        --muted: #a9b3bf;
+        --border: #3a434d;
+        --accent: #73b99e;
+        --danger: #ec8e8e;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      min-height: 100dvh;
+      margin: 0;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      background: var(--page);
+      color: var(--text);
+    }
+    main {
+      width: min(100%, 420px);
+      padding: 28px 24px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
+      box-shadow: 0 10px 30px rgb(0 0 0 / 8%);
+    }
+    .status-mark {
+      width: 40px;
+      height: 4px;
+      margin-bottom: 22px;
+      border-radius: 2px;
+      background: var(--accent);
+    }
+    h1 {
+      margin: 0 0 10px;
+      font-size: 24px;
+      line-height: 1.25;
+      letter-spacing: 0;
+    }
+    p {
+      min-height: 44px;
+      margin: 0 0 22px;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.55;
+      letter-spacing: 0;
+    }
+    #challenge {
+      min-height: 70px;
+      display: grid;
+      align-items: center;
+      justify-items: center;
+      overflow: hidden;
+    }
+    .success { color: var(--accent); }
+    .error { color: var(--danger); }
+  </style>
+  <script nonce="__NONCE__" src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script nonce="__NONCE__">
+    "use strict";
+    const telegram = window.Telegram && window.Telegram.WebApp;
+    const statusElement = () => document.getElementById("status");
+
+    function setStatus(message, className = "") {
+      const element = statusElement();
+      element.textContent = message;
+      element.className = className;
+    }
+
+    async function completeVerification(turnstileToken) {
+      setStatus("正在确认验证结果…");
+      try {
+        const response = await fetch("/verify/complete", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            init_data: telegram.initData,
+            turnstile_token: turnstileToken
+          })
+        });
+        const result = await response.json();
+        if (!response.ok || !result.ok) {
+          throw new Error(result.message || "验证失败，请重新尝试。");
+        }
+        setStatus("验证完成，现在可以返回聊天发送留言。", "success");
+        window.setTimeout(() => telegram.close(), 1200);
+      } catch (error) {
+        setStatus(error.message || "验证服务暂时不可用，请稍后重试。", "error");
+        if (window.turnstile) {
+          window.turnstile.reset();
+        }
+      }
+    }
+
+    window.onTurnstileReady = function () {
+      if (!telegram) {
+        setStatus("Telegram 验证组件加载失败，请返回 Bot 重试。", "error");
+        return;
+      }
+      telegram.ready();
+      telegram.expand();
+      if (!telegram.initData) {
+        setStatus("请从 Telegram Bot 内打开此验证页面。", "error");
+        return;
+      }
+      setStatus("请完成下方验证。");
+      const challenge = document.getElementById("challenge");
+      window.turnstile.render(challenge, {
+        sitekey: __SITE_KEY_JSON__,
+        action: "telegram_verify",
+        size: challenge.clientWidth >= 300 ? "flexible" : "compact",
+        callback: completeVerification,
+        "error-callback": () => {
+          setStatus("验证组件加载失败，请检查网络后重试。", "error");
+        },
+        "expired-callback": () => {
+          setStatus("验证已过期，请重新完成验证。", "error");
+        }
+      });
+    };
+  </script>
+  <script nonce="__NONCE__"
+          src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onTurnstileReady&amp;render=explicit"
+          async defer></script>
+</head>
+<body>
+  <main>
+    <div class="status-mark" aria-hidden="true"></div>
+    <h1>验证后开始留言</h1>
+    <p id="status" aria-live="polite">正在加载验证组件…</p>
+    <div id="challenge"></div>
+  </main>
+</body>
+</html>
