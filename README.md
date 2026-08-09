@@ -25,6 +25,8 @@
 - 时间按 `DISPLAY_TIMEZONE` 转换后展示，数据库仍保存 UTC 时间
 - 按钮颜色按用途区分：蓝色为主要操作、绿色为完成或恢复、红色为退出、取消或风险确认
 - `/closed` 显示最近已处理会话，可通过按钮重新打开
+- 可直接使用 Telegram 原生 Reply 回复用户通知或对应媒体
+- 管理端消息 ID 与用户消息 ID 持久化关联，服务重启后仍可准确回复
 - 持续回复模式，支持文字和媒体
 - 多管理员接管与标记已处理
 - 手动加入或解除黑名单，按钮操作需要二次确认
@@ -42,6 +44,7 @@
 - Turnstile Token 与 Telegram Mini App 身份均在服务端验证
 - 所有管理命令和管理按钮均校验 `ADMIN_IDS`
 - Webhook 更新使用 `processing/done/failed` 状态，失败后允许 Telegram 重试
+- 原生 Reply 优先按持久化消息映射查找用户，无法识别时拒绝发送，不会回退到旧回复状态
 - Telegram 触发 flood control 时按 `retry_after` 等待；群发失败用户可单独重试
 - Telegram HTTP 连接复用
 - 管理员通知自动控制在 Telegram 消息长度限制内
@@ -247,10 +250,12 @@ sudo tg-bot turnstile disable
 待处理流程：
 
 1. 用户发送新消息后，会话进入 `/inbox` 并累加待处理数
-2. 超过 `PENDING_REMINDER_MINUTES` 仍未处理时会出现在 `/pending`
-3. 管理员成功回复后待处理数清零
-4. 点击“标记已处理”或使用 `/close 用户ID` 后进入 `/closed`
-5. 用户再次留言会自动重新打开，也可以由管理员手动重新打开
+2. Bot 为通知卡片和对应媒体分别保存管理端消息 ID 映射
+3. 管理员可以直接 Reply 通知、Reply 媒体，或点击“回复”进入持续回复模式
+4. 超过 `PENDING_REMINDER_MINUTES` 仍未处理时会出现在 `/pending`
+5. 管理员成功回复后待处理数清零
+6. 点击“标记已处理”或使用 `/close 用户ID` 后进入 `/closed`
+7. 用户再次留言会自动重新打开，也可以由管理员手动重新打开
 
 群发流程：
 
@@ -276,6 +281,7 @@ bot.db
 - `users`：用户资料和最近消息
 - `admin_states`：管理员当前回复目标
 - `message_logs`：用户和管理员回复历史
+- `message_links`：用户消息与每个管理员聊天中的通知、媒体和回复消息映射
 - `blacklists`：手动黑名单
 - `conversations`：会话接管、待处理数和最后回复时间
 - `admin_audit_logs`：管理员操作审计记录
