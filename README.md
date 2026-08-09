@@ -351,7 +351,7 @@ sudo tg-bot update
 安装或回退到指定 Release：
 
 ```bash
-sudo tg-bot update v1.4.0
+sudo tg-bot update v1.5.0
 ```
 
 更新前脚本会检查 Git 工作区、获取目标提交并创建数据库回滚备份。随后更新依赖、运行测试、同步 systemd 服务并检查 `/healthz`。任一步失败都会自动停止服务并恢复：
@@ -371,14 +371,14 @@ sudo tg-bot update v1.4.0
 sudo tg-bot version
 ```
 
-正式 Tag 部署会显示例如 `v1.4.0`；开发分支会显示例如 `v1.4.0+提交号`。
+正式 Tag 部署会显示例如 `v1.5.0`；开发分支会显示例如 `v1.5.0+提交号`。
 
 ## 发布 Release
 
 `VERSION` 保存当前语义化版本。准备新版本时，先通过 PR 更新该文件并合并到 `main`，然后在干净且与 `origin/main` 一致的本地仓库运行：
 
 ```bash
-bash scripts/create-release.sh v1.4.0
+bash scripts/create-release.sh v1.5.0
 ```
 
 脚本会验证版本、运行测试、创建 annotated Tag 并推送。`VERSION` 合并到 `main` 后，如果对应 Tag 尚不存在，`.github/workflows/release.yml` 也会自动创建 annotated Tag；随后再次验证 Tag 和测试结果，并使用仓库内置 `GITHUB_TOKEN` 创建带自动发行说明的 GitHub Release。
@@ -420,7 +420,7 @@ sudo tg-bot status
 正常返回：
 
 ```json
-{"ok":true,"version":"1.4.0","db":"ok","broadcast_worker":"ok"}
+{"ok":true,"version":"1.5.0","db":"ok","broadcast_worker":"ok"}
 ```
 
 Nginx 模板不会把 `/healthz` 暴露到公网。
