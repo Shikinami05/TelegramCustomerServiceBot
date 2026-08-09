@@ -10,175 +10,65 @@ import secrets
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterator
-from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass
+from contextlib import AbstractContextManager, asynccontextmanager
 from datetime import datetime, timezone
-from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlsplit
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from urllib.parse import parse_qsl
 
 import httpx
-from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+
+from tg_bot.config import (
+    load_display_timezone,
+    load_settings,
+    turnstile_verify_hostname,
+)
+from tg_bot import database, keyboards
+from tg_bot.keyboards import ButtonSpec
+from tg_bot.models import ConversationClaimResult, TelegramSendResult
+from tg_bot.telegram import TelegramAPIError, request as telegram_request
+from tg_bot.text import escape_html_limited, html_to_plain_text, truncate_text
 
 if os.name == "posix":
     os.umask(0o077)
 
-load_dotenv()
-
-
-def env_int(name: str, default: int, minimum: int = 0) -> int:
-    raw_value = os.getenv(name, str(default))
-    try:
-        value = int(raw_value)
-    except ValueError as exc:
-        raise RuntimeError(f"{name} must be an integer") from exc
-    if value < minimum:
-        raise RuntimeError(f"{name} must be at least {minimum}")
-    return value
-
-
-def env_float(name: str, default: float, minimum: float = 0.0) -> float:
-    raw_value = os.getenv(name, str(default))
-    try:
-        value = float(raw_value)
-    except ValueError as exc:
-        raise RuntimeError(f"{name} must be a number") from exc
-    if value < minimum:
-        raise RuntimeError(f"{name} must be at least {minimum}")
-    return value
-
-
-def env_bool(name: str, default: bool = False) -> bool:
-    raw_value = os.getenv(name, str(default)).strip().lower()
-    if raw_value in {"1", "true", "yes", "on"}:
-        return True
-    if raw_value in {"0", "false", "no", "off"}:
-        return False
-    raise RuntimeError(f"{name} must be true or false")
-
-
-def turnstile_verify_hostname(url: str) -> str:
-    try:
-        parsed = urlsplit(url)
-        port = parsed.port
-    except ValueError as exc:
-        raise ValueError("invalid Turnstile verification URL") from exc
-    hostname = parsed.hostname or ""
-    hostname_labels = hostname.split(".")
-    if (
-        parsed.scheme != "https"
-        or not hostname
-        or not hostname.isascii()
-        or len(hostname) > 253
-        or port == 0
-        or any(
-            not label
-            or len(label) > 63
-            or label.startswith("-")
-            or label.endswith("-")
-            or any(
-                not (character.isalnum() or character == "-")
-                for character in label
-            )
-            for label in hostname_labels
-        )
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.path != "/verify"
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ValueError(
-            "Turnstile verification URL must be an HTTPS /verify URL "
-            "without credentials, query, or fragment"
-    )
-    expected_netloc = hostname
-    if port is not None:
-        expected_netloc = f"{hostname}:{port}"
-    if parsed.netloc.lower() != expected_netloc.lower():
-        raise ValueError("invalid Turnstile verification URL host")
-    return hostname.lower()
-
-
-def load_display_timezone(name: str) -> ZoneInfo:
-    try:
-        return ZoneInfo(name)
-    except (ZoneInfoNotFoundError, ValueError) as exc:
-        raise RuntimeError(f"DISPLAY_TIMEZONE is invalid: {name}") from exc
-
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
-ADMIN_IDS = {
-    int(x.strip())
-    for x in os.getenv("ADMIN_IDS", "").split(",")
-    if x.strip().lstrip("-").isdigit()
-}
-OWNER_IDS = {
-    int(x.strip())
-    for x in os.getenv("OWNER_IDS", "").split(",")
-    if x.strip().lstrip("-").isdigit()
-}
-if not OWNER_IDS:
-    OWNER_IDS = set(ADMIN_IDS)
-ADMIN_IDS |= OWNER_IDS
-
-DB_BACKUP_ENABLED = os.getenv("DB_BACKUP_ENABLED", "true").lower() == "true"
-DB_BACKUP_INTERVAL_SECONDS = env_int("DB_BACKUP_INTERVAL_SECONDS", 86400, 60)
-DB_BACKUP_KEEP = env_int("DB_BACKUP_KEEP", 14, 1)
-USER_RATE_LIMIT_COUNT = env_int("USER_RATE_LIMIT_COUNT", 8, 1)
-USER_RATE_LIMIT_WINDOW_SECONDS = env_int("USER_RATE_LIMIT_WINDOW_SECONDS", 60, 1)
-USER_RATE_LIMIT_COOLDOWN_SECONDS = env_int("USER_RATE_LIMIT_COOLDOWN_SECONDS", 300, 1)
-MESSAGE_RETENTION_DAYS = env_int("MESSAGE_RETENTION_DAYS", 0, 0)
-BROADCAST_SEND_DELAY_SECONDS = env_float("BROADCAST_SEND_DELAY_SECONDS", 0.05, 0.0)
-UPDATE_PROCESSING_TIMEOUT_SECONDS = env_int("UPDATE_PROCESSING_TIMEOUT_SECONDS", 300, 30)
-PENDING_REMINDER_MINUTES = env_int("PENDING_REMINDER_MINUTES", 30, 1)
-TELEGRAM_INLINE_RETRY_MAX_SECONDS = env_int(
-    "TELEGRAM_INLINE_RETRY_MAX_SECONDS", 5, 0
-)
-BROADCAST_RATE_LIMIT_RETRIES = env_int("BROADCAST_RATE_LIMIT_RETRIES", 3, 0)
-WEBHOOK_MAX_BODY_BYTES = 1024 * 1024
-TURNSTILE_ENABLED = env_bool("TURNSTILE_ENABLED", False)
-TURNSTILE_SITE_KEY = os.getenv("TURNSTILE_SITE_KEY", "").strip()
-TURNSTILE_SECRET_KEY = os.getenv("TURNSTILE_SECRET_KEY", "").strip()
-TURNSTILE_VERIFY_URL = os.getenv("TURNSTILE_VERIFY_URL", "").strip()
-TURNSTILE_VERIFY_DAYS = env_int("TURNSTILE_VERIFY_DAYS", 30, 1)
-TURNSTILE_INIT_DATA_MAX_AGE_SECONDS = env_int(
-    "TURNSTILE_INIT_DATA_MAX_AGE_SECONDS",
-    600,
-    60,
-)
-DISPLAY_TIMEZONE_NAME = os.getenv("DISPLAY_TIMEZONE", "Asia/Hong_Kong").strip()
-DISPLAY_TIMEZONE = load_display_timezone(DISPLAY_TIMEZONE_NAME)
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing")
-if not WEBHOOK_SECRET:
-    raise RuntimeError("WEBHOOK_SECRET is missing")
-if not ADMIN_IDS:
-    raise RuntimeError("ADMIN_IDS is missing")
-if TURNSTILE_ENABLED:
-    if not TURNSTILE_SITE_KEY or not TURNSTILE_SECRET_KEY or not TURNSTILE_VERIFY_URL:
-        raise RuntimeError(
-            "TURNSTILE_SITE_KEY, TURNSTILE_SECRET_KEY and "
-            "TURNSTILE_VERIFY_URL are required when Turnstile is enabled"
-        )
-    try:
-        turnstile_verify_hostname(TURNSTILE_VERIFY_URL)
-    except ValueError as exc:
-        raise RuntimeError(str(exc)) from exc
-
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "bot.db"
-DB_BACKUP_DIR = Path(os.getenv("DB_BACKUP_DIR", str(BASE_DIR / "backups")))
-API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
-APP_VERSION = (BASE_DIR / "VERSION").read_text(encoding="ascii").strip()
+SETTINGS = load_settings(BASE_DIR)
+
+BOT_TOKEN = SETTINGS.bot_token
+WEBHOOK_SECRET = SETTINGS.webhook_secret
+ADMIN_IDS = set(SETTINGS.admin_ids)
+OWNER_IDS = set(SETTINGS.owner_ids)
+DB_BACKUP_ENABLED = SETTINGS.db_backup_enabled
+DB_BACKUP_INTERVAL_SECONDS = SETTINGS.db_backup_interval_seconds
+DB_BACKUP_KEEP = SETTINGS.db_backup_keep
+USER_RATE_LIMIT_COUNT = SETTINGS.user_rate_limit_count
+USER_RATE_LIMIT_WINDOW_SECONDS = SETTINGS.user_rate_limit_window_seconds
+USER_RATE_LIMIT_COOLDOWN_SECONDS = SETTINGS.user_rate_limit_cooldown_seconds
+MESSAGE_RETENTION_DAYS = SETTINGS.message_retention_days
+BROADCAST_SEND_DELAY_SECONDS = SETTINGS.broadcast_send_delay_seconds
+UPDATE_PROCESSING_TIMEOUT_SECONDS = SETTINGS.update_processing_timeout_seconds
+PENDING_REMINDER_MINUTES = SETTINGS.pending_reminder_minutes
+TELEGRAM_INLINE_RETRY_MAX_SECONDS = SETTINGS.telegram_inline_retry_max_seconds
+BROADCAST_RATE_LIMIT_RETRIES = SETTINGS.broadcast_rate_limit_retries
+WEBHOOK_MAX_BODY_BYTES = 1024 * 1024
+TURNSTILE_ENABLED = SETTINGS.turnstile_enabled
+TURNSTILE_SITE_KEY = SETTINGS.turnstile_site_key
+TURNSTILE_SECRET_KEY = SETTINGS.turnstile_secret_key
+TURNSTILE_VERIFY_URL = SETTINGS.turnstile_verify_url
+TURNSTILE_VERIFY_DAYS = SETTINGS.turnstile_verify_days
+TURNSTILE_INIT_DATA_MAX_AGE_SECONDS = (
+    SETTINGS.turnstile_init_data_max_age_seconds
+)
+DISPLAY_TIMEZONE_NAME = SETTINGS.display_timezone_name
+DISPLAY_TIMEZONE = SETTINGS.display_timezone
+LOG_LEVEL = SETTINGS.log_level
+DB_PATH = SETTINGS.db_path
+DB_BACKUP_DIR = SETTINGS.db_backup_dir
+API_BASE = SETTINGS.api_base
+APP_VERSION = SETTINGS.app_version
 TURNSTILE_VERIFY_ACTION = "telegram_verify"
 TURNSTILE_SITEVERIFY_URL = (
     "https://challenges.cloudflare.com/turnstile/v0/siteverify"
@@ -280,279 +170,36 @@ AUDIT_ACTION_LABELS = {
     "broadcast_retry": "重试群发",
 }
 
-ButtonSpec = tuple[str, str] | tuple[str, str, str]
-INLINE_BUTTON_STYLES = {"primary", "success", "danger"}
-
-
 # =========================
 # 数据库
 # =========================
 
 def enforce_private_mode(path: Path, mode: int) -> None:
-    if os.name == "posix" and path.exists():
-        path.chmod(mode)
+    database.enforce_private_mode(path, mode)
 
 
 def secure_database_files() -> None:
-    for path in (
-        DB_PATH,
-        Path(f"{DB_PATH}-wal"),
-        Path(f"{DB_PATH}-shm"),
-        Path(f"{DB_PATH}-journal"),
-    ):
-        enforce_private_mode(path, 0o600)
+    database.secure_database_files(DB_PATH)
 
 
 def init_db() -> None:
-    with db_connect() as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                chat_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                last_message TEXT DEFAULT '',
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS admin_states (
-                admin_id INTEGER PRIMARY KEY,
-                target_chat_id INTEGER,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS message_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                sender_type TEXT NOT NULL,
-                sender_id INTEGER NOT NULL,
-                text TEXT NOT NULL DEFAULT '',
-                telegram_message_id INTEGER,
-                edited_at DATETIME,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS message_links (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_chat_id INTEGER NOT NULL,
-                user_message_id INTEGER NOT NULL,
-                admin_chat_id INTEGER NOT NULL,
-                admin_message_id INTEGER NOT NULL,
-                admin_message_thread_id INTEGER,
-                direction TEXT NOT NULL,
-                link_kind TEXT NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(admin_chat_id, admin_message_id)
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS blacklists (
-                chat_id INTEGER PRIMARY KEY,
-                reason TEXT DEFAULT '',
-                created_by INTEGER,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS conversations (
-                chat_id INTEGER PRIMARY KEY,
-                owner_admin_id INTEGER,
-                status TEXT NOT NULL DEFAULT 'open',
-                unread_count INTEGER NOT NULL DEFAULT 0,
-                last_user_message_at DATETIME,
-                last_admin_reply_at DATETIME,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                closed_at DATETIME
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS admin_audit_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                admin_id INTEGER NOT NULL,
-                action TEXT NOT NULL,
-                target_chat_id INTEGER,
-                details TEXT NOT NULL DEFAULT '',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS pending_broadcasts (
-                id TEXT PRIMARY KEY,
-                admin_id INTEGER NOT NULL,
-                content TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                total_count INTEGER NOT NULL DEFAULT 0,
-                sent_count INTEGER NOT NULL DEFAULT 0,
-                failed_count INTEGER NOT NULL DEFAULT 0,
-                confirmed_at DATETIME,
-                started_at DATETIME,
-                completed_at DATETIME,
-                last_error TEXT NOT NULL DEFAULT '',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS broadcast_recipients (
-                broadcast_id TEXT NOT NULL,
-                chat_id INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                attempts INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT NOT NULL DEFAULT '',
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (broadcast_id, chat_id),
-                FOREIGN KEY (broadcast_id) REFERENCES pending_broadcasts(id)
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS processed_updates (
-                update_id INTEGER PRIMARY KEY,
-                status TEXT NOT NULL DEFAULT 'done',
-                attempts INTEGER NOT NULL DEFAULT 1,
-                last_error TEXT NOT NULL DEFAULT '',
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_rate_limits (
-                chat_id INTEGER PRIMARY KEY,
-                window_started_at INTEGER NOT NULL,
-                message_count INTEGER NOT NULL DEFAULT 0,
-                blocked_until INTEGER NOT NULL DEFAULT 0,
-                last_notified_at INTEGER NOT NULL DEFAULT 0
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_verifications (
-                chat_id INTEGER PRIMARY KEY,
-                verified_at DATETIME,
-                expires_at DATETIME,
-                last_prompted_at DATETIME
-            )
-            """
-        )
-
-        ensure_column(conn, "message_logs", "telegram_message_id", "INTEGER")
-        ensure_column(conn, "message_logs", "edited_at", "DATETIME")
-        ensure_column(conn, "conversations", "unread_count", "INTEGER NOT NULL DEFAULT 0")
-        ensure_column(conn, "conversations", "last_user_message_at", "DATETIME")
-        ensure_column(conn, "conversations", "last_admin_reply_at", "DATETIME")
-        ensure_column(conn, "pending_broadcasts", "status", "TEXT NOT NULL DEFAULT 'pending'")
-        ensure_column(conn, "pending_broadcasts", "total_count", "INTEGER NOT NULL DEFAULT 0")
-        ensure_column(conn, "pending_broadcasts", "sent_count", "INTEGER NOT NULL DEFAULT 0")
-        ensure_column(conn, "pending_broadcasts", "failed_count", "INTEGER NOT NULL DEFAULT 0")
-        ensure_column(conn, "pending_broadcasts", "confirmed_at", "DATETIME")
-        ensure_column(conn, "pending_broadcasts", "started_at", "DATETIME")
-        ensure_column(conn, "pending_broadcasts", "completed_at", "DATETIME")
-        ensure_column(conn, "pending_broadcasts", "last_error", "TEXT NOT NULL DEFAULT ''")
-        ensure_column(conn, "processed_updates", "status", "TEXT NOT NULL DEFAULT 'done'")
-        ensure_column(conn, "processed_updates", "attempts", "INTEGER NOT NULL DEFAULT 1")
-        ensure_column(conn, "processed_updates", "last_error", "TEXT NOT NULL DEFAULT ''")
-        ensure_column(conn, "processed_updates", "updated_at", "DATETIME")
-        conn.execute(
-            "UPDATE processed_updates SET updated_at = processed_at WHERE updated_at IS NULL"
-        )
-        conn.execute(
-            "UPDATE broadcast_recipients SET status = 'pending' WHERE status = 'sending'"
-        )
-        conn.execute(
-            "UPDATE pending_broadcasts SET status = 'queued' WHERE status = 'running'"
-        )
-
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_message_logs_chat_id_id "
-            "ON message_logs(chat_id, id DESC)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_message_links_user_message "
-            "ON message_links(user_chat_id, user_message_id)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_broadcast_recipients_status "
-            "ON broadcast_recipients(broadcast_id, status)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_pending_broadcasts_status "
-            "ON pending_broadcasts(status, created_at)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_conversations_inbox "
-            "ON conversations(status, unread_count, last_user_message_at)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_created "
-            "ON admin_audit_logs(created_at DESC)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_user_verifications_expires "
-            "ON user_verifications(expires_at)"
-        )
-        conn.commit()
-    secure_database_files()
+    database.initialize(DB_PATH)
 
 
-@contextmanager
-def db_connect() -> Iterator[sqlite3.Connection]:
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA foreign_keys=ON")
-    try:
-        yield conn
-    finally:
-        conn.close()
-
-
-def ensure_column(
-    conn: sqlite3.Connection, table: str, column: str, definition: str
-) -> None:
-    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-    if column not in columns:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+def db_connect() -> AbstractContextManager[sqlite3.Connection]:
+    return database.connect(DB_PATH)
 
 
 def db_execute(sql: str, params: tuple[Any, ...] = ()) -> None:
-    with db_connect() as conn:
-        conn.execute(sql, params)
-        conn.commit()
+    database.execute(DB_PATH, sql, params)
 
 
 def db_fetchone(sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
-    with db_connect() as conn:
-        return conn.execute(sql, params).fetchone()
+    return database.fetchone(DB_PATH, sql, params)
 
 
 def db_fetchall(sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
-    with db_connect() as conn:
-        return conn.execute(sql, params).fetchall()
+    return database.fetchall(DB_PATH, sql, params)
 
 
 def claim_update(update_id: int) -> bool:
@@ -739,37 +386,6 @@ async def periodic_db_backup() -> None:
 TELEGRAM_TEXT_LIMIT = 4096
 
 
-class TelegramAPIError(RuntimeError):
-    def __init__(
-        self,
-        method: str,
-        status_code: int,
-        description: str,
-        retry_after: int | None = None,
-    ) -> None:
-        super().__init__(
-            f"Telegram API {method} failed with HTTP "
-            f"{status_code}: {truncate_text(description, 300)}"
-        )
-        self.method = method
-        self.status_code = status_code
-        self.description = description
-        self.retry_after = retry_after
-
-
-@dataclass(frozen=True, slots=True)
-class TelegramSendResult:
-    ok: bool
-    message_id: int | None = None
-    message_thread_id: int | None = None
-    status_code: int | None = None
-    description: str = ""
-    retry_after: int | None = None
-
-    def __bool__(self) -> bool:
-        return self.ok
-
-
 def telegram_send_result(data: dict[str, Any]) -> TelegramSendResult:
     result = data.get("result")
     if not isinstance(result, dict):
@@ -813,85 +429,8 @@ def delivery_failure_message(result: Any) -> str:
     return "发送失败：Telegram API 或网络暂时不可用，请稍后重试。"
 
 
-class PlainTextHTMLParser(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.parts: list[str] = []
-
-    def handle_data(self, data: str) -> None:
-        self.parts.append(data)
-
-
-def html_to_plain_text(value: str) -> str:
-    parser = PlainTextHTMLParser()
-    parser.feed(value)
-    parser.close()
-    return "".join(parser.parts)
-
-
-def truncate_text(value: str, limit: int) -> str:
-    if len(value) <= limit:
-        return value
-    if limit <= 1:
-        return value[:limit]
-    return value[: limit - 1] + "…"
-
-
-def escape_html_limited(value: str, limit: int) -> str:
-    escaped = html.escape(value)
-    if len(escaped) <= limit:
-        return escaped
-
-    low = 0
-    high = len(value)
-    while low < high:
-        middle = (low + high + 1) // 2
-        candidate = html.escape(value[:middle]) + "…"
-        if len(candidate) <= limit:
-            low = middle
-        else:
-            high = middle - 1
-    return html.escape(value[:low]) + "…"
-
-
 async def tg(method: str, payload: dict[str, Any]) -> dict[str, Any]:
-    try:
-        if telegram_client is None:
-            async with httpx.AsyncClient(timeout=20) as client:
-                response = await client.post(f"{API_BASE}/{method}", json=payload)
-        else:
-            response = await telegram_client.post(f"{API_BASE}/{method}", json=payload)
-    except httpx.RequestError as exc:
-        raise RuntimeError(
-            f"Telegram API {method} request failed ({type(exc).__name__})"
-        ) from None
-
-    try:
-        data = response.json()
-    except ValueError:
-        data = {}
-    if response.is_error or not isinstance(data, dict) or not data.get("ok", False):
-        description = (
-            str(data.get("description", "unexpected response"))
-            if isinstance(data, dict)
-            else "unexpected response"
-        )
-        parameters = data.get("parameters") if isinstance(data, dict) else None
-        raw_retry_after = (
-            parameters.get("retry_after") if isinstance(parameters, dict) else None
-        )
-        retry_after = (
-            int(raw_retry_after)
-            if isinstance(raw_retry_after, int) and raw_retry_after >= 0
-            else None
-        )
-        raise TelegramAPIError(
-            method,
-            response.status_code,
-            description,
-            retry_after=retry_after,
-        ) from None
-    return data
+    return await telegram_request(telegram_client, API_BASE, method, payload)
 
 
 async def send_message(
@@ -1061,22 +600,7 @@ async def copy_message(
 
 
 def inline_keyboard(rows: list[list[ButtonSpec]]) -> dict[str, Any]:
-    keyboard: list[list[dict[str, str]]] = []
-    for row in rows:
-        keyboard_row: list[dict[str, str]] = []
-        for button_spec in row:
-            if len(button_spec) not in {2, 3}:
-                raise ValueError("inline button must contain text, data, and optional style")
-            text, data = button_spec[:2]
-            button = {"text": text, "callback_data": data}
-            if len(button_spec) == 3:
-                style = button_spec[2]
-                if style not in INLINE_BUTTON_STYLES:
-                    raise ValueError(f"unsupported inline button style: {style}")
-                button["style"] = style
-            keyboard_row.append(button)
-        keyboard.append(keyboard_row)
-    return {"inline_keyboard": keyboard}
+    return keyboards.inline_keyboard(rows)
 
 
 # =========================
@@ -1806,15 +1330,6 @@ def get_conversation_owner(chat_id: int) -> int | None:
     if not row or row["status"] != "open" or row["owner_admin_id"] is None:
         return None
     return int(row["owner_admin_id"])
-
-
-@dataclass(frozen=True, slots=True)
-class ConversationClaimResult:
-    status: str
-    owner_admin_id: int | None
-
-    def __bool__(self) -> bool:
-        return self.status == "acquired"
 
 
 def claim_conversation(
@@ -2568,63 +2083,17 @@ def admin_user_keyboard(chat_id: int, viewer_admin_id: int | None = None) -> dic
     conversation = get_conversation(chat_id)
     is_closed = bool(conversation and conversation["status"] == "closed")
     owner_admin_id = get_conversation_owner(chat_id)
-    if is_blacklisted(chat_id):
-        return inline_keyboard(
-            [
-                [
-                    ("用户详情", f"detail:{chat_id}"),
-                    ("解除黑名单", f"unblacklist:{chat_id}", "success"),
-                ],
-                [("返回工作台", "admin:dashboard")],
-            ]
-        )
-
-    if is_closed:
-        return inline_keyboard(
-            [
-                [
-                    ("重新打开", f"reopen:{chat_id}", "primary"),
-                    ("用户详情", f"detail:{chat_id}"),
-                ],
-                [("加入黑名单", f"blacklist:{chat_id}")],
-                [("返回工作台", "admin:dashboard")],
-            ]
-        )
-
-    if owner_admin_id and viewer_admin_id and owner_admin_id != viewer_admin_id:
-        reply_button: ButtonSpec = ("接管", f"takeover:{chat_id}", "primary")
-    else:
-        reply_button = ("回复", f"reply:{chat_id}", "primary")
-    return inline_keyboard(
-        [
-            [
-                reply_button,
-                ("标记已处理", f"resolve:{chat_id}", "success"),
-            ],
-            [
-                ("用户详情", f"detail:{chat_id}"),
-                ("加入黑名单", f"blacklist:{chat_id}"),
-            ],
-            [("返回工作台", "admin:dashboard")],
-        ]
+    return keyboards.admin_user_keyboard(
+        chat_id,
+        blacklisted=is_blacklisted(chat_id),
+        closed=is_closed,
+        owner_admin_id=owner_admin_id,
+        viewer_admin_id=viewer_admin_id,
     )
 
 
 def admin_dashboard_keyboard() -> dict[str, Any]:
-    counts = get_queue_counts()
-    return inline_keyboard(
-        [
-            [
-                (f"待处理 {counts['inbox']}", "queue:inbox:1", "primary"),
-                (f"超时 {counts['pending']}", "queue:pending:1"),
-            ],
-            [
-                (f"已处理 {counts['closed']}", "queue:closed:1", "success"),
-                ("最近用户", "admin:users:1"),
-            ],
-            [("刷新", "admin:dashboard")],
-        ]
-    )
+    return keyboards.admin_dashboard_keyboard(get_queue_counts())
 
 
 def pagination_navigation_row(
@@ -2632,13 +2101,7 @@ def pagination_navigation_row(
     page: int,
     total_pages: int,
 ) -> list[ButtonSpec]:
-    row: list[ButtonSpec] = []
-    if page > 1:
-        row.append(("上一页", f"{callback_prefix}:{page - 1}"))
-    row.append((f"第 {page}/{total_pages} 页", f"{callback_prefix}:{page}"))
-    if page < total_pages:
-        row.append(("下一页", f"{callback_prefix}:{page + 1}"))
-    return row
+    return keyboards.pagination_navigation_row(callback_prefix, page, total_pages)
 
 
 def queue_navigation_rows(
@@ -2646,20 +2109,12 @@ def queue_navigation_rows(
     page: int,
     total_pages: int,
 ) -> list[list[ButtonSpec]]:
-    counts = get_queue_counts()
-    rows: list[list[ButtonSpec]] = [
-        [
-            (f"待处理 {counts['inbox']}", "queue:inbox:1", "primary"),
-            (f"超时 {counts['pending']}", "queue:pending:1"),
-            (f"已处理 {counts['closed']}", "queue:closed:1", "success"),
-        ],
-    ]
-    if total_pages > 1:
-        rows.append(
-            pagination_navigation_row(f"queue:{queue_name}", page, total_pages)
-        )
-    rows.append([("返回工作台", "admin:dashboard")])
-    return rows
+    return keyboards.queue_navigation_rows(
+        queue_name,
+        page,
+        total_pages,
+        get_queue_counts(),
+    )
 
 
 def recent_users_keyboard(
@@ -2667,22 +2122,12 @@ def recent_users_keyboard(
     page: int = 1,
     total_pages: int = 1,
 ) -> dict[str, Any]:
-    keyboard_rows: list[list[ButtonSpec]] = []
-    current_row: list[ButtonSpec] = []
-    start_index = (page - 1) * ADMIN_PAGE_SIZE
-    for index, row in enumerate(rows, start=start_index + 1):
-        current_row.append((f"{index} 详情", f"detail:{row['chat_id']}"))
-        if len(current_row) == 2:
-            keyboard_rows.append(current_row)
-            current_row = []
-    if current_row:
-        keyboard_rows.append(current_row)
-    if total_pages > 1:
-        keyboard_rows.append(
-            pagination_navigation_row("admin:users", page, total_pages)
-        )
-    keyboard_rows.append([("返回工作台", "admin:dashboard")])
-    return inline_keyboard(keyboard_rows)
+    return keyboards.recent_users_keyboard(
+        rows,
+        page=page,
+        total_pages=total_pages,
+        page_size=ADMIN_PAGE_SIZE,
+    )
 
 
 def conversation_queue_keyboard(
@@ -2692,82 +2137,27 @@ def conversation_queue_keyboard(
     page: int = 1,
     total_pages: int = 1,
 ) -> dict[str, Any]:
-    keyboard_rows: list[list[ButtonSpec]] = []
-    start_index = (page - 1) * ADMIN_PAGE_SIZE
-    for index, row in enumerate(rows, start=start_index + 1):
-        chat_id = int(row["chat_id"])
-        if queue_name == "closed":
-            keyboard_rows.append(
-                [
-                    (f"{index} 重开", f"reopen:{chat_id}", "primary"),
-                    (f"{index} 详情", f"detail:{chat_id}"),
-                ]
-            )
-            continue
-
-        owner_admin_id = row["owner_admin_id"]
-        if (
-            owner_admin_id is not None
-            and viewer_admin_id is not None
-            and int(owner_admin_id) != viewer_admin_id
-        ):
-            primary_button: ButtonSpec = (
-                f"{index} 接管",
-                f"takeover:{chat_id}",
-                "primary",
-            )
-        else:
-            primary_button = (
-                f"{index} 回复",
-                f"reply:{chat_id}",
-                "primary",
-            )
-        keyboard_rows.append(
-            [
-                primary_button,
-                (f"{index} 详情", f"detail:{chat_id}"),
-                (f"{index} 处理", f"resolve:{chat_id}", "success"),
-            ]
-        )
-    keyboard_rows.extend(queue_navigation_rows(queue_name, page, total_pages))
-    return inline_keyboard(keyboard_rows)
+    return keyboards.conversation_queue_keyboard(
+        rows,
+        queue_name,
+        viewer_admin_id=viewer_admin_id,
+        page=page,
+        total_pages=total_pages,
+        page_size=ADMIN_PAGE_SIZE,
+        counts=get_queue_counts(),
+    )
 
 
 def exit_reply_keyboard(chat_id: int) -> dict[str, Any]:
-    return inline_keyboard(
-        [
-            [
-                ("退出回复", f"cancel:{chat_id}", "danger"),
-                ("标记已处理", f"resolve:{chat_id}", "success"),
-            ],
-            [("用户详情", f"detail:{chat_id}")],
-        ]
-    )
+    return keyboards.exit_reply_keyboard(chat_id)
 
 
 def welcome_keyboard() -> dict[str, Any]:
-    return inline_keyboard(
-        [
-            [
-                ("如何留言", "user_help", "primary"),
-                ("支持格式", "user_guide"),
-            ]
-        ]
-    )
+    return keyboards.welcome_keyboard()
 
 
 def verification_keyboard() -> dict[str, Any]:
-    return {
-        "inline_keyboard": [
-            [
-                {
-                    "text": "完成人机验证",
-                    "web_app": {"url": TURNSTILE_VERIFY_URL},
-                    "style": "primary",
-                }
-            ]
-        ]
-    }
+    return keyboards.verification_keyboard(TURNSTILE_VERIFY_URL)
 
 
 async def present_admin_view(

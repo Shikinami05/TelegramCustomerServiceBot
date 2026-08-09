@@ -175,7 +175,7 @@ chmod 644 "$SERVICE_FILE"
 
 cd "$PROJECT_DIR"
 runuser -u "$APP_USER" -- "$PROJECT_DIR/venv/bin/python" -m py_compile \
-    app.py scripts/manage_webhook.py scripts/manage_backup.py \
+    app.py tg_bot/*.py scripts/manage_webhook.py scripts/manage_backup.py \
     scripts/manage_turnstile.py
 runuser -u "$APP_USER" -- "$PROJECT_DIR/venv/bin/python" -m unittest discover -s tests -v
 

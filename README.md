@@ -63,6 +63,25 @@
 - systemd
 - 一个已经指向 VPS 的域名
 
+## 项目结构
+
+项目保留 `uvicorn app:app` 入口，同时把可独立测试的基础能力放入 `tg_bot/`：
+
+```text
+app.py                 FastAPI 生命周期、Webhook、消息与回调编排
+tg_bot/config.py       环境变量解析、类型转换和启动校验
+tg_bot/database.py     SQLite 连接、Schema、迁移和通用查询
+tg_bot/telegram.py     Telegram Bot API HTTP 传输和错误模型
+tg_bot/keyboards.py    Inline Keyboard、分页、按钮颜色和回调数据
+tg_bot/models.py       共享结果类型
+tg_bot/text.py         HTML 与 Telegram 文本长度处理
+templates/             Turnstile 验证页面
+scripts/               安装、更新、备份、Webhook 和运维命令
+tests/                 业务、模块、安全边界和部署脚本回归测试
+```
+
+当前仍使用 FastAPI、HTTPX 和 SQLite，不依赖 Aiogram、Redis、PostgreSQL 或 ORM。这个拆分只减少 `app.py` 的基础设施职责，不改变现有命令、按钮回调、数据库表或部署入口。
+
 部署脚本不假设 VPS 用户名。它按以下顺序确定运行 Bot 的非 root 用户：
 
 1. 显式传入的 `APP_USER`
@@ -413,7 +432,7 @@ Telegram API 错误日志只记录方法、HTTP 状态和错误描述，不记�
 ```bash
 PROJECT_DIR="$(sudo systemctl show tg-bot -p WorkingDirectory --value)"
 cd "$PROJECT_DIR"
-./venv/bin/python -m py_compile app.py scripts/manage_webhook.py scripts/manage_backup.py scripts/manage_turnstile.py
+./venv/bin/python -m py_compile app.py tg_bot/*.py scripts/manage_webhook.py scripts/manage_backup.py scripts/manage_turnstile.py
 ./venv/bin/python -m unittest discover -s tests -v
 ```
 

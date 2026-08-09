@@ -23,5 +23,5 @@ jobs:
       - run: python -m pip install -r requirements.txt
       - run: bash -n scripts/*.sh
       - run: bash tests/test_scripts.sh
-      - run: python -m py_compile app.py scripts/manage_webhook.py scripts/manage_backup.py scripts/manage_turnstile.py
+      - run: python -m py_compile app.py tg_bot/*.py scripts/manage_webhook.py scripts/manage_backup.py scripts/manage_turnstile.py
       - run: python -m unittest discover -s tests -v
