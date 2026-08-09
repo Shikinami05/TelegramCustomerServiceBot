@@ -7,9 +7,11 @@ import os
 import sqlite3
 import stat
 import tempfile
+import threading
 import time
 import unittest
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode
@@ -427,15 +429,263 @@ class BotDatabaseTests(unittest.TestCase):
         self.assertIn("已编辑", full_history)
 
     def test_takeover_clears_previous_admin_reply_state(self) -> None:
-        app.claim_conversation(30, 1)
-        app.set_admin_state(1, 30)
+        first_claim = app.claim_conversation(30, 1, activate_reply=True)
 
-        app.claim_conversation(30, 2)
-        app.set_admin_state(2, 30)
+        second_claim = app.claim_conversation(
+            30,
+            2,
+            force=True,
+            reopen=True,
+            activate_reply=True,
+        )
 
+        self.assertTrue(first_claim)
+        self.assertTrue(second_claim)
         self.assertIsNone(app.get_admin_state(1))
         self.assertEqual(app.get_admin_state(2), 30)
         self.assertEqual(app.get_conversation_owner(30), 2)
+
+    def test_message_links_survive_database_reinitialization(self) -> None:
+        app.add_message_link(
+            user_chat_id=200,
+            user_message_id=15,
+            admin_chat_id=1,
+            admin_message_id=500,
+            direction="user_to_admin",
+            link_kind="notification",
+        )
+
+        app.init_db()
+
+        link = app.get_message_link(1, 500)
+        self.assertIsNotNone(link)
+        self.assertEqual(int(link["user_chat_id"]), 200)
+        self.assertEqual(int(link["user_message_id"]), 15)
+        self.assertEqual(link["direction"], "user_to_admin")
+
+    def test_existing_admin_message_link_cannot_be_remapped(self) -> None:
+        app.add_message_link(
+            user_chat_id=200,
+            user_message_id=15,
+            admin_chat_id=1,
+            admin_message_id=501,
+            direction="user_to_admin",
+            link_kind="notification",
+        )
+
+        with self.assertRaises(RuntimeError):
+            app.add_message_link(
+                user_chat_id=999,
+                user_message_id=99,
+                admin_chat_id=1,
+                admin_message_id=501,
+                direction="user_to_admin",
+                link_kind="notification",
+            )
+
+        link = app.get_message_link(1, 501)
+        self.assertEqual(int(link["user_chat_id"]), 200)
+
+    def test_notification_records_text_and_media_message_links(self) -> None:
+        user = {"id": 201, "username": "mapped_user", "first_name": "Mapped"}
+        source_message = {
+            "from": user,
+            "chat": {"id": 201, "type": "private"},
+            "message_id": 16,
+            "photo": [{"file_id": "photo"}],
+            "caption": "mapped photo",
+        }
+        app.upsert_user(user, app.message_content(source_message))
+        app.record_user_activity(201)
+        app.add_message_log(
+            201,
+            "user",
+            201,
+            app.message_content(source_message),
+            telegram_message_id=16,
+        )
+        send = AsyncMock(
+            return_value=app.TelegramSendResult(ok=True, message_id=600)
+        )
+        copy = AsyncMock(
+            return_value=app.TelegramSendResult(ok=True, message_id=601)
+        )
+
+        with (
+            patch.object(app, "ADMIN_IDS", {1}),
+            patch.object(app, "send_message", send),
+            patch.object(app, "copy_message", copy),
+        ):
+            asyncio.run(
+                app.notify_admins(
+                    user,
+                    app.message_content(source_message),
+                    source_message=source_message,
+                )
+            )
+
+        notification_link = app.get_message_link(1, 600)
+        content_link = app.get_message_link(1, 601)
+        self.assertEqual(int(notification_link["user_chat_id"]), 201)
+        self.assertEqual(notification_link["link_kind"], "notification")
+        self.assertEqual(int(content_link["user_chat_id"]), 201)
+        self.assertEqual(content_link["link_kind"], "content")
+
+    def test_native_reply_uses_mapping_instead_of_stale_reply_state(self) -> None:
+        app.set_admin_state(1, 100)
+        app.add_message_link(
+            user_chat_id=202,
+            user_message_id=20,
+            admin_chat_id=1,
+            admin_message_id=700,
+            direction="user_to_admin",
+            link_kind="notification",
+        )
+        message = {
+            "from": {"id": 1},
+            "chat": {"id": 1, "type": "private"},
+            "message_id": 701,
+            "text": "reply to mapped user",
+            "reply_to_message": {"message_id": 700},
+        }
+        copy = AsyncMock(
+            return_value=app.TelegramSendResult(ok=True, message_id=21)
+        )
+        send = AsyncMock(
+            return_value=app.TelegramSendResult(ok=True, message_id=702)
+        )
+
+        with (
+            patch.object(app, "copy_message", copy),
+            patch.object(app, "send_message", send),
+        ):
+            asyncio.run(app.handle_admin_message(message))
+
+        self.assertEqual(copy.await_args.args[0], 202)
+        self.assertEqual(app.get_admin_state(1), 202)
+        self.assertEqual(app.get_conversation_owner(202), 1)
+        reply_link = app.get_message_link(1, 701)
+        self.assertEqual(int(reply_link["user_chat_id"]), 202)
+        self.assertEqual(reply_link["direction"], "admin_to_user")
+
+    def test_unmapped_native_reply_never_falls_back_to_stale_state(self) -> None:
+        app.set_admin_state(1, 203)
+        message = {
+            "from": {"id": 1},
+            "chat": {"id": 1, "type": "private"},
+            "message_id": 801,
+            "text": "must not be sent",
+            "reply_to_message": {"message_id": 800},
+        }
+        copy = AsyncMock(
+            return_value=app.TelegramSendResult(ok=True, message_id=22)
+        )
+        send = AsyncMock(
+            return_value=app.TelegramSendResult(ok=True, message_id=802)
+        )
+
+        with (
+            patch.object(app, "copy_message", copy),
+            patch.object(app, "send_message", send),
+        ):
+            asyncio.run(app.handle_admin_message(message))
+
+        copy.assert_not_awaited()
+        self.assertEqual(app.get_admin_state(1), 203)
+        self.assertIn("无法识别回复对象", send.await_args.args[1])
+
+    def test_atomic_claim_allows_only_one_admin(self) -> None:
+        barrier = threading.Barrier(2)
+
+        def claim(admin_id: int) -> app.ConversationClaimResult:
+            barrier.wait()
+            return app.claim_conversation(204, admin_id, activate_reply=True)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(claim, (1, 2)))
+
+        self.assertEqual(sum(bool(result) for result in results), 1)
+        owner_admin_id = app.get_conversation_owner(204)
+        self.assertIn(owner_admin_id, {1, 2})
+        self.assertEqual(app.get_admin_state(owner_admin_id), 204)
+        losing_admin_id = 1 if owner_admin_id == 2 else 2
+        self.assertIsNone(app.get_admin_state(losing_admin_id))
+
+    def test_requested_media_types_have_explicit_summaries(self) -> None:
+        cases = (
+            ({"text": "hello"}, "text", "hello"),
+            ({"photo": [{}], "caption": "photo"}, "photo", "[图片] photo"),
+            ({"video": {}, "caption": "video"}, "video", "[视频] video"),
+            (
+                {"document": {"file_name": "a.txt"}, "caption": "doc"},
+                "document",
+                "[文件] a.txt doc",
+            ),
+            ({"audio": {}, "caption": "audio"}, "audio", "[音频] audio"),
+            ({"voice": {}, "caption": "voice"}, "voice", "[语音] voice"),
+            (
+                {"animation": {}, "caption": "animation"},
+                "animation",
+                "[动图] animation",
+            ),
+            ({"sticker": {"emoji": "ok"}}, "sticker", "[贴纸] ok"),
+            ({"location": {"latitude": 1, "longitude": 2}}, "location", "[位置]"),
+            (
+                {"contact": {"first_name": "Example", "last_name": "User"}},
+                "contact",
+                "[联系人] Example User",
+            ),
+        )
+
+        for message, expected_kind, expected_content in cases:
+            with self.subTest(expected_kind=expected_kind):
+                self.assertEqual(app.message_kind(message), expected_kind)
+                self.assertEqual(app.message_content(message), expected_content)
+
+    def test_requested_admin_media_types_are_copied_to_the_selected_user(self) -> None:
+        app.claim_conversation(205, 1, activate_reply=True)
+        payloads = (
+            {"text": "text"},
+            {"photo": [{}], "caption": "photo"},
+            {"video": {}, "caption": "video"},
+            {"document": {"file_name": "file.txt"}, "caption": "document"},
+            {"audio": {}, "caption": "audio"},
+            {"voice": {}, "caption": "voice"},
+            {"animation": {}, "caption": "animation"},
+            {"sticker": {"emoji": "ok"}},
+            {"location": {"latitude": 1, "longitude": 2}},
+            {"contact": {"first_name": "Example"}},
+        )
+        copy = AsyncMock(
+            side_effect=[
+                app.TelegramSendResult(ok=True, message_id=1000 + index)
+                for index in range(len(payloads))
+            ]
+        )
+        send = AsyncMock(
+            return_value=app.TelegramSendResult(ok=True, message_id=2000)
+        )
+
+        with (
+            patch.object(app, "copy_message", copy),
+            patch.object(app, "send_message", send),
+        ):
+            for index, payload in enumerate(payloads, start=1):
+                message = {
+                    "from": {"id": 1},
+                    "chat": {"id": 1, "type": "private"},
+                    "message_id": 900 + index,
+                    **payload,
+                }
+                asyncio.run(app.handle_admin_message(message))
+
+        self.assertEqual(copy.await_count, len(payloads))
+        self.assertTrue(
+            all(call.args[0] == 205 for call in copy.await_args_list)
+        )
+        for index in range(1, len(payloads) + 1):
+            link = app.get_message_link(1, 900 + index)
+            self.assertEqual(int(link["user_chat_id"]), 205)
 
     def test_conversation_inbox_pending_and_reopen_workflow(self) -> None:
         app.db_execute(
@@ -869,6 +1119,34 @@ class BotDatabaseTests(unittest.TestCase):
         self.assertTrue(sent)
         self.assertEqual(tg_mock.await_count, 2)
         sleep_mock.assert_awaited_once_with(2)
+
+    def test_send_results_preserve_message_ids_and_error_types(self) -> None:
+        tg_mock = AsyncMock(
+            side_effect=[
+                {
+                    "ok": True,
+                    "result": {"message_id": 301, "message_thread_id": 9},
+                },
+                {"ok": True, "result": {"message_id": 302}},
+                app.TelegramAPIError(
+                    "sendMessage",
+                    403,
+                    "Forbidden: bot was blocked",
+                ),
+            ]
+        )
+        with patch.object(app, "tg", tg_mock):
+            sent = asyncio.run(app.send_message(1, "hello"))
+            copied = asyncio.run(app.copy_message(1, 2, 3))
+            rejected = asyncio.run(app.send_message(1, "blocked"))
+
+        self.assertTrue(sent)
+        self.assertEqual(sent.message_id, 301)
+        self.assertEqual(sent.message_thread_id, 9)
+        self.assertEqual(copied.message_id, 302)
+        self.assertFalse(rejected)
+        self.assertEqual(rejected.status_code, 403)
+        self.assertIn("屏蔽", app.delivery_failure_message(rejected))
 
     def test_refreshing_unchanged_admin_view_is_not_an_error(self) -> None:
         tg_mock = AsyncMock(

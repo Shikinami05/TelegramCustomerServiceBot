@@ -12,6 +12,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
@@ -343,6 +344,22 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS message_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_chat_id INTEGER NOT NULL,
+                user_message_id INTEGER NOT NULL,
+                admin_chat_id INTEGER NOT NULL,
+                admin_message_id INTEGER NOT NULL,
+                admin_message_thread_id INTEGER,
+                direction TEXT NOT NULL,
+                link_kind TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(admin_chat_id, admin_message_id)
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS blacklists (
                 chat_id INTEGER PRIMARY KEY,
                 reason TEXT DEFAULT '',
@@ -473,6 +490,10 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_message_logs_chat_id_id "
             "ON message_logs(chat_id, id DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_message_links_user_message "
+            "ON message_links(user_chat_id, user_message_id)"
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_broadcast_recipients_status "
@@ -613,6 +634,10 @@ def purge_expired_data() -> None:
                 "DELETE FROM message_logs WHERE created_at < datetime('now', ?)",
                 (f"-{MESSAGE_RETENTION_DAYS} days",),
             )
+            conn.execute(
+                "DELETE FROM message_links WHERE created_at < datetime('now', ?)",
+                (f"-{MESSAGE_RETENTION_DAYS} days",),
+            )
         conn.execute(
             """
             DELETE FROM processed_updates
@@ -732,6 +757,62 @@ class TelegramAPIError(RuntimeError):
         self.retry_after = retry_after
 
 
+@dataclass(frozen=True, slots=True)
+class TelegramSendResult:
+    ok: bool
+    message_id: int | None = None
+    message_thread_id: int | None = None
+    status_code: int | None = None
+    description: str = ""
+    retry_after: int | None = None
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+def telegram_send_result(data: dict[str, Any]) -> TelegramSendResult:
+    result = data.get("result")
+    if not isinstance(result, dict):
+        return TelegramSendResult(ok=True)
+    raw_message_id = result.get("message_id")
+    raw_thread_id = result.get("message_thread_id")
+    return TelegramSendResult(
+        ok=True,
+        message_id=(
+            int(raw_message_id)
+            if isinstance(raw_message_id, int) and not isinstance(raw_message_id, bool)
+            else None
+        ),
+        message_thread_id=(
+            int(raw_thread_id)
+            if isinstance(raw_thread_id, int) and not isinstance(raw_thread_id, bool)
+            else None
+        ),
+    )
+
+
+def failed_send_result(exc: Exception) -> TelegramSendResult:
+    if isinstance(exc, TelegramAPIError):
+        return TelegramSendResult(
+            ok=False,
+            status_code=exc.status_code,
+            description=exc.description,
+            retry_after=exc.retry_after,
+        )
+    return TelegramSendResult(ok=False, description=type(exc).__name__)
+
+
+def delivery_failure_message(result: Any) -> str:
+    if isinstance(result, TelegramSendResult):
+        if result.status_code == 403:
+            return "发送失败：用户可能已经屏蔽 Bot。"
+        if result.status_code == 400:
+            return "发送失败：Telegram 无法找到该用户或不接受这类消息。"
+        if result.retry_after is not None:
+            return f"发送受限：请等待约 {result.retry_after} 秒后重试。"
+    return "发送失败：Telegram API 或网络暂时不可用，请稍后重试。"
+
+
 class PlainTextHTMLParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -820,7 +901,7 @@ async def send_message(
     parse_mode: str | None = "HTML",
     rate_limit_retries: int = 1,
     rate_limit_max_wait_seconds: int | None = TELEGRAM_INLINE_RETRY_MAX_SECONDS,
-) -> bool:
+) -> TelegramSendResult:
     if len(text) > TELEGRAM_TEXT_LIMIT:
         logger.warning(
             "Telegram message exceeded limit; falling back to truncated plain text chat_id=%s",
@@ -842,8 +923,8 @@ async def send_message(
     rate_limit_attempt = 0
     while True:
         try:
-            await tg("sendMessage", payload)
-            return True
+            data = await tg("sendMessage", payload)
+            return telegram_send_result(data)
         except TelegramAPIError as exc:
             can_retry = (
                 exc.retry_after is not None
@@ -864,10 +945,10 @@ async def send_message(
                 await asyncio.sleep(exc.retry_after)
                 continue
             logger.warning("sendMessage failed chat_id=%s error=%s", chat_id, exc)
-            return False
+            return failed_send_result(exc)
         except Exception as exc:
             logger.warning("sendMessage failed chat_id=%s error=%s", chat_id, exc)
-            return False
+            return failed_send_result(exc)
 
 
 async def answer_callback_query(callback_query_id: str, text: str = "") -> bool:
@@ -926,11 +1007,11 @@ async def copy_message(
     message_id: int,
     rate_limit_retries: int = 1,
     rate_limit_max_wait_seconds: int | None = TELEGRAM_INLINE_RETRY_MAX_SECONDS,
-) -> bool:
+) -> TelegramSendResult:
     rate_limit_attempt = 0
     while True:
         try:
-            await tg(
+            data = await tg(
                 "copyMessage",
                 {
                     "chat_id": to_chat_id,
@@ -938,7 +1019,7 @@ async def copy_message(
                     "message_id": message_id,
                 },
             )
-            return True
+            return telegram_send_result(data)
         except TelegramAPIError as exc:
             can_retry = (
                 exc.retry_after is not None
@@ -966,7 +1047,7 @@ async def copy_message(
                 message_id,
                 exc,
             )
-            return False
+            return failed_send_result(exc)
         except Exception as exc:
             logger.warning(
                 "copyMessage failed to_chat_id=%s from_chat_id=%s "
@@ -976,7 +1057,7 @@ async def copy_message(
                 message_id,
                 exc,
             )
-            return False
+            return failed_send_result(exc)
 
 
 def inline_keyboard(rows: list[list[ButtonSpec]]) -> dict[str, Any]:
@@ -1036,6 +1117,24 @@ def user_label(user: dict[str, Any]) -> str:
     return name or str(user.get("id"))
 
 
+def user_identity_html(user: dict[str, Any]) -> str:
+    username = (
+        f"@{escape_html_limited(str(user['username']), 80)}"
+        if user.get("username")
+        else "-"
+    )
+    name = " ".join(
+        str(value)
+        for value in (user.get("first_name"), user.get("last_name"))
+        if value
+    ).strip()
+    return (
+        f"ID：<code>{int(user['id'])}</code>\n"
+        f"Username：{username}\n"
+        f"Name：{escape_html_limited(name, 100) if name else '-'}"
+    )
+
+
 def compact_timestamp(value: Any) -> str:
     if not value:
         return "-"
@@ -1078,10 +1177,23 @@ def message_content(message: dict[str, Any]) -> str:
         return f"[视频] {caption}".strip()
     if "audio" in message:
         return f"[音频] {caption}".strip()
+    if "animation" in message:
+        return f"[动图] {caption}".strip()
     if "video_note" in message:
         return "[视频消息]"
     if "sticker" in message:
-        return "[贴纸]"
+        emoji = str(message.get("sticker", {}).get("emoji") or "")
+        return f"[贴纸] {emoji}".strip()
+    if "location" in message:
+        return "[位置]"
+    if "contact" in message:
+        contact = message.get("contact") or {}
+        name = " ".join(
+            value
+            for value in (contact.get("first_name"), contact.get("last_name"))
+            if value
+        ).strip()
+        return f"[联系人] {name}".strip()
     return "[非文本消息]"
 
 
@@ -1093,8 +1205,11 @@ def message_kind(message: dict[str, Any]) -> str:
         "voice",
         "video",
         "audio",
+        "animation",
         "video_note",
         "sticker",
+        "location",
+        "contact",
     ):
         if kind in message:
             return kind
@@ -1152,6 +1267,103 @@ def add_message_log(
         """,
         (chat_id, sender_type, sender_id, text, telegram_message_id),
     )
+
+
+def add_message_link(
+    user_chat_id: int,
+    user_message_id: int,
+    admin_chat_id: int,
+    admin_message_id: int,
+    direction: str,
+    link_kind: str,
+    admin_message_thread_id: int | None = None,
+) -> None:
+    if direction not in {"user_to_admin", "admin_to_user"}:
+        raise ValueError(f"unsupported message link direction: {direction}")
+    if link_kind not in {"notification", "content", "admin_reply"}:
+        raise ValueError(f"unsupported message link kind: {link_kind}")
+
+    values = (
+        user_chat_id,
+        user_message_id,
+        admin_chat_id,
+        admin_message_id,
+        admin_message_thread_id,
+        direction,
+        link_kind,
+    )
+    with db_connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO message_links (
+                user_chat_id, user_message_id,
+                admin_chat_id, admin_message_id,
+                admin_message_thread_id, direction, link_kind
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
+        )
+        if cursor.rowcount == 0:
+            existing = conn.execute(
+                """
+                SELECT user_chat_id, user_message_id,
+                       admin_message_thread_id, direction, link_kind
+                FROM message_links
+                WHERE admin_chat_id = ? AND admin_message_id = ?
+                """,
+                (admin_chat_id, admin_message_id),
+            ).fetchone()
+            expected = (
+                user_chat_id,
+                user_message_id,
+                admin_message_thread_id,
+                direction,
+                link_kind,
+            )
+            actual = tuple(existing) if existing else None
+            if actual != expected:
+                raise RuntimeError(
+                    "refusing to remap an existing administrator message"
+                )
+        conn.commit()
+
+
+def get_message_link(
+    admin_chat_id: int,
+    admin_message_id: int,
+) -> sqlite3.Row | None:
+    return db_fetchone(
+        """
+        SELECT user_chat_id, user_message_id,
+               admin_chat_id, admin_message_id,
+               admin_message_thread_id, direction, link_kind, created_at
+        FROM message_links
+        WHERE admin_chat_id = ? AND admin_message_id = ?
+        """,
+        (admin_chat_id, admin_message_id),
+    )
+
+
+def resolve_admin_message_target(
+    admin_id: int,
+    message: dict[str, Any],
+) -> tuple[int | None, str]:
+    replied_message = message.get("reply_to_message")
+    if isinstance(replied_message, dict):
+        replied_message_id = replied_message.get("message_id")
+        admin_chat_id = message.get("chat", {}).get("id")
+        if (
+            not isinstance(replied_message_id, int)
+            or isinstance(replied_message_id, bool)
+            or not isinstance(admin_chat_id, int)
+            or isinstance(admin_chat_id, bool)
+        ):
+            return None, "unmapped_reply"
+        link = get_message_link(admin_chat_id, replied_message_id)
+        if not link:
+            return None, "unmapped_reply"
+        return int(link["user_chat_id"]), "reply"
+    return get_admin_state(admin_id), "state"
 
 
 def update_user_message_log(chat_id: int, message_id: int, text: str) -> bool:
@@ -1596,9 +1808,45 @@ def get_conversation_owner(chat_id: int) -> int | None:
     return int(row["owner_admin_id"])
 
 
-def claim_conversation(chat_id: int, admin_id: int) -> None:
+@dataclass(frozen=True, slots=True)
+class ConversationClaimResult:
+    status: str
+    owner_admin_id: int | None
+
+    def __bool__(self) -> bool:
+        return self.status == "acquired"
+
+
+def claim_conversation(
+    chat_id: int,
+    admin_id: int,
+    *,
+    force: bool = False,
+    reopen: bool = False,
+    activate_reply: bool = False,
+) -> ConversationClaimResult:
     with db_connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        conversation = conn.execute(
+            """
+            SELECT owner_admin_id, status
+            FROM conversations
+            WHERE chat_id = ?
+            """,
+            (chat_id,),
+        ).fetchone()
+        current_owner = (
+            int(conversation["owner_admin_id"])
+            if conversation and conversation["owner_admin_id"] is not None
+            else None
+        )
+        if conversation and conversation["status"] == "closed" and not reopen:
+            conn.commit()
+            return ConversationClaimResult("closed", current_owner)
+        if current_owner not in {None, admin_id} and not force:
+            conn.commit()
+            return ConversationClaimResult("conflict", current_owner)
+
         conn.execute(
             "DELETE FROM admin_states WHERE target_chat_id = ? AND admin_id != ?",
             (chat_id, admin_id),
@@ -1615,7 +1863,19 @@ def claim_conversation(chat_id: int, admin_id: int) -> None:
             """,
             (chat_id, admin_id),
         )
+        if activate_reply:
+            conn.execute(
+                """
+                INSERT INTO admin_states (admin_id, target_chat_id, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(admin_id) DO UPDATE SET
+                    target_chat_id = excluded.target_chat_id,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (admin_id, chat_id),
+            )
         conn.commit()
+        return ConversationClaimResult("acquired", admin_id)
 
 
 def close_conversation(chat_id: int) -> None:
@@ -1905,10 +2165,22 @@ def format_user_detail(chat_id: int) -> str:
         if conversation
         else "-"
     )
+    username = (
+        f"@{escape_html_limited(str(user['username']), 80)}"
+        if user["username"]
+        else "-"
+    )
+    name = " ".join(
+        str(value)
+        for value in (user["first_name"], user["last_name"])
+        if value
+    ).strip()
     return (
         "<b>用户详情</b>\n\n"
         f"<b>{escape_html_limited(row_user_label(user), 100)}</b>\n"
         f"ID：<code>{chat_id}</code>\n"
+        f"Username：{username}\n"
+        f"Name：{escape_html_limited(name, 100) if name else '-'}\n"
         f"状态：{state}\n"
         f"接管：{owner}\n"
         f"最后留言：{last_user_message_at}\n"
@@ -2598,6 +2870,11 @@ async def notify_admins(
     exclude_message_id: int | None = None,
 ) -> None:
     chat_id = int(user["id"])
+    source_message_id = (
+        int(source_message["message_id"])
+        if source_message and isinstance(source_message.get("message_id"), int)
+        else None
+    )
     history = format_history(
         chat_id,
         limit=6,
@@ -2615,8 +2892,8 @@ async def notify_admins(
     msg = (
         f"<b>{html.escape(title)}</b>\n"
         f"{unread_count} 条待处理 · {owner_state}\n\n"
-        f"<b>{escape_html_limited(user_label(user), 100)}</b>\n"
-        f"ID：<code>{chat_id}</code>\n\n"
+        "<b>用户</b>\n"
+        f"{user_identity_html(user)}\n\n"
         "<b>本条内容</b>\n"
         f"{escape_html_limited(text, 1200)}\n\n"
         "<b>最近记录</b>\n"
@@ -2624,18 +2901,48 @@ async def notify_admins(
     )
 
     for admin_id in ADMIN_IDS:
-        notification_sent = await send_message(
+        notification_result = await send_message(
             admin_id,
             msg,
             reply_markup=admin_user_keyboard(chat_id, viewer_admin_id=admin_id),
         )
-        if notification_sent and source_message and can_copy_message(source_message):
+        if (
+            notification_result
+            and source_message_id is not None
+            and isinstance(notification_result, TelegramSendResult)
+            and notification_result.message_id is not None
+        ):
+            add_message_link(
+                chat_id,
+                source_message_id,
+                admin_id,
+                notification_result.message_id,
+                "user_to_admin",
+                "notification",
+                notification_result.message_thread_id,
+            )
+        if notification_result and source_message and can_copy_message(source_message):
             if source_message.get("text") is None:
-                await copy_message(
+                copied_result = await copy_message(
                     admin_id,
                     int(source_message["chat"]["id"]),
                     int(source_message["message_id"]),
                 )
+                if (
+                    copied_result
+                    and source_message_id is not None
+                    and isinstance(copied_result, TelegramSendResult)
+                    and copied_result.message_id is not None
+                ):
+                    add_message_link(
+                        chat_id,
+                        source_message_id,
+                        admin_id,
+                        copied_result.message_id,
+                        "user_to_admin",
+                        "content",
+                        copied_result.message_thread_id,
+                    )
 
 
 async def send_welcome(chat_id: int) -> None:
@@ -2835,17 +3142,25 @@ async def handle_admin_command(admin_id: int, text: str) -> bool:
         if is_blacklisted(target_chat_id):
             await send_message(admin_id, "这个用户在黑名单中，请先解除黑名单。")
             return True
-        owner_admin_id = get_conversation_owner(target_chat_id)
-        if owner_admin_id and owner_admin_id != admin_id:
+        claim_result = claim_conversation(
+            target_chat_id,
+            admin_id,
+            reopen=parts[0] == "/send",
+        )
+        if claim_result.status == "conflict":
             await send_message(
                 admin_id,
-                f"这个会话当前由 <code>{owner_admin_id}</code> 接管。请先接管后再发送。",
+                f"这个会话当前由 <code>{claim_result.owner_admin_id}</code> 接管。"
+                "请先接管后再发送。",
                 reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
             )
             return True
-        claim_conversation(target_chat_id, admin_id)
-        if not await send_message(target_chat_id, content, parse_mode=None):
-            await send_message(admin_id, "发送失败：用户可能已屏蔽 Bot 或 Telegram API 暂时不可用。")
+        if claim_result.status == "closed":
+            await send_message(admin_id, "这个会话已经关闭，请先重新打开。")
+            return True
+        delivery_result = await send_message(target_chat_id, content, parse_mode=None)
+        if not delivery_result:
+            await send_message(admin_id, delivery_failure_message(delivery_result))
             return True
         add_message_log(target_chat_id, "admin", admin_id, content)
         mark_conversation_replied(target_chat_id)
@@ -3002,8 +3317,16 @@ async def handle_admin_command(admin_id: int, text: str) -> bool:
             await send_message(admin_id, "格式：/takeover 用户ID")
             return True
         target_chat_id = int(parts[1])
-        claim_conversation(target_chat_id, admin_id)
-        set_admin_state(admin_id, target_chat_id)
+        if is_blacklisted(target_chat_id):
+            await send_message(admin_id, "这个用户在黑名单中，请先解除黑名单。")
+            return True
+        claim_conversation(
+            target_chat_id,
+            admin_id,
+            force=True,
+            reopen=True,
+            activate_reply=True,
+        )
         add_admin_audit(admin_id, "conversation_takeover", target_chat_id)
         await send_message(
             admin_id,
@@ -3118,7 +3441,16 @@ async def handle_admin_message(message: dict[str, Any]) -> None:
         )
         return
 
-    target_chat_id = get_admin_state(admin_id)
+    target_chat_id, target_source = resolve_admin_message_target(admin_id, message)
+    if target_source == "unmapped_reply":
+        await send_message(
+            admin_id,
+            "<b>无法识别回复对象</b>\n\n"
+            "这条被回复的消息没有用户映射。为防止发错人，本次消息没有发送。\n"
+            "请点击用户通知下方的“回复”后重试。",
+            reply_markup=admin_dashboard_keyboard(),
+        )
+        return
     if not target_chat_id:
         await send_message(
             admin_id,
@@ -3136,41 +3468,61 @@ async def handle_admin_message(message: dict[str, Any]) -> None:
         )
         return
 
-    conversation = get_conversation(target_chat_id)
-    if conversation and conversation["status"] == "closed":
+    claim_result = claim_conversation(
+        target_chat_id,
+        admin_id,
+        activate_reply=target_source == "reply",
+    )
+    if claim_result.status == "closed":
         await send_message(
             admin_id,
-            "这个会话已经关闭。如需继续，请先接管会话。",
+            "这个会话已经关闭。如需继续，请先重新打开。",
+            reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
+        )
+        return
+    if claim_result.status == "conflict":
+        await send_message(
+            admin_id,
+            f"这个会话当前由 <code>{claim_result.owner_admin_id}</code> 接管。"
+            "点击接管后再回复。",
             reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
         )
         return
 
-    owner_admin_id = get_conversation_owner(target_chat_id)
-    if owner_admin_id and owner_admin_id != admin_id:
-        await send_message(
-            admin_id,
-            f"这个会话当前由 <code>{owner_admin_id}</code> 接管。点击接管后再回复。",
-            reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
-        )
-        return
-
-    if not owner_admin_id:
-        claim_conversation(target_chat_id, admin_id)
-
-    if not await copy_message(
+    delivery_result = await copy_message(
         target_chat_id,
         int(message["chat"]["id"]),
         int(message["message_id"]),
-    ):
-        await send_message(admin_id, "发送失败：用户可能已屏蔽 Bot 或 Telegram API 暂时不可用。")
+    )
+    if not delivery_result:
+        await send_message(admin_id, delivery_failure_message(delivery_result))
         return
-    add_message_log(target_chat_id, "admin", admin_id, content)
+    if (
+        isinstance(delivery_result, TelegramSendResult)
+        and delivery_result.message_id is not None
+    ):
+        add_message_link(
+            target_chat_id,
+            delivery_result.message_id,
+            int(message["chat"]["id"]),
+            int(message["message_id"]),
+            "admin_to_user",
+            "admin_reply",
+            message.get("message_thread_id"),
+        )
+    add_message_log(
+        target_chat_id,
+        "admin",
+        admin_id,
+        content,
+        telegram_message_id=int(message["message_id"]),
+    )
     mark_conversation_replied(target_chat_id)
     add_admin_audit(
         admin_id,
         "message_sent",
         target_chat_id,
-        f"type={message_kind(message)}",
+        f"type={message_kind(message)} route={target_source}",
     )
     await send_message(
         admin_id,
@@ -3321,18 +3673,46 @@ async def handle_callback(callback: dict[str, Any]) -> None:
 
     target_chat_id = int(raw_chat_id)
 
+    if action in {"reply", "takeover", "reopen"} and is_blacklisted(
+        target_chat_id
+    ):
+        await answer_callback_query(callback_id, "用户在黑名单中")
+        await send_message(
+            admin_id,
+            "这个用户在黑名单中，请先解除黑名单。",
+            reply_markup=admin_user_keyboard(
+                target_chat_id,
+                viewer_admin_id=admin_id,
+            ),
+        )
+        return
+
     if action == "reply":
-        owner_admin_id = get_conversation_owner(target_chat_id)
-        if owner_admin_id and owner_admin_id != admin_id:
+        claim_result = claim_conversation(
+            target_chat_id,
+            admin_id,
+            activate_reply=True,
+        )
+        if claim_result.status == "conflict":
             await answer_callback_query(callback_id, "会话已被其他管理员接管")
             await send_message(
                 admin_id,
-                f"这个会话当前由 <code>{owner_admin_id}</code> 接管。需要回复的话请先接管。",
+                f"这个会话当前由 <code>{claim_result.owner_admin_id}</code> 接管。"
+                "需要回复的话请先接管。",
                 reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
             )
             return
-        claim_conversation(target_chat_id, admin_id)
-        set_admin_state(admin_id, target_chat_id)
+        if claim_result.status == "closed":
+            await answer_callback_query(callback_id, "会话已关闭")
+            await send_message(
+                admin_id,
+                "这个会话已经关闭，请先重新打开。",
+                reply_markup=admin_user_keyboard(
+                    target_chat_id,
+                    viewer_admin_id=admin_id,
+                ),
+            )
+            return
         add_admin_audit(admin_id, "reply_mode_enter", target_chat_id)
         await answer_callback_query(callback_id, "已进入回复模式")
         await send_message(
@@ -3361,8 +3741,13 @@ async def handle_callback(callback: dict[str, Any]) -> None:
         return
 
     if action == "takeover":
-        claim_conversation(target_chat_id, admin_id)
-        set_admin_state(admin_id, target_chat_id)
+        claim_conversation(
+            target_chat_id,
+            admin_id,
+            force=True,
+            reopen=True,
+            activate_reply=True,
+        )
         add_admin_audit(admin_id, "conversation_takeover", target_chat_id)
         await answer_callback_query(callback_id, "已接管")
         await send_message(
