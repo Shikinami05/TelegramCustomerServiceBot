@@ -156,6 +156,7 @@ if [[ ! -f "$PROJECT_DIR/.env" ]]; then
         printf 'BROADCAST_RATE_LIMIT_RETRIES=3\n'
         printf 'UPDATE_PROCESSING_TIMEOUT_SECONDS=300\n'
         printf 'PENDING_REMINDER_MINUTES=30\n'
+        printf 'ADMIN_REPLY_STATE_TTL_SECONDS=1800\n'
         printf 'TELEGRAM_INLINE_RETRY_MAX_SECONDS=5\n'
         printf 'DISPLAY_TIMEZONE=Asia/Hong_Kong\n'
         printf 'LOG_LEVEL=INFO\n'
@@ -174,8 +175,9 @@ sed \
 chmod 644 "$SERVICE_FILE"
 
 cd "$PROJECT_DIR"
+runuser -u "$APP_USER" -- "$PROJECT_DIR/venv/bin/python" -m compileall -q tg_bot
 runuser -u "$APP_USER" -- "$PROJECT_DIR/venv/bin/python" -m py_compile \
-    app.py tg_bot/*.py scripts/manage_webhook.py scripts/manage_backup.py \
+    app.py scripts/manage_webhook.py scripts/manage_backup.py \
     scripts/manage_turnstile.py
 runuser -u "$APP_USER" -- "$PROJECT_DIR/venv/bin/python" -m unittest discover -s tests -v
 

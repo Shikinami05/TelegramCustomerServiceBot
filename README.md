@@ -25,9 +25,9 @@
 - 时间按 `DISPLAY_TIMEZONE` 转换后展示，数据库仍保存 UTC 时间
 - 按钮颜色按用途区分：蓝色为主要操作、绿色为完成或恢复、红色为退出、取消或风险确认
 - `/closed` 显示最近已处理会话，可通过按钮重新打开
-- 可直接使用 Telegram 原生 Reply 回复用户通知或对应媒体
+- 可直接使用 Telegram 原生 Reply 一次性回复用户通知或对应媒体
 - 管理端消息 ID 与用户消息 ID 持久化关联，服务重启后仍可准确回复
-- 持续回复模式，支持文字和媒体
+- 点击“持续回复”后进入有时限的持续回复模式，支持文字和媒体
 - 多管理员接管与标记已处理
 - 手动加入或解除黑名单，按钮操作需要二次确认
 - `OWNER_IDS` 负责人专用群发与管理员审计权限
@@ -43,8 +43,11 @@
 - Webhook 只接受 JSON，应用层限制为 1 MiB，Nginx 部署模板同步限制请求大小
 - Turnstile Token 与 Telegram Mini App 身份均在服务端验证
 - 所有管理命令和管理按钮均校验 `ADMIN_IDS`
-- Webhook 更新使用 `processing/done/failed` 状态，失败后允许 Telegram 重试
+- Webhook 更新使用 `processing/done/failed` 状态；并发处理中返回 503，异常或重启中断后允许 Telegram 重试
 - 原生 Reply 优先按持久化消息映射查找用户，无法识别时拒绝发送，不会回退到旧回复状态
+- 用户入站事件、管理员通知和媒体投递使用 SQLite 持久化队列；通知完成前不会丢失任务
+- Telegram 投递结果不确定时不会自动盲目重放，负责人确认后可通过告警按钮人工重试
+- 管理员回复使用投递台账去重；服务在 Telegram 调用后中断时记录为 `unknown`，避免恢复后重复发给用户
 - Telegram 触发 flood control 时按 `retry_after` 等待；群发失败用户可单独重试
 - Telegram HTTP 连接复用
 - 管理员通知自动控制在 Telegram 消息长度限制内
@@ -52,7 +55,7 @@
 - 支持按 GitHub Release 版本安装、更新和查看当前部署版本
 - 更新失败时自动恢复代码、依赖、systemd 配置和 SQLite 数据库
 - 数据库与备份目录在 Linux 上强制使用私有权限（文件 `600`、目录 `700`）
-- `/healthz` 同时检查数据库和群发后台任务
+- `/healthz` 同时检查数据库、群发后台任务和管理员通知投递任务
 - systemd 示例只监听 `127.0.0.1:9000`
 
 ## 技术要求
@@ -75,12 +78,14 @@ tg_bot/telegram.py     Telegram Bot API HTTP 传输和错误模型
 tg_bot/keyboards.py    Inline Keyboard、分页、按钮颜色和回调数据
 tg_bot/models.py       共享结果类型
 tg_bot/text.py         HTML 与 Telegram 文本长度处理
+tg_bot/repositories/   Update、会话、映射、投递和群发的 SQLite 事务
+tg_bot/services/       管理员通知与群发后台任务编排
 templates/             Turnstile 验证页面
 scripts/               安装、更新、备份、Webhook 和运维命令
 tests/                 业务、模块、安全边界和部署脚本回归测试
 ```
 
-当前仍使用 FastAPI、HTTPX 和 SQLite，不依赖 Aiogram、Redis、PostgreSQL 或 ORM。这个拆分只减少 `app.py` 的基础设施职责，不改变现有命令、按钮回调、数据库表或部署入口。
+当前仍使用 FastAPI、HTTPX 和 SQLite，不依赖 Aiogram、Redis、PostgreSQL 或 ORM。项目继续保留原有部署入口，并通过启动迁移兼容旧数据库。
 
 部署脚本不假设 VPS 用户名。它按以下顺序确定运行 Bot 的非 root 用户：
 
@@ -180,6 +185,7 @@ BROADCAST_RATE_LIMIT_RETRIES=3
 UPDATE_PROCESSING_TIMEOUT_SECONDS=300
 PENDING_REMINDER_MINUTES=30
 TELEGRAM_INLINE_RETRY_MAX_SECONDS=5
+ADMIN_REPLY_STATE_TTL_SECONDS=1800
 
 TURNSTILE_ENABLED=false
 TURNSTILE_SITE_KEY=
@@ -270,22 +276,26 @@ sudo tg-bot turnstile disable
 
 1. 用户发送新消息后，会话进入 `/inbox` 并累加待处理数
 2. Bot 为通知卡片和对应媒体分别保存管理端消息 ID 映射
-3. 管理员可以直接 Reply 通知、Reply 媒体，或点击“回复”进入持续回复模式
-4. 超过 `PENDING_REMINDER_MINUTES` 仍未处理时会出现在 `/pending`
-5. 管理员成功回复后待处理数清零
-6. 点击“标记已处理”或使用 `/close 用户ID` 后进入 `/closed`
-7. 用户再次留言会自动重新打开，也可以由管理员手动重新打开
+3. 管理员可以直接 Reply 通知或媒体做一次性回复；如需连续发送多条，明确点击“持续回复”
+4. 持续回复模式在每次成功发送后刷新有效期，闲置超过 `ADMIN_REPLY_STATE_TTL_SECONDS` 后自动退出
+5. 超过 `PENDING_REMINDER_MINUTES` 仍未处理时会出现在 `/pending`
+6. 管理员成功回复后待处理数清零
+7. 点击“标记已处理”或使用 `/close 用户ID` 后进入 `/closed`
+8. 用户再次留言会自动重新打开，也可以由管理员手动重新打开
+
+管理员通知在数据库队列中逐条投递。明确失败或结果不确定时，负责人会收到带“重试投递”按钮的告警；其中“不确定”表示 Telegram 可能已经收到了消息，点击前应先检查管理员聊天，避免产生重复通知。
 
 群发流程：
 
 1. 管理员发送 `/broadcast 内容`
 2. Bot 显示预计人数和确认按钮
 3. 管理员确认后任务进入后台队列
-4. Bot 完成后发送成功和失败数量
+4. Bot 完成后发送成功、失败和结果不确定数量
 5. `/broadcast_status` 可查看最近进度
-6. 失败用户可点击“重试失败用户”或使用 `/broadcast_retry 任务ID`
+6. 明确失败的用户可点击“重试失败用户”或使用 `/broadcast_retry 任务ID`
 
 群发接收人会在确认时生成快照。黑名单用户不会进入快照；发送期间新加入黑名单的用户也不会收到群发。
+网络中断或服务在发送中重启时，该收件人会标记为“结果不确定”且不会自动重放，以避免重复群发；管理员应先核对实际送达情况。
 
 ## 数据库
 
@@ -301,6 +311,9 @@ bot.db
 - `admin_states`：管理员当前回复目标
 - `message_logs`：用户和管理员回复历史
 - `message_links`：用户消息与每个管理员聊天中的通知、媒体和回复消息映射
+- `inbound_events`：用户入站 Update 的幂等事件记录
+- `admin_deliveries`：发往管理员的通知和媒体持久化投递队列
+- `admin_reply_deliveries`：管理员发往用户的回复投递台账和未知状态
 - `blacklists`：手动黑名单
 - `conversations`：会话接管、待处理数和最后回复时间
 - `admin_audit_logs`：管理员操作审计记录
@@ -311,6 +324,7 @@ bot.db
 - `user_verifications`：Turnstile 验证状态和有效期
 
 旧数据库会在启动时自动增加新字段，不需要删除 `bot.db`。
+超过 `MESSAGE_RETENTION_DAYS` 的消息历史、消息映射和已结束投递台账会在维护任务中清理；待发送、发送中及仍有关联的入站事件不会被删除。
 
 ## 备份
 
@@ -432,7 +446,8 @@ Telegram API 错误日志只记录方法、HTTP 状态和错误描述，不记�
 ```bash
 PROJECT_DIR="$(sudo systemctl show tg-bot -p WorkingDirectory --value)"
 cd "$PROJECT_DIR"
-./venv/bin/python -m py_compile app.py tg_bot/*.py scripts/manage_webhook.py scripts/manage_backup.py scripts/manage_turnstile.py
+./venv/bin/python -m compileall -q tg_bot
+./venv/bin/python -m py_compile app.py scripts/manage_webhook.py scripts/manage_backup.py scripts/manage_turnstile.py
 ./venv/bin/python -m unittest discover -s tests -v
 ```
 

@@ -60,7 +60,7 @@ def admin_user_keyboard(
     if owner_admin_id and viewer_admin_id and owner_admin_id != viewer_admin_id:
         reply_button: ButtonSpec = ("接管", f"takeover:{chat_id}", "primary")
     else:
-        reply_button = ("回复", f"reply:{chat_id}", "primary")
+        reply_button = ("持续回复", f"reply:{chat_id}", "primary")
     return inline_keyboard(
         [
             [
@@ -188,7 +188,7 @@ def conversation_queue_keyboard(
             )
         else:
             primary_button = (
-                f"{index} 回复",
+                f"{index} 持续回复",
                 f"reply:{chat_id}",
                 "primary",
             )

@@ -3,12 +3,24 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
 from tg_bot import database, keyboards
 from tg_bot.config import load_settings
+from tg_bot.models import TelegramSendResult
+from tg_bot.repositories import (
+    access,
+    broadcasts,
+    conversations,
+    deliveries,
+    inbound,
+    messages,
+    users,
+)
+from tg_bot.repositories import updates
+from tg_bot.services import broadcast as broadcast_service
 from tg_bot.telegram import TelegramAPIError, request
 from tg_bot.text import escape_html_limited, html_to_plain_text, truncate_text
 
@@ -32,6 +44,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.display_timezone.key, "UTC")
         self.assertEqual(settings.app_version, "1.4.0")
         self.assertEqual(settings.db_path, base_dir / "bot.db")
+        self.assertEqual(settings.admin_reply_state_ttl_seconds, 1800)
 
     def test_missing_security_settings_fail_startup(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -126,7 +139,230 @@ class DatabaseModuleTests(unittest.TestCase):
         self.assertIn(("table", "message_links"), objects)
         self.assertIn(("table", "processed_updates"), objects)
         self.assertIn(("table", "pending_broadcasts"), objects)
+        self.assertIn(("table", "inbound_events"), objects)
+        self.assertIn(("table", "admin_deliveries"), objects)
+        self.assertIn(("table", "admin_reply_deliveries"), objects)
         self.assertIn(("index", "idx_message_links_user_message"), objects)
+        self.assertIn(("index", "idx_admin_deliveries_pending"), objects)
+        self.assertIn(("index", "idx_admin_deliveries_alerts"), objects)
+        self.assertIn(("index", "idx_admin_reply_deliveries_status"), objects)
+
+
+class RepositoryModuleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "bot.db"
+        database.initialize(self.db_path)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_update_claim_is_persistent_and_idempotent(self) -> None:
+        self.assertEqual(updates.claim(self.db_path, 100, 30), "claimed")
+        self.assertEqual(updates.claim(self.db_path, 100, 30), "processing")
+        updates.finish(self.db_path, 100)
+        self.assertEqual(updates.claim(self.db_path, 100, 30), "done")
+
+    def test_inbound_delivery_records_message_links_in_order(self) -> None:
+        persisted = inbound.persist_event(
+            self.db_path,
+            101,
+            {"id": 10, "username": "user"},
+            "photo caption",
+            10,
+            20,
+            event_type="message",
+            title="收到用户消息",
+            edited=False,
+            admin_ids={200},
+            include_content_delivery=True,
+        )
+        self.assertTrue(persisted)
+        self.assertFalse(
+            inbound.persist_event(
+                self.db_path,
+                101,
+                {"id": 10},
+                "duplicate",
+                10,
+                20,
+                event_type="message",
+                title="收到用户消息",
+                edited=False,
+                admin_ids={200},
+                include_content_delivery=True,
+            )
+        )
+
+        notification = deliveries.claim_next_admin(self.db_path, now=100)
+        self.assertEqual(notification["delivery_kind"], "notification")
+        deliveries.complete_admin(
+            self.db_path,
+            notification,
+            TelegramSendResult(True, message_id=301),
+        )
+        content = deliveries.claim_next_admin(self.db_path, now=100)
+        self.assertEqual(content["delivery_kind"], "content")
+        deliveries.complete_admin(
+            self.db_path,
+            content,
+            TelegramSendResult(True, message_id=302),
+        )
+
+        self.assertEqual(
+            int(messages.find_link(self.db_path, 200, 301)["user_chat_id"]),
+            10,
+        )
+        self.assertEqual(
+            int(messages.find_link(self.db_path, 200, 302)["user_message_id"]),
+            20,
+        )
+        self.assertIsNone(deliveries.claim_next_admin(self.db_path, now=100))
+
+    def test_conversation_claim_and_clear_are_consistent(self) -> None:
+        conversations.record_user_activity(self.db_path, 10)
+        acquired = conversations.claim(
+            self.db_path,
+            10,
+            200,
+            activate_reply=True,
+        )
+        self.assertEqual(acquired.status, "acquired")
+        conflict = conversations.claim(self.db_path, 10, 201)
+        self.assertEqual((conflict.status, conflict.owner_admin_id), ("conflict", 200))
+        self.assertIsNone(
+            conversations.clear_admin_state(
+                self.db_path,
+                200,
+                1800,
+                expected_target_chat_id=11,
+            )
+        )
+        self.assertEqual(conversations.get_admin_state(self.db_path, 200, 1800), 10)
+        self.assertEqual(
+            conversations.clear_admin_state(self.db_path, 200, 1800, 10),
+            10,
+        )
+
+    def test_broadcast_recipient_can_only_finish_once(self) -> None:
+        database.execute(
+            self.db_path,
+            "INSERT INTO users (chat_id, first_name) VALUES (?, ?)",
+            (10, "User"),
+        )
+        broadcast_id = broadcasts.create(self.db_path, 200, "hello")
+        self.assertEqual(
+            broadcasts.queue(self.db_path, broadcast_id, 200),
+            ("queued", 1),
+        )
+        self.assertIsNotNone(broadcasts.claim_next_job(self.db_path))
+        self.assertEqual(broadcasts.claim_next_recipient(self.db_path, broadcast_id), 10)
+        broadcasts.finish_recipient(self.db_path, broadcast_id, 10, True)
+        with self.assertRaisesRegex(RuntimeError, "no longer claimed"):
+            broadcasts.finish_recipient(self.db_path, broadcast_id, 10, True)
+        result = broadcasts.complete(self.db_path, broadcast_id)
+        self.assertEqual(int(result["sent_count"]), 1)
+
+    def test_interrupted_broadcast_recipient_is_not_replayed(self) -> None:
+        database.execute(
+            self.db_path,
+            "INSERT INTO users (chat_id, first_name) VALUES (?, ?)",
+            (10, "User"),
+        )
+        broadcast_id = broadcasts.create(self.db_path, 200, "hello")
+        broadcasts.queue(self.db_path, broadcast_id, 200)
+        broadcasts.claim_next_job(self.db_path)
+        self.assertEqual(broadcasts.claim_next_recipient(self.db_path, broadcast_id), 10)
+
+        database.initialize(self.db_path)
+
+        self.assertIsNotNone(broadcasts.claim_next_job(self.db_path))
+        self.assertIsNone(broadcasts.claim_next_recipient(self.db_path, broadcast_id))
+        result = broadcasts.complete(self.db_path, broadcast_id)
+        self.assertEqual(int(result["sent_count"]), 0)
+        self.assertEqual(int(result["failed_count"]), 0)
+        self.assertEqual(int(result["unknown_count"]), 1)
+
+    def test_user_history_and_access_state_are_persistent(self) -> None:
+        users.upsert(
+            self.db_path,
+            {"id": 10, "username": "before", "first_name": "User"},
+            "first",
+        )
+        users.upsert(
+            self.db_path,
+            {"id": 10, "username": "after", "first_name": "User"},
+            "second",
+        )
+        users.add_message_log(self.db_path, 10, "user", 10, "hello", 20)
+        self.assertEqual(users.get(self.db_path, 10)["username"], "after")
+        self.assertEqual(users.get_history(self.db_path, 10, 5)[0]["text"], "hello")
+
+        self.assertEqual(
+            access.check_rate_limit(self.db_path, 10, 1, 60, 30, now=100),
+            (True, False, 0),
+        )
+        self.assertEqual(
+            access.check_rate_limit(self.db_path, 10, 1, 60, 30, now=101),
+            (False, True, 30),
+        )
+        access.blacklist(self.db_path, 10, 200, "spam")
+        self.assertTrue(access.is_blacklisted(self.db_path, 10))
+        self.assertEqual(access.list_blacklist(self.db_path)[0]["reason"], "spam")
+        access.unblacklist(self.db_path, 10)
+        self.assertFalse(access.is_blacklisted(self.db_path, 10))
+
+
+class BroadcastServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unknown_network_result_is_not_retried(self) -> None:
+        recipients = iter((10, None))
+        finished: list[tuple[str, int, bool, str, bool]] = []
+        send = AsyncMock(
+            return_value=TelegramSendResult(
+                False,
+                description="connection closed before response",
+            )
+        )
+
+        await broadcast_service.process_job(
+            {"id": "job-1", "content": "hello"},
+            lambda _: next(recipients),
+            lambda _: None,
+            lambda _: False,
+            lambda *args: finished.append(args),
+            send,
+            rate_limit_retries=3,
+            send_delay_seconds=0,
+        )
+
+        send.assert_awaited_once()
+        self.assertEqual(finished[0][:3], ("job-1", 10, False))
+        self.assertTrue(finished[0][4])
+
+    async def test_server_error_is_treated_as_uncertain(self) -> None:
+        recipients = iter((10, None))
+        finished: list[tuple[str, int, bool, str, bool]] = []
+        send = AsyncMock(
+            return_value=TelegramSendResult(
+                False,
+                status_code=502,
+                description="bad gateway",
+            )
+        )
+
+        await broadcast_service.process_job(
+            {"id": "job-2", "content": "hello"},
+            lambda _: next(recipients),
+            lambda _: None,
+            lambda _: False,
+            lambda *args: finished.append(args),
+            send,
+            rate_limit_retries=3,
+            send_delay_seconds=0,
+        )
+
+        send.assert_awaited_once()
+        self.assertTrue(finished[0][4])
 
 
 class KeyboardModuleTests(unittest.TestCase):
@@ -143,6 +379,17 @@ class KeyboardModuleTests(unittest.TestCase):
         self.assertEqual(first_row[0]["callback_data"], "takeover:123")
         self.assertEqual(first_row[0]["style"], "primary")
         self.assertEqual(first_row[1]["style"], "success")
+
+        owned_markup = keyboards.admin_user_keyboard(
+            123,
+            blacklisted=False,
+            closed=False,
+            owner_admin_id=8,
+            viewer_admin_id=8,
+        )
+        self.assertEqual(
+            owned_markup["inline_keyboard"][0][0]["text"], "持续回复"
+        )
 
         exit_button = keyboards.exit_reply_keyboard(123)["inline_keyboard"][0][0]
         self.assertEqual(exit_button["callback_data"], "cancel:123")
