@@ -113,6 +113,7 @@ class Settings:
     broadcast_send_delay_seconds: float
     update_processing_timeout_seconds: int
     pending_reminder_minutes: int
+    admin_reply_state_ttl_seconds: int
     telegram_inline_retry_max_seconds: int
     broadcast_rate_limit_retries: int
     turnstile_enabled: bool
@@ -194,6 +195,9 @@ def load_settings(base_dir: Path) -> Settings:
             "UPDATE_PROCESSING_TIMEOUT_SECONDS", 300, 30
         ),
         pending_reminder_minutes=env_int("PENDING_REMINDER_MINUTES", 30, 1),
+        admin_reply_state_ttl_seconds=env_int(
+            "ADMIN_REPLY_STATE_TTL_SECONDS", 1800, 60
+        ),
         telegram_inline_retry_max_seconds=env_int(
             "TELEGRAM_INLINE_RETRY_MAX_SECONDS", 5, 0
         ),

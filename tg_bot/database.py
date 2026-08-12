@@ -145,6 +145,7 @@ def initialize(db_path: Path) -> None:
                 total_count INTEGER NOT NULL DEFAULT 0,
                 sent_count INTEGER NOT NULL DEFAULT 0,
                 failed_count INTEGER NOT NULL DEFAULT 0,
+                unknown_count INTEGER NOT NULL DEFAULT 0,
                 confirmed_at DATETIME,
                 started_at DATETIME,
                 completed_at DATETIME,
@@ -176,6 +177,64 @@ def initialize(db_path: Path) -> None:
                 last_error TEXT NOT NULL DEFAULT '',
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inbound_events (
+                update_id INTEGER PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admin_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                update_id INTEGER NOT NULL,
+                user_chat_id INTEGER NOT NULL,
+                source_message_id INTEGER NOT NULL,
+                admin_chat_id INTEGER NOT NULL,
+                delivery_kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                content_summary TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at INTEGER NOT NULL DEFAULT 0,
+                admin_message_id INTEGER,
+                admin_message_thread_id INTEGER,
+                last_error TEXT NOT NULL DEFAULT '',
+                alerted_at DATETIME,
+                alert_attempts INTEGER NOT NULL DEFAULT 0,
+                alert_next_attempt_at INTEGER NOT NULL DEFAULT 0,
+                sent_at DATETIME,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(update_id, admin_chat_id, delivery_kind),
+                FOREIGN KEY (update_id) REFERENCES inbound_events(update_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admin_reply_deliveries (
+                admin_chat_id INTEGER NOT NULL,
+                admin_message_id INTEGER NOT NULL,
+                update_id INTEGER,
+                admin_id INTEGER NOT NULL,
+                user_chat_id INTEGER NOT NULL,
+                route TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                user_message_id INTEGER,
+                last_error TEXT NOT NULL DEFAULT '',
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                completed_at DATETIME,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (admin_chat_id, admin_message_id)
             )
             """
         )
@@ -235,6 +294,12 @@ def initialize(db_path: Path) -> None:
             "failed_count",
             "INTEGER NOT NULL DEFAULT 0",
         )
+        ensure_column(
+            conn,
+            "pending_broadcasts",
+            "unknown_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
         ensure_column(conn, "pending_broadcasts", "confirmed_at", "DATETIME")
         ensure_column(conn, "pending_broadcasts", "started_at", "DATETIME")
         ensure_column(conn, "pending_broadcasts", "completed_at", "DATETIME")
@@ -263,13 +328,30 @@ def initialize(db_path: Path) -> None:
             "TEXT NOT NULL DEFAULT ''",
         )
         ensure_column(conn, "processed_updates", "updated_at", "DATETIME")
+        ensure_column(
+            conn,
+            "admin_deliveries",
+            "alert_attempts",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        ensure_column(
+            conn,
+            "admin_deliveries",
+            "alert_next_attempt_at",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
         conn.execute(
             "UPDATE processed_updates SET updated_at = processed_at "
             "WHERE updated_at IS NULL"
         )
         conn.execute(
-            "UPDATE broadcast_recipients SET status = 'pending' "
-            "WHERE status = 'sending'"
+            """
+            UPDATE broadcast_recipients
+            SET status = 'unknown',
+                last_error = 'service restarted during Telegram delivery',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE status = 'sending'
+            """
         )
         conn.execute(
             "UPDATE pending_broadcasts SET status = 'queued' "
@@ -303,6 +385,22 @@ def initialize(db_path: Path) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_user_verifications_expires "
             "ON user_verifications(expires_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_admin_deliveries_pending "
+            "ON admin_deliveries(status, next_attempt_at, id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_admin_deliveries_source "
+            "ON admin_deliveries(user_chat_id, source_message_id, admin_chat_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_admin_deliveries_alerts "
+            "ON admin_deliveries(status, alert_next_attempt_at, id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_admin_reply_deliveries_status "
+            "ON admin_reply_deliveries(status, updated_at)"
         )
         conn.commit()
     secure_database_files(db_path)

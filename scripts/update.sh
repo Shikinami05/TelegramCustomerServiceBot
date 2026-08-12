@@ -220,8 +220,9 @@ fi
 cd "$PROJECT_DIR"
 runuser -u "$APP_USER" -- \
     "$PROJECT_DIR/venv/bin/pip" install -r requirements.txt
+runuser -u "$APP_USER" -- "$PYTHON_BIN" -m compileall -q tg_bot
 runuser -u "$APP_USER" -- "$PYTHON_BIN" -m py_compile \
-    app.py tg_bot/*.py scripts/manage_webhook.py scripts/manage_backup.py \
+    app.py scripts/manage_webhook.py scripts/manage_backup.py \
     scripts/manage_turnstile.py
 runuser -u "$APP_USER" -- "$PYTHON_BIN" -m unittest discover -s tests -v
 runuser -u "$APP_USER" -- bash scripts/version.sh --short

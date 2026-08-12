@@ -28,6 +28,16 @@ from tg_bot.config import (
 from tg_bot import database, keyboards
 from tg_bot.keyboards import ButtonSpec
 from tg_bot.models import ConversationClaimResult, TelegramSendResult
+from tg_bot.repositories import access as access_repository
+from tg_bot.repositories import broadcasts as broadcast_repository
+from tg_bot.repositories import conversations as conversation_repository
+from tg_bot.repositories import deliveries as delivery_repository
+from tg_bot.repositories import inbound as inbound_repository
+from tg_bot.repositories import messages as message_repository
+from tg_bot.repositories import updates as update_repository
+from tg_bot.repositories import users as user_repository
+from tg_bot.services import admin_delivery as admin_delivery_service
+from tg_bot.services import broadcast as broadcast_service
 from tg_bot.telegram import TelegramAPIError, request as telegram_request
 from tg_bot.text import escape_html_limited, html_to_plain_text, truncate_text
 
@@ -51,6 +61,7 @@ MESSAGE_RETENTION_DAYS = SETTINGS.message_retention_days
 BROADCAST_SEND_DELAY_SECONDS = SETTINGS.broadcast_send_delay_seconds
 UPDATE_PROCESSING_TIMEOUT_SECONDS = SETTINGS.update_processing_timeout_seconds
 PENDING_REMINDER_MINUTES = SETTINGS.pending_reminder_minutes
+ADMIN_REPLY_STATE_TTL_SECONDS = SETTINGS.admin_reply_state_ttl_seconds
 TELEGRAM_INLINE_RETRY_MAX_SECONDS = SETTINGS.telegram_inline_retry_max_seconds
 BROADCAST_RATE_LIMIT_RETRIES = SETTINGS.broadcast_rate_limit_retries
 WEBHOOK_MAX_BODY_BYTES = 1024 * 1024
@@ -91,13 +102,17 @@ telegram_client: httpx.AsyncClient | None = None
 backup_task: asyncio.Task[None] | None = None
 broadcast_worker_task: asyncio.Task[None] | None = None
 broadcast_wakeup: asyncio.Event | None = None
+admin_delivery_worker_task: asyncio.Task[None] | None = None
+admin_delivery_wakeup: asyncio.Event | None = None
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global telegram_client, backup_task, broadcast_worker_task, broadcast_wakeup
+    global admin_delivery_worker_task, admin_delivery_wakeup
 
     init_db()
+    recover_interrupted_work()
     purge_expired_data()
     try:
         await asyncio.to_thread(backup_database)
@@ -109,18 +124,30 @@ async def lifespan(_: FastAPI):
         limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
     )
     broadcast_wakeup = asyncio.Event()
+    admin_delivery_wakeup = asyncio.Event()
     backup_task = asyncio.create_task(periodic_db_backup(), name="database-backup")
     broadcast_worker_task = asyncio.create_task(
         periodic_broadcast_worker(), name="broadcast-worker"
+    )
+    admin_delivery_worker_task = asyncio.create_task(
+        periodic_admin_delivery_worker(), name="admin-delivery-worker"
     )
 
     try:
         yield
     finally:
-        for task in (broadcast_worker_task, backup_task):
+        for task in (
+            admin_delivery_worker_task,
+            broadcast_worker_task,
+            backup_task,
+        ):
             if task:
                 task.cancel()
-        for task in (broadcast_worker_task, backup_task):
+        for task in (
+            admin_delivery_worker_task,
+            broadcast_worker_task,
+            backup_task,
+        ):
             if task:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
@@ -202,76 +229,24 @@ def db_fetchall(sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
     return database.fetchall(DB_PATH, sql, params)
 
 
-def claim_update(update_id: int) -> bool:
-    stale_modifier = f"-{UPDATE_PROCESSING_TIMEOUT_SECONDS} seconds"
-    with db_connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            """
-            SELECT status,
-                   CASE
-                       WHEN updated_at < datetime('now', ?) THEN 1
-                       ELSE 0
-                   END AS is_stale
-            FROM processed_updates
-            WHERE update_id = ?
-            """,
-            (stale_modifier, update_id),
-        ).fetchone()
+def claim_update(update_id: int) -> str:
+    return update_repository.claim(
+        DB_PATH,
+        update_id,
+        UPDATE_PROCESSING_TIMEOUT_SECONDS,
+    )
 
-        if row and row["status"] == "done":
-            conn.commit()
-            return False
-        if row and row["status"] == "processing" and not row["is_stale"]:
-            conn.commit()
-            return False
 
-        if row:
-            conn.execute(
-                """
-                UPDATE processed_updates
-                SET status = 'processing',
-                    attempts = attempts + 1,
-                    last_error = '',
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE update_id = ?
-                """,
-                (update_id,),
-            )
-        else:
-            conn.execute(
-                """
-                INSERT INTO processed_updates (
-                    update_id, status, attempts, updated_at, processed_at
-                ) VALUES (?, 'processing', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                """,
-                (update_id,),
-            )
-        conn.commit()
-        return True
+def recover_interrupted_work() -> None:
+    update_repository.recover_interrupted(DB_PATH)
 
 
 def finish_update(update_id: int) -> None:
-    db_execute(
-        """
-        UPDATE processed_updates
-        SET status = 'done', last_error = '',
-            updated_at = CURRENT_TIMESTAMP, processed_at = CURRENT_TIMESTAMP
-        WHERE update_id = ?
-        """,
-        (update_id,),
-    )
+    update_repository.finish(DB_PATH, update_id)
 
 
 def fail_update(update_id: int, error: str) -> None:
-    db_execute(
-        """
-        UPDATE processed_updates
-        SET status = 'failed', last_error = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE update_id = ?
-        """,
-        (error[:1000], update_id),
-    )
+    update_repository.fail(DB_PATH, update_id, error)
 
 
 def purge_expired_data() -> None:
@@ -283,6 +258,33 @@ def purge_expired_data() -> None:
             )
             conn.execute(
                 "DELETE FROM message_links WHERE created_at < datetime('now', ?)",
+                (f"-{MESSAGE_RETENTION_DAYS} days",),
+            )
+            conn.execute(
+                """
+                DELETE FROM admin_reply_deliveries
+                WHERE status IN ('sent', 'failed', 'unknown')
+                  AND updated_at < datetime('now', ?)
+                """,
+                (f"-{MESSAGE_RETENTION_DAYS} days",),
+            )
+            conn.execute(
+                """
+                DELETE FROM admin_deliveries
+                WHERE status IN ('sent', 'failed', 'unknown')
+                  AND updated_at < datetime('now', ?)
+                """,
+                (f"-{MESSAGE_RETENTION_DAYS} days",),
+            )
+            conn.execute(
+                """
+                DELETE FROM inbound_events
+                WHERE created_at < datetime('now', ?)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM admin_deliveries
+                      WHERE admin_deliveries.update_id = inbound_events.update_id
+                  )
+                """,
                 (f"-{MESSAGE_RETENTION_DAYS} days",),
             )
         conn.execute(
@@ -384,6 +386,7 @@ async def periodic_db_backup() -> None:
 # =========================
 
 TELEGRAM_TEXT_LIMIT = 4096
+ADMIN_DELIVERY_MAX_ATTEMPTS = 5
 
 
 def telegram_send_result(data: dict[str, Any]) -> TelegramSendResult:
@@ -621,13 +624,12 @@ def add_admin_audit(
     target_chat_id: int | None = None,
     details: str = "",
 ) -> None:
-    db_execute(
-        """
-        INSERT INTO admin_audit_logs (
-            admin_id, action, target_chat_id, details
-        ) VALUES (?, ?, ?, ?)
-        """,
-        (admin_id, action[:80], target_chat_id, details[:500]),
+    user_repository.add_admin_audit(
+        DB_PATH,
+        admin_id,
+        action,
+        target_chat_id,
+        details,
     )
 
 
@@ -755,25 +757,7 @@ def is_private_callback(callback: dict[str, Any]) -> bool:
 
 
 def upsert_user(user: dict[str, Any], text: str) -> None:
-    db_execute(
-        """
-        INSERT INTO users (chat_id, username, first_name, last_name, last_message, updated_at)
-        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(chat_id) DO UPDATE SET
-            username = excluded.username,
-            first_name = excluded.first_name,
-            last_name = excluded.last_name,
-            last_message = excluded.last_message,
-            updated_at = CURRENT_TIMESTAMP
-        """,
-        (
-            user["id"],
-            user.get("username"),
-            user.get("first_name"),
-            user.get("last_name"),
-            text,
-        ),
-    )
+    user_repository.upsert(DB_PATH, user, text)
 
 
 def add_message_log(
@@ -783,13 +767,13 @@ def add_message_log(
     text: str,
     telegram_message_id: int | None = None,
 ) -> None:
-    db_execute(
-        """
-        INSERT INTO message_logs (
-            chat_id, sender_type, sender_id, text, telegram_message_id
-        ) VALUES (?, ?, ?, ?, ?)
-        """,
-        (chat_id, sender_type, sender_id, text, telegram_message_id),
+    user_repository.add_message_log(
+        DB_PATH,
+        chat_id,
+        sender_type,
+        sender_id,
+        text,
+        telegram_message_id,
     )
 
 
@@ -802,70 +786,45 @@ def add_message_link(
     link_kind: str,
     admin_message_thread_id: int | None = None,
 ) -> None:
-    if direction not in {"user_to_admin", "admin_to_user"}:
-        raise ValueError(f"unsupported message link direction: {direction}")
-    if link_kind not in {"notification", "content", "admin_reply"}:
-        raise ValueError(f"unsupported message link kind: {link_kind}")
-
-    values = (
+    message_repository.add_link(
+        DB_PATH,
         user_chat_id,
         user_message_id,
         admin_chat_id,
         admin_message_id,
-        admin_message_thread_id,
         direction,
         link_kind,
+        admin_message_thread_id,
     )
-    with db_connect() as conn:
-        cursor = conn.execute(
-            """
-            INSERT OR IGNORE INTO message_links (
-                user_chat_id, user_message_id,
-                admin_chat_id, admin_message_id,
-                admin_message_thread_id, direction, link_kind
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            values,
-        )
-        if cursor.rowcount == 0:
-            existing = conn.execute(
-                """
-                SELECT user_chat_id, user_message_id,
-                       admin_message_thread_id, direction, link_kind
-                FROM message_links
-                WHERE admin_chat_id = ? AND admin_message_id = ?
-                """,
-                (admin_chat_id, admin_message_id),
-            ).fetchone()
-            expected = (
-                user_chat_id,
-                user_message_id,
-                admin_message_thread_id,
-                direction,
-                link_kind,
-            )
-            actual = tuple(existing) if existing else None
-            if actual != expected:
-                raise RuntimeError(
-                    "refusing to remap an existing administrator message"
-                )
-        conn.commit()
+
+
+def add_message_link_in_connection(
+    conn: sqlite3.Connection,
+    user_chat_id: int,
+    user_message_id: int,
+    admin_chat_id: int,
+    admin_message_id: int,
+    direction: str,
+    link_kind: str,
+    admin_message_thread_id: int | None = None,
+) -> None:
+    message_repository.add_link_in_connection(
+        conn,
+        user_chat_id,
+        user_message_id,
+        admin_chat_id,
+        admin_message_id,
+        direction,
+        link_kind,
+        admin_message_thread_id,
+    )
 
 
 def get_message_link(
     admin_chat_id: int,
     admin_message_id: int,
 ) -> sqlite3.Row | None:
-    return db_fetchone(
-        """
-        SELECT user_chat_id, user_message_id,
-               admin_chat_id, admin_message_id,
-               admin_message_thread_id, direction, link_kind, created_at
-        FROM message_links
-        WHERE admin_chat_id = ? AND admin_message_id = ?
-        """,
-        (admin_chat_id, admin_message_id),
-    )
+    return message_repository.find_link(DB_PATH, admin_chat_id, admin_message_id)
 
 
 def resolve_admin_message_target(
@@ -891,24 +850,12 @@ def resolve_admin_message_target(
 
 
 def update_user_message_log(chat_id: int, message_id: int, text: str) -> bool:
-    with db_connect() as conn:
-        cursor = conn.execute(
-            """
-            UPDATE message_logs
-            SET text = ?, edited_at = CURRENT_TIMESTAMP
-            WHERE id = (
-                SELECT id FROM message_logs
-                WHERE chat_id = ?
-                  AND sender_type = 'user'
-                  AND telegram_message_id = ?
-                ORDER BY id DESC
-                LIMIT 1
-            )
-            """,
-            (text, chat_id, message_id),
-        )
-        conn.commit()
-        return cursor.rowcount == 1
+    return user_repository.update_user_message_log(
+        DB_PATH,
+        chat_id,
+        message_id,
+        text,
+    )
 
 
 def get_history(
@@ -916,30 +863,12 @@ def get_history(
     limit: int = 5,
     exclude_message_id: int | None = None,
 ) -> list[sqlite3.Row]:
-    if exclude_message_id is None:
-        rows = db_fetchall(
-            """
-            SELECT sender_type, text, edited_at, created_at
-            FROM message_logs
-            WHERE chat_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (chat_id, limit),
-        )
-    else:
-        rows = db_fetchall(
-            """
-            SELECT sender_type, text, edited_at, created_at
-            FROM message_logs
-            WHERE chat_id = ?
-              AND (telegram_message_id IS NULL OR telegram_message_id != ?)
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (chat_id, exclude_message_id, limit),
-        )
-    return rows[::-1]
+    return user_repository.get_history(
+        DB_PATH,
+        chat_id,
+        limit,
+        exclude_message_id,
+    )
 
 
 def format_history(
@@ -970,157 +899,43 @@ def format_history(
 
 
 def check_user_rate_limit(chat_id: int) -> tuple[bool, bool, int]:
-    now = int(time.time())
-    with db_connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            """
-            SELECT window_started_at, message_count, blocked_until
-            FROM user_rate_limits
-            WHERE chat_id = ?
-            """,
-            (chat_id,),
-        ).fetchone()
-
-        if not row:
-            conn.execute(
-                """
-                INSERT INTO user_rate_limits (
-                    chat_id, window_started_at, message_count, blocked_until
-                ) VALUES (?, ?, 1, 0)
-                """,
-                (chat_id, now),
-            )
-            conn.commit()
-            return True, False, 0
-
-        blocked_until = int(row["blocked_until"])
-        if blocked_until > now:
-            conn.commit()
-            return False, False, blocked_until - now
-
-        window_started_at = int(row["window_started_at"])
-        if now - window_started_at >= USER_RATE_LIMIT_WINDOW_SECONDS:
-            conn.execute(
-                """
-                UPDATE user_rate_limits
-                SET window_started_at = ?, message_count = 1, blocked_until = 0
-                WHERE chat_id = ?
-                """,
-                (now, chat_id),
-            )
-            conn.commit()
-            return True, False, 0
-
-        message_count = int(row["message_count"]) + 1
-        if message_count > USER_RATE_LIMIT_COUNT:
-            blocked_until = now + USER_RATE_LIMIT_COOLDOWN_SECONDS
-            conn.execute(
-                """
-                UPDATE user_rate_limits
-                SET message_count = ?, blocked_until = ?, last_notified_at = ?
-                WHERE chat_id = ?
-                """,
-                (message_count, blocked_until, now, chat_id),
-            )
-            conn.commit()
-            return False, True, USER_RATE_LIMIT_COOLDOWN_SECONDS
-
-        conn.execute(
-            "UPDATE user_rate_limits SET message_count = ? WHERE chat_id = ?",
-            (message_count, chat_id),
-        )
-        conn.commit()
-        return True, False, 0
-
-
-def is_blacklisted(chat_id: int) -> bool:
-    return db_fetchone(
-        "SELECT chat_id FROM blacklists WHERE chat_id = ?",
-        (chat_id,),
-    ) is not None
-
-
-def blacklist_user(chat_id: int, admin_id: int, reason: str = "") -> None:
-    db_execute(
-        """
-        INSERT INTO blacklists (chat_id, reason, created_by)
-        VALUES (?, ?, ?)
-        ON CONFLICT(chat_id) DO UPDATE SET
-            reason = excluded.reason,
-            created_by = excluded.created_by,
-            created_at = CURRENT_TIMESTAMP
-        """,
-        (chat_id, reason, admin_id),
+    return access_repository.check_rate_limit(
+        DB_PATH,
+        chat_id,
+        USER_RATE_LIMIT_COUNT,
+        USER_RATE_LIMIT_WINDOW_SECONDS,
+        USER_RATE_LIMIT_COOLDOWN_SECONDS,
     )
 
 
+def is_blacklisted(chat_id: int) -> bool:
+    return access_repository.is_blacklisted(DB_PATH, chat_id)
+
+
+def blacklist_user(chat_id: int, admin_id: int, reason: str = "") -> None:
+    access_repository.blacklist(DB_PATH, chat_id, admin_id, reason)
+
+
 def unblacklist_user(chat_id: int) -> None:
-    db_execute("DELETE FROM blacklists WHERE chat_id = ?", (chat_id,))
+    access_repository.unblacklist(DB_PATH, chat_id)
 
 
 def is_user_verified(chat_id: int) -> bool:
     if not TURNSTILE_ENABLED or is_admin(chat_id):
         return True
-    return db_fetchone(
-        """
-        SELECT chat_id
-        FROM user_verifications
-        WHERE chat_id = ?
-          AND verified_at IS NOT NULL
-          AND expires_at > CURRENT_TIMESTAMP
-        """,
-        (chat_id,),
-    ) is not None
+    return access_repository.is_verified(DB_PATH, chat_id)
 
 
 def claim_verification_prompt(chat_id: int) -> bool:
-    with db_connect() as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO user_verifications (chat_id, last_prompted_at)
-            VALUES (?, CURRENT_TIMESTAMP)
-            ON CONFLICT(chat_id) DO UPDATE SET
-                last_prompted_at = CURRENT_TIMESTAMP
-            WHERE user_verifications.last_prompted_at IS NULL
-               OR user_verifications.last_prompted_at
-                  < datetime('now', '-30 seconds')
-            """,
-            (chat_id,),
-        )
-        conn.commit()
-        return cursor.rowcount == 1
+    return access_repository.claim_verification_prompt(DB_PATH, chat_id)
 
 
 def release_verification_prompt(chat_id: int) -> None:
-    db_execute(
-        """
-        UPDATE user_verifications
-        SET last_prompted_at = NULL
-        WHERE chat_id = ?
-          AND verified_at IS NULL
-        """,
-        (chat_id,),
-    )
+    access_repository.release_verification_prompt(DB_PATH, chat_id)
 
 
 def mark_user_verified(chat_id: int) -> None:
-    db_execute(
-        """
-        INSERT INTO user_verifications (
-            chat_id, verified_at, expires_at, last_prompted_at
-        )
-        VALUES (
-            ?, CURRENT_TIMESTAMP, datetime('now', ?), CURRENT_TIMESTAMP
-        )
-        ON CONFLICT(chat_id) DO UPDATE SET
-            verified_at = CURRENT_TIMESTAMP,
-            expires_at = excluded.expires_at,
-            last_prompted_at = CURRENT_TIMESTAMP
-        """,
-        (chat_id, f"+{TURNSTILE_VERIFY_DAYS} days"),
-    )
-    db_execute("DELETE FROM user_rate_limits WHERE chat_id = ?", (chat_id,))
+    access_repository.mark_verified(DB_PATH, chat_id, TURNSTILE_VERIFY_DAYS)
 
 
 def validate_telegram_init_data(init_data: str) -> int:
@@ -1222,114 +1037,54 @@ async def verify_turnstile_token(token: str) -> bool:
 
 
 def set_admin_state(admin_id: int, target_chat_id: int) -> None:
-    db_execute(
-        """
-        INSERT INTO admin_states (admin_id, target_chat_id, updated_at)
-        VALUES (?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(admin_id) DO UPDATE SET
-            target_chat_id = excluded.target_chat_id,
-            updated_at = CURRENT_TIMESTAMP
-        """,
-        (admin_id, target_chat_id),
-    )
+    conversation_repository.set_admin_state(DB_PATH, admin_id, target_chat_id)
 
 
 def get_admin_state(admin_id: int) -> int | None:
-    row = db_fetchone(
-        "SELECT target_chat_id FROM admin_states WHERE admin_id = ?",
-        (admin_id,),
+    return conversation_repository.get_admin_state(
+        DB_PATH,
+        admin_id,
+        ADMIN_REPLY_STATE_TTL_SECONDS,
     )
-    return int(row["target_chat_id"]) if row else None
 
 
 def clear_admin_state(
     admin_id: int, expected_target_chat_id: int | None = None
 ) -> int | None:
-    target_chat_id = get_admin_state(admin_id)
-    if (
-        expected_target_chat_id is not None
-        and target_chat_id != expected_target_chat_id
-    ):
-        return None
-    db_execute("DELETE FROM admin_states WHERE admin_id = ?", (admin_id,))
-    return target_chat_id
+    return conversation_repository.clear_admin_state(
+        DB_PATH,
+        admin_id,
+        ADMIN_REPLY_STATE_TTL_SECONDS,
+        expected_target_chat_id,
+    )
 
 
 def clear_admin_states_for_target(chat_id: int) -> None:
-    db_execute("DELETE FROM admin_states WHERE target_chat_id = ?", (chat_id,))
+    conversation_repository.clear_admin_states_for_target(DB_PATH, chat_id)
 
 
 def record_user_activity(chat_id: int, increment_unread: bool = True) -> None:
-    db_execute(
-        """
-        INSERT INTO conversations (
-            chat_id, status, unread_count, last_user_message_at, updated_at
-        )
-        VALUES (?, 'open', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        ON CONFLICT(chat_id) DO UPDATE SET
-            status = 'open',
-            unread_count = CASE
-                WHEN ? THEN conversations.unread_count + 1
-                ELSE MAX(conversations.unread_count, 1)
-            END,
-            last_user_message_at = CURRENT_TIMESTAMP,
-            updated_at = CURRENT_TIMESTAMP,
-            closed_at = NULL
-        """,
-        (chat_id, 1 if increment_unread else 0),
+    conversation_repository.record_user_activity(
+        DB_PATH,
+        chat_id,
+        increment_unread,
     )
 
 
 def mark_conversation_replied(chat_id: int) -> None:
-    db_execute(
-        """
-        INSERT INTO conversations (
-            chat_id, status, unread_count, last_admin_reply_at, updated_at
-        )
-        VALUES (?, 'open', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        ON CONFLICT(chat_id) DO UPDATE SET
-            status = 'open',
-            unread_count = 0,
-            last_admin_reply_at = CURRENT_TIMESTAMP,
-            updated_at = CURRENT_TIMESTAMP,
-            closed_at = NULL
-        """,
-        (chat_id,),
-    )
+    conversation_repository.mark_replied(DB_PATH, chat_id)
 
 
 def reopen_conversation(chat_id: int) -> None:
-    db_execute(
-        """
-        INSERT INTO conversations (chat_id, status, unread_count, updated_at)
-        VALUES (?, 'open', 0, CURRENT_TIMESTAMP)
-        ON CONFLICT(chat_id) DO UPDATE SET
-            status = 'open',
-            updated_at = CURRENT_TIMESTAMP,
-            closed_at = NULL
-        """,
-        (chat_id,),
-    )
+    conversation_repository.reopen(DB_PATH, chat_id)
 
 
 def get_conversation(chat_id: int) -> sqlite3.Row | None:
-    return db_fetchone(
-        """
-        SELECT chat_id, owner_admin_id, status, unread_count,
-               last_user_message_at, last_admin_reply_at,
-               updated_at, closed_at
-        FROM conversations
-        WHERE chat_id = ?
-        """,
-        (chat_id,),
-    )
+    return conversation_repository.get(DB_PATH, chat_id)
 
 
 def get_conversation_owner(chat_id: int) -> int | None:
-    row = get_conversation(chat_id)
-    if not row or row["status"] != "open" or row["owner_admin_id"] is None:
-        return None
-    return int(row["owner_admin_id"])
+    return conversation_repository.get_owner(DB_PATH, chat_id)
 
 
 def claim_conversation(
@@ -1340,107 +1095,35 @@ def claim_conversation(
     reopen: bool = False,
     activate_reply: bool = False,
 ) -> ConversationClaimResult:
-    with db_connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        conversation = conn.execute(
-            """
-            SELECT owner_admin_id, status
-            FROM conversations
-            WHERE chat_id = ?
-            """,
-            (chat_id,),
-        ).fetchone()
-        current_owner = (
-            int(conversation["owner_admin_id"])
-            if conversation and conversation["owner_admin_id"] is not None
-            else None
-        )
-        if conversation and conversation["status"] == "closed" and not reopen:
-            conn.commit()
-            return ConversationClaimResult("closed", current_owner)
-        if current_owner not in {None, admin_id} and not force:
-            conn.commit()
-            return ConversationClaimResult("conflict", current_owner)
-
-        conn.execute(
-            "DELETE FROM admin_states WHERE target_chat_id = ? AND admin_id != ?",
-            (chat_id, admin_id),
-        )
-        conn.execute(
-            """
-            INSERT INTO conversations (chat_id, owner_admin_id, status, updated_at)
-            VALUES (?, ?, 'open', CURRENT_TIMESTAMP)
-            ON CONFLICT(chat_id) DO UPDATE SET
-                owner_admin_id = excluded.owner_admin_id,
-                status = 'open',
-                updated_at = CURRENT_TIMESTAMP,
-                closed_at = NULL
-            """,
-            (chat_id, admin_id),
-        )
-        if activate_reply:
-            conn.execute(
-                """
-                INSERT INTO admin_states (admin_id, target_chat_id, updated_at)
-                VALUES (?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(admin_id) DO UPDATE SET
-                    target_chat_id = excluded.target_chat_id,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (admin_id, chat_id),
-            )
-        conn.commit()
-        return ConversationClaimResult("acquired", admin_id)
+    return conversation_repository.claim(
+        DB_PATH,
+        chat_id,
+        admin_id,
+        force=force,
+        reopen_closed=reopen,
+        activate_reply=activate_reply,
+    )
 
 
 def close_conversation(chat_id: int) -> None:
-    db_execute(
-        """
-        INSERT INTO conversations (chat_id, owner_admin_id, status, updated_at, closed_at)
-        VALUES (?, NULL, 'closed', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        ON CONFLICT(chat_id) DO UPDATE SET
-            owner_admin_id = NULL,
-            status = 'closed',
-            unread_count = 0,
-            updated_at = CURRENT_TIMESTAMP,
-            closed_at = CURRENT_TIMESTAMP
-        """,
-        (chat_id,),
-    )
-    clear_admin_states_for_target(chat_id)
+    conversation_repository.close(DB_PATH, chat_id)
 
 
 def conversation_queue_filter(
     queue_name: str,
 ) -> tuple[str, str, tuple[Any, ...]]:
-    where_clause: str
-    order_clause: str
-    params: tuple[Any, ...] = ()
-    if queue_name == "inbox":
-        where_clause = "c.status = 'open' AND c.unread_count > 0"
-        order_clause = "c.last_user_message_at DESC, c.chat_id DESC"
-    elif queue_name == "pending":
-        where_clause = (
-            "c.status = 'open' AND c.unread_count > 0 "
-            "AND c.last_user_message_at <= datetime('now', ?)"
-        )
-        order_clause = "c.last_user_message_at ASC, c.chat_id ASC"
-        params = (f"-{PENDING_REMINDER_MINUTES} minutes",)
-    elif queue_name == "closed":
-        where_clause = "c.status = 'closed'"
-        order_clause = "c.closed_at DESC, c.chat_id DESC"
-    else:
-        raise ValueError(f"unsupported queue: {queue_name}")
-    return where_clause, order_clause, params
+    return conversation_repository.queue_filter(
+        queue_name,
+        PENDING_REMINDER_MINUTES,
+    )
 
 
 def count_conversation_queue(queue_name: str) -> int:
-    where_clause, _, params = conversation_queue_filter(queue_name)
-    row = db_fetchone(
-        f"SELECT COUNT(*) AS total FROM conversations c WHERE {where_clause}",
-        params,
+    return conversation_repository.count_queue(
+        DB_PATH,
+        queue_name,
+        PENDING_REMINDER_MINUTES,
     )
-    return int(row["total"]) if row else 0
 
 
 def get_conversation_queue(
@@ -1448,20 +1131,12 @@ def get_conversation_queue(
     limit: int = ADMIN_PAGE_SIZE,
     offset: int = 0,
 ) -> list[sqlite3.Row]:
-    where_clause, order_clause, filter_params = conversation_queue_filter(queue_name)
-    return db_fetchall(
-        f"""
-        SELECT c.chat_id, c.owner_admin_id, c.status, c.unread_count,
-               c.last_user_message_at, c.last_admin_reply_at,
-               c.updated_at, c.closed_at,
-               u.username, u.first_name, u.last_name, u.last_message
-        FROM conversations c
-        LEFT JOIN users u ON u.chat_id = c.chat_id
-        WHERE {where_clause}
-        ORDER BY {order_clause}
-        LIMIT ? OFFSET ?
-        """,
-        (*filter_params, limit, offset),
+    return conversation_repository.list_queue(
+        DB_PATH,
+        queue_name,
+        PENDING_REMINDER_MINUTES,
+        limit,
+        offset,
     )
 
 
@@ -1491,27 +1166,10 @@ def parse_callback_page(raw_page: str | None) -> int | None:
 
 
 def get_queue_counts() -> dict[str, int]:
-    row = db_fetchone(
-        """
-        SELECT
-            SUM(CASE
-                WHEN status = 'open' AND unread_count > 0 THEN 1
-                ELSE 0
-            END) AS inbox,
-            SUM(CASE
-                WHEN status = 'open' AND unread_count > 0
-                 AND last_user_message_at <= datetime('now', ?)
-                THEN 1 ELSE 0
-            END) AS pending,
-            SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) AS closed
-        FROM conversations
-        """,
-        (f"-{PENDING_REMINDER_MINUTES} minutes",),
+    return conversation_repository.queue_counts(
+        DB_PATH,
+        PENDING_REMINDER_MINUTES,
     )
-    return {
-        queue_name: int(row[queue_name] or 0) if row else 0
-        for queue_name in QUEUE_LABELS
-    }
 
 
 def format_admin_dashboard(admin_id: int) -> str:
@@ -1591,28 +1249,14 @@ def format_conversation_queue(
 
 
 def count_recent_users() -> int:
-    row = db_fetchone("SELECT COUNT(*) AS total FROM users")
-    return int(row["total"]) if row else 0
+    return user_repository.count(DB_PATH)
 
 
 def get_recent_users(
     limit: int = ADMIN_PAGE_SIZE,
     offset: int = 0,
 ) -> list[sqlite3.Row]:
-    return db_fetchall(
-        """
-        SELECT u.chat_id, u.username, u.first_name, u.last_name, u.last_message,
-               u.updated_at, b.chat_id AS blocked,
-               COALESCE(c.unread_count, 0) AS unread_count,
-               c.status AS conversation_status
-        FROM users u
-        LEFT JOIN blacklists b ON b.chat_id = u.chat_id
-        LEFT JOIN conversations c ON c.chat_id = u.chat_id
-        ORDER BY u.updated_at DESC, u.chat_id DESC
-        LIMIT ? OFFSET ?
-        """,
-        (limit, offset),
-    )
+    return user_repository.list_recent(DB_PATH, limit, offset)
 
 
 def format_recent_users(
@@ -1652,7 +1296,7 @@ def format_recent_users(
 
 
 def format_user_detail(chat_id: int) -> str:
-    user = db_fetchone("SELECT * FROM users WHERE chat_id = ?", (chat_id,))
+    user = user_repository.get(DB_PATH, chat_id)
     if not user:
         return f"<b>用户详情</b>\n\n未找到用户 <code>{chat_id}</code>。"
 
@@ -1706,377 +1350,79 @@ def format_user_detail(chat_id: int) -> str:
 
 
 def create_pending_broadcast(admin_id: int, content: str) -> str:
-    broadcast_id = uuid.uuid4().hex[:12]
-    db_execute(
-        """
-        INSERT INTO pending_broadcasts (id, admin_id, content, status)
-        VALUES (?, ?, ?, 'pending')
-        """,
-        (broadcast_id, admin_id, content),
-    )
-    return broadcast_id
+    return broadcast_repository.create(DB_PATH, admin_id, content)
 
 
 def queue_broadcast(broadcast_id: str, admin_id: int) -> tuple[str, int]:
-    with db_connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        broadcast = conn.execute(
-            "SELECT admin_id, status FROM pending_broadcasts WHERE id = ?",
-            (broadcast_id,),
-        ).fetchone()
-        if not broadcast:
-            conn.commit()
-            return "missing", 0
-        if int(broadcast["admin_id"]) != admin_id:
-            conn.commit()
-            return "forbidden", 0
-        if broadcast["status"] != "pending":
-            conn.commit()
-            return str(broadcast["status"]), 0
-
-        recipients = conn.execute(
-            """
-            SELECT u.chat_id
-            FROM users u
-            LEFT JOIN blacklists b ON b.chat_id = u.chat_id
-            WHERE b.chat_id IS NULL
-            ORDER BY u.updated_at DESC
-            """
-        ).fetchall()
-        conn.executemany(
-            """
-            INSERT OR IGNORE INTO broadcast_recipients (
-                broadcast_id, chat_id, status
-            ) VALUES (?, ?, 'pending')
-            """,
-            [(broadcast_id, int(row["chat_id"])) for row in recipients],
-        )
-        total = len(recipients)
-        conn.execute(
-            """
-            UPDATE pending_broadcasts
-            SET status = 'queued', total_count = ?, sent_count = 0,
-                failed_count = 0, confirmed_at = CURRENT_TIMESTAMP,
-                last_error = ''
-            WHERE id = ?
-            """,
-            (total, broadcast_id),
-        )
-        conn.commit()
-        return "queued", total
+    return broadcast_repository.queue(DB_PATH, broadcast_id, admin_id)
 
 
 def cancel_pending_broadcast(broadcast_id: str, admin_id: int) -> str:
-    with db_connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        broadcast = conn.execute(
-            "SELECT admin_id, status FROM pending_broadcasts WHERE id = ?",
-            (broadcast_id,),
-        ).fetchone()
-        if not broadcast:
-            conn.commit()
-            return "missing"
-        if int(broadcast["admin_id"]) != admin_id:
-            conn.commit()
-            return "forbidden"
-        if broadcast["status"] != "pending":
-            conn.commit()
-            return str(broadcast["status"])
-        conn.execute(
-            """
-            UPDATE pending_broadcasts
-            SET status = 'canceled', completed_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-            """,
-            (broadcast_id,),
-        )
-        conn.commit()
-        return "canceled"
+    return broadcast_repository.cancel(DB_PATH, broadcast_id, admin_id)
 
 
 def retry_failed_broadcast(broadcast_id: str) -> tuple[str, int]:
-    with db_connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        broadcast = conn.execute(
-            "SELECT status FROM pending_broadcasts WHERE id = ?",
-            (broadcast_id,),
-        ).fetchone()
-        if not broadcast:
-            conn.commit()
-            return "missing", 0
-        if broadcast["status"] not in {"completed", "canceled"}:
-            conn.commit()
-            return str(broadcast["status"]), 0
-
-        failed = conn.execute(
-            """
-            SELECT COUNT(*) AS total
-            FROM broadcast_recipients
-            WHERE broadcast_id = ? AND status = 'failed'
-            """,
-            (broadcast_id,),
-        ).fetchone()
-        failed_count = int(failed["total"]) if failed else 0
-        if failed_count == 0:
-            conn.commit()
-            return "nothing", 0
-
-        conn.execute(
-            """
-            UPDATE broadcast_recipients
-            SET status = 'pending', last_error = '',
-                updated_at = CURRENT_TIMESTAMP
-            WHERE broadcast_id = ? AND status = 'failed'
-            """,
-            (broadcast_id,),
-        )
-        conn.execute(
-            """
-            UPDATE pending_broadcasts
-            SET status = 'queued', failed_count = 0,
-                confirmed_at = CURRENT_TIMESTAMP,
-                completed_at = NULL, last_error = ''
-            WHERE id = ?
-            """,
-            (broadcast_id,),
-        )
-        conn.commit()
-        return "queued", failed_count
+    return broadcast_repository.retry_failed(DB_PATH, broadcast_id)
 
 
 def claim_next_broadcast_job() -> sqlite3.Row | None:
-    with db_connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        job = conn.execute(
-            """
-            SELECT id, admin_id, content
-            FROM pending_broadcasts
-            WHERE status IN ('queued', 'running')
-            ORDER BY confirmed_at, created_at
-            LIMIT 1
-            """
-        ).fetchone()
-        if job:
-            conn.execute(
-                """
-                UPDATE pending_broadcasts
-                SET status = 'running',
-                    started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
-                    last_error = ''
-                WHERE id = ?
-                """,
-                (job["id"],),
-            )
-        conn.commit()
-        return job
+    return broadcast_repository.claim_next_job(DB_PATH)
 
 
 def claim_next_broadcast_recipient(broadcast_id: str) -> int | None:
-    with db_connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        recipient = conn.execute(
-            """
-            SELECT chat_id
-            FROM broadcast_recipients
-            WHERE broadcast_id = ? AND status = 'pending'
-            ORDER BY chat_id
-            LIMIT 1
-            """,
-            (broadcast_id,),
-        ).fetchone()
-        if not recipient:
-            conn.commit()
-            return None
-        chat_id = int(recipient["chat_id"])
-        conn.execute(
-            """
-            UPDATE broadcast_recipients
-            SET status = 'sending', attempts = attempts + 1,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE broadcast_id = ? AND chat_id = ?
-            """,
-            (broadcast_id, chat_id),
-        )
-        conn.commit()
-        return chat_id
+    return broadcast_repository.claim_next_recipient(DB_PATH, broadcast_id)
 
 
 def finish_broadcast_recipient(
-    broadcast_id: str, chat_id: int, sent: bool, error: str = ""
+    broadcast_id: str,
+    chat_id: int,
+    sent: bool,
+    error: str = "",
+    unknown: bool = False,
 ) -> None:
-    recipient_status = "sent" if sent else "failed"
-    counter = "sent_count" if sent else "failed_count"
-    with db_connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute(
-            """
-            UPDATE broadcast_recipients
-            SET status = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE broadcast_id = ? AND chat_id = ?
-            """,
-            (recipient_status, error[:500], broadcast_id, chat_id),
-        )
-        conn.execute(
-            f"UPDATE pending_broadcasts SET {counter} = {counter} + 1 WHERE id = ?",
-            (broadcast_id,),
-        )
-        conn.commit()
+    broadcast_repository.finish_recipient(
+        DB_PATH,
+        broadcast_id,
+        chat_id,
+        sent,
+        error,
+        unknown,
+    )
 
 
 def complete_broadcast(broadcast_id: str) -> sqlite3.Row | None:
-    with db_connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        remaining = conn.execute(
-            """
-            SELECT COUNT(*) AS total
-            FROM broadcast_recipients
-            WHERE broadcast_id = ? AND status IN ('pending', 'sending')
-            """,
-            (broadcast_id,),
-        ).fetchone()
-        if remaining and int(remaining["total"]) > 0:
-            conn.commit()
-            return None
-        conn.execute(
-            """
-            UPDATE pending_broadcasts
-            SET status = 'completed', completed_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-            """,
-            (broadcast_id,),
-        )
-        result = conn.execute(
-            """
-            SELECT admin_id, total_count, sent_count, failed_count
-            FROM pending_broadcasts
-            WHERE id = ?
-            """,
-            (broadcast_id,),
-        ).fetchone()
-        conn.commit()
-        return result
+    return broadcast_repository.complete(DB_PATH, broadcast_id)
 
 
 def recover_broadcast_job(broadcast_id: str, error: str) -> None:
-    with db_connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute(
-            """
-            UPDATE broadcast_recipients
-            SET status = 'pending', updated_at = CURRENT_TIMESTAMP
-            WHERE broadcast_id = ? AND status = 'sending'
-            """,
-            (broadcast_id,),
-        )
-        conn.execute(
-            """
-            UPDATE pending_broadcasts
-            SET status = 'queued', last_error = ?
-            WHERE id = ? AND status = 'running'
-            """,
-            (error[:1000], broadcast_id),
-        )
-        conn.commit()
+    broadcast_repository.recover(DB_PATH, broadcast_id, error)
 
 
 def active_user_count() -> int:
-    row = db_fetchone(
-        """
-        SELECT COUNT(*) AS total
-        FROM users u
-        LEFT JOIN blacklists b ON b.chat_id = u.chat_id
-        WHERE b.chat_id IS NULL
-        """
-    )
-    return int(row["total"]) if row else 0
+    return broadcast_repository.active_user_count(DB_PATH)
 
 
 async def process_broadcast_job(job: sqlite3.Row) -> None:
-    broadcast_id = str(job["id"])
-    content = str(job["content"])
-
-    while True:
-        chat_id = claim_next_broadcast_recipient(broadcast_id)
-        if chat_id is None:
-            result = complete_broadcast(broadcast_id)
-            if result:
-                failed_count = int(result["failed_count"])
-                reply_markup = (
-                    inline_keyboard(
-                        [
-                            [
-                                (
-                                    "重试失败用户",
-                                    f"broadcast_retry:{broadcast_id}",
-                                    "primary",
-                                )
-                            ]
-                        ]
-                    )
-                    if failed_count > 0
-                    else None
-                )
-                await send_message(
-                    int(result["admin_id"]),
-                    "<b>群发完成</b>\n\n"
-                    f"成功：<b>{result['sent_count']}</b>\n"
-                    f"失败：<b>{failed_count}</b>\n"
-                    f"总计：{result['total_count']}",
-                    reply_markup=reply_markup,
-                )
-            return
-
-        if is_blacklisted(chat_id):
-            finish_broadcast_recipient(
-                broadcast_id, chat_id, False, "user is blacklisted"
-            )
-            continue
-
-        sent = False
-        for attempt in range(2):
-            if await send_message(
-                chat_id,
-                content,
-                parse_mode=None,
-                rate_limit_retries=BROADCAST_RATE_LIMIT_RETRIES,
-                rate_limit_max_wait_seconds=None,
-            ):
-                sent = True
-                break
-            if attempt == 0:
-                await asyncio.sleep(1)
-        finish_broadcast_recipient(
-            broadcast_id,
-            chat_id,
-            sent,
-            "Telegram send failed" if not sent else "",
-        )
-        if BROADCAST_SEND_DELAY_SECONDS:
-            await asyncio.sleep(BROADCAST_SEND_DELAY_SECONDS)
+    await broadcast_service.process_job(
+        job,
+        claim_next_broadcast_recipient,
+        complete_broadcast,
+        is_blacklisted,
+        finish_broadcast_recipient,
+        send_message,
+        BROADCAST_RATE_LIMIT_RETRIES,
+        BROADCAST_SEND_DELAY_SECONDS,
+    )
 
 
 async def periodic_broadcast_worker() -> None:
-    while True:
-        job: sqlite3.Row | None = None
-        try:
-            job = claim_next_broadcast_job()
-            if job:
-                await process_broadcast_job(job)
-                continue
-
-            if broadcast_wakeup is None:
-                await asyncio.sleep(2)
-                continue
-            broadcast_wakeup.clear()
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(broadcast_wakeup.wait(), timeout=5)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.exception("Broadcast worker failed")
-            if job:
-                recover_broadcast_job(str(job["id"]), str(exc))
-            await asyncio.sleep(2)
+    await broadcast_service.run_worker(
+        broadcast_wakeup,
+        claim_next_broadcast_job,
+        process_broadcast_job,
+        recover_broadcast_job,
+        logger,
+    )
 
 
 def admin_user_keyboard(chat_id: int, viewer_admin_id: int | None = None) -> dict[str, Any]:
@@ -2252,23 +1598,51 @@ async def show_recent_users(
 # 业务逻辑
 # =========================
 
-async def notify_admins(
+def persist_user_event(
+    update_id: int,
     user: dict[str, Any],
     text: str,
-    source_message: dict[str, Any] | None = None,
-    title: str = "收到用户消息",
-    exclude_message_id: int | None = None,
-) -> None:
-    chat_id = int(user["id"])
-    source_message_id = (
-        int(source_message["message_id"])
-        if source_message and isinstance(source_message.get("message_id"), int)
-        else None
+    source_message: dict[str, Any],
+    *,
+    event_type: str,
+    title: str,
+    edited: bool = False,
+) -> bool:
+    chat_id = int(source_message["chat"]["id"])
+    message_id = int(source_message["message_id"])
+    return inbound_repository.persist_event(
+        DB_PATH,
+        update_id,
+        user,
+        text,
+        chat_id,
+        message_id,
+        event_type=event_type,
+        title=title,
+        edited=edited,
+        admin_ids=ADMIN_IDS,
+        include_content_delivery=(
+            source_message.get("text") is None
+            and can_copy_message(source_message)
+        ),
     )
+
+
+def format_admin_delivery_message(delivery: sqlite3.Row) -> str:
+    chat_id = int(delivery["user_chat_id"])
+    user_row = user_repository.get(DB_PATH, chat_id)
+    if not user_row:
+        raise RuntimeError("administrator delivery user record is missing")
+    user = {
+        "id": int(user_row["chat_id"]),
+        "username": user_row["username"],
+        "first_name": user_row["first_name"],
+        "last_name": user_row["last_name"],
+    }
     history = format_history(
         chat_id,
         limit=6,
-        exclude_message_id=exclude_message_id,
+        exclude_message_id=int(delivery["source_message_id"]),
         max_chars=1800,
     )
     conversation = get_conversation(chat_id)
@@ -2279,60 +1653,97 @@ async def notify_admins(
         if owner_admin_id
         else "未接管"
     )
-    msg = (
-        f"<b>{html.escape(title)}</b>\n"
+    return (
+        f"<b>{html.escape(str(delivery['title']))}</b>\n"
         f"{unread_count} 条待处理 · {owner_state}\n\n"
         "<b>用户</b>\n"
         f"{user_identity_html(user)}\n\n"
         "<b>本条内容</b>\n"
-        f"{escape_html_limited(text, 1200)}\n\n"
+        f"{escape_html_limited(str(delivery['content_summary']), 1200)}\n\n"
         "<b>最近记录</b>\n"
         f"{history}"
     )
 
-    for admin_id in ADMIN_IDS:
-        notification_result = await send_message(
-            admin_id,
-            msg,
-            reply_markup=admin_user_keyboard(chat_id, viewer_admin_id=admin_id),
-        )
-        if (
-            notification_result
-            and source_message_id is not None
-            and isinstance(notification_result, TelegramSendResult)
-            and notification_result.message_id is not None
-        ):
-            add_message_link(
-                chat_id,
-                source_message_id,
-                admin_id,
-                notification_result.message_id,
-                "user_to_admin",
-                "notification",
-                notification_result.message_thread_id,
-            )
-        if notification_result and source_message and can_copy_message(source_message):
-            if source_message.get("text") is None:
-                copied_result = await copy_message(
-                    admin_id,
-                    int(source_message["chat"]["id"]),
-                    int(source_message["message_id"]),
-                )
-                if (
-                    copied_result
-                    and source_message_id is not None
-                    and isinstance(copied_result, TelegramSendResult)
-                    and copied_result.message_id is not None
-                ):
-                    add_message_link(
-                        chat_id,
-                        source_message_id,
-                        admin_id,
-                        copied_result.message_id,
-                        "user_to_admin",
-                        "content",
-                        copied_result.message_thread_id,
-                    )
+
+def claim_next_admin_delivery() -> sqlite3.Row | None:
+    return delivery_repository.claim_next_admin(DB_PATH)
+
+
+def complete_admin_delivery(
+    delivery: sqlite3.Row,
+    result: TelegramSendResult,
+) -> None:
+    delivery_repository.complete_admin(DB_PATH, delivery, result)
+
+
+def mark_admin_delivery_unknown(delivery_id: int, error: str) -> None:
+    delivery_repository.mark_admin_unknown(DB_PATH, delivery_id, error)
+
+
+def defer_or_fail_admin_delivery(
+    delivery: sqlite3.Row,
+    result: TelegramSendResult,
+) -> str:
+    return delivery_repository.defer_or_fail_admin(
+        DB_PATH,
+        delivery,
+        result,
+        ADMIN_DELIVERY_MAX_ATTEMPTS,
+    )
+
+
+def claim_unalerted_admin_delivery() -> sqlite3.Row | None:
+    return delivery_repository.claim_unalerted_admin(DB_PATH)
+
+
+def mark_admin_delivery_alerted(delivery_id: int) -> None:
+    delivery_repository.mark_admin_alerted(DB_PATH, delivery_id)
+
+
+def defer_admin_delivery_alert(delivery: sqlite3.Row) -> None:
+    delivery_repository.defer_admin_alert(DB_PATH, delivery)
+
+
+def retry_admin_delivery(delivery_id: int) -> str:
+    return delivery_repository.retry_admin(DB_PATH, delivery_id)
+
+
+async def alert_admin_delivery_failure(delivery: sqlite3.Row) -> bool:
+    return await admin_delivery_service.alert_failure(
+        delivery,
+        OWNER_IDS,
+        send_message,
+    )
+
+
+async def process_admin_delivery(delivery: sqlite3.Row) -> None:
+    await admin_delivery_service.process_delivery(
+        delivery,
+        send_message,
+        copy_message,
+        format_admin_delivery_message,
+        lambda chat_id, viewer_admin_id: admin_user_keyboard(
+            chat_id,
+            viewer_admin_id=viewer_admin_id,
+        ),
+        complete_admin_delivery,
+        mark_admin_delivery_unknown,
+        defer_or_fail_admin_delivery,
+    )
+
+
+async def periodic_admin_delivery_worker() -> None:
+    await admin_delivery_service.run_worker(
+        admin_delivery_wakeup,
+        claim_unalerted_admin_delivery,
+        alert_admin_delivery_failure,
+        defer_admin_delivery_alert,
+        mark_admin_delivery_alerted,
+        claim_next_admin_delivery,
+        process_admin_delivery,
+        mark_admin_delivery_unknown,
+        logger,
+    )
 
 
 async def send_welcome(chat_id: int) -> None:
@@ -2362,7 +1773,7 @@ def normalize_command_text(text: str) -> str:
     return f"{command} {remainder}" if separator else command
 
 
-async def handle_user_message(message: dict[str, Any]) -> None:
+async def handle_user_message(message: dict[str, Any], update_id: int) -> None:
     user = message["from"]
     chat_id = int(message["chat"]["id"])
     text = message_content(message)
@@ -2410,24 +1821,20 @@ async def handle_user_message(message: dict[str, Any]) -> None:
             )
         return
 
-    record_user_activity(chat_id)
-    add_message_log(
-        chat_id,
-        "user",
-        chat_id,
-        text,
-        telegram_message_id=message_id,
-    )
-    await send_message(chat_id, "留言已收到，我看到后会通过 Bot 回复你。")
-    await notify_admins(
+    persist_user_event(
+        update_id,
         user,
         text,
-        source_message=message,
-        exclude_message_id=message_id,
+        message,
+        event_type="message",
+        title="收到用户消息",
     )
+    await send_message(chat_id, "留言已收到，我看到后会通过 Bot 回复你。")
+    if admin_delivery_wakeup:
+        admin_delivery_wakeup.set()
 
 
-async def handle_user_edited_message(message: dict[str, Any]) -> None:
+async def handle_user_edited_message(message: dict[str, Any], update_id: int) -> None:
     user = message["from"]
     chat_id = int(message["chat"]["id"])
     message_id = int(message["message_id"])
@@ -2451,25 +1858,136 @@ async def handle_user_edited_message(message: dict[str, Any]) -> None:
             )
         return
 
-    record_user_activity(chat_id, increment_unread=False)
-    if not update_user_message_log(chat_id, message_id, text):
-        add_message_log(
-            chat_id,
-            "user",
-            chat_id,
-            text,
-            telegram_message_id=message_id,
-        )
-    await notify_admins(
+    persist_user_event(
+        update_id,
         user,
         text,
-        source_message=message,
+        message,
+        event_type="edited_message",
         title="用户修改了消息",
-        exclude_message_id=message_id,
+        edited=True,
+    )
+    if admin_delivery_wakeup:
+        admin_delivery_wakeup.set()
+
+
+def prepare_admin_reply_delivery(
+    update_id: int | None,
+    admin_id: int,
+    admin_chat_id: int,
+    admin_message_id: int,
+    user_chat_id: int,
+    route: str,
+) -> str:
+    return delivery_repository.prepare_reply(
+        DB_PATH,
+        update_id,
+        admin_id,
+        admin_chat_id,
+        admin_message_id,
+        user_chat_id,
+        route,
     )
 
 
-async def handle_admin_command(admin_id: int, text: str) -> bool:
+def mark_admin_reply_sending(admin_chat_id: int, admin_message_id: int) -> bool:
+    return delivery_repository.mark_reply_sending(
+        DB_PATH,
+        admin_chat_id,
+        admin_message_id,
+    )
+
+
+def fail_admin_reply_delivery(
+    admin_chat_id: int,
+    admin_message_id: int,
+    result: TelegramSendResult,
+) -> None:
+    delivery_repository.fail_reply(
+        DB_PATH,
+        admin_chat_id,
+        admin_message_id,
+        result,
+    )
+
+
+def mark_admin_reply_unknown(
+    admin_chat_id: int,
+    admin_message_id: int,
+    error: str,
+) -> None:
+    delivery_repository.mark_reply_unknown(
+        DB_PATH,
+        admin_chat_id,
+        admin_message_id,
+        error,
+    )
+
+
+def complete_admin_reply_delivery(
+    admin_chat_id: int,
+    admin_message_id: int,
+    user_chat_id: int,
+    admin_id: int,
+    route: str,
+    content: str,
+    kind: str,
+    result: TelegramSendResult,
+    admin_message_thread_id: int | None = None,
+) -> None:
+    delivery_repository.complete_reply(
+        DB_PATH,
+        admin_chat_id,
+        admin_message_id,
+        user_chat_id,
+        admin_id,
+        route,
+        content,
+        kind,
+        result,
+        admin_message_thread_id,
+    )
+
+
+async def send_admin_reply_status(
+    admin_id: int,
+    target_chat_id: int,
+    route: str,
+    *,
+    duplicate: bool = False,
+) -> None:
+    if route == "state":
+        state_line = "持续回复模式仍然开启。"
+        markup = exit_reply_keyboard(target_chat_id)
+    else:
+        state_line = "本次为一次性回复，持续回复模式未开启。"
+        markup = admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id)
+    duplicate_line = "\n已忽略 Telegram 的重复投递。" if duplicate else ""
+    await send_message(
+        admin_id,
+        "<b>消息已发送</b>\n\n"
+        f"目标用户：<code>{target_chat_id}</code>\n"
+        f"{state_line}{duplicate_line}",
+        reply_markup=markup,
+    )
+
+
+async def send_admin_reply_uncertain(admin_id: int, target_chat_id: int) -> None:
+    await send_message(
+        admin_id,
+        "<b>投递结果不确定</b>\n\n"
+        f"目标用户：<code>{target_chat_id}</code>\n"
+        "为避免重复发送，Bot 没有自动重放。请先确认用户侧，再重新发送一条新消息。",
+        reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
+    )
+
+
+async def handle_admin_command(
+    admin_id: int,
+    text: str,
+    message: dict[str, Any] | None = None,
+    update_id: int | None = None,
+) -> bool:
     if not is_admin(admin_id):
         return False
 
@@ -2548,23 +2066,67 @@ async def handle_admin_command(admin_id: int, text: str) -> bool:
         if claim_result.status == "closed":
             await send_message(admin_id, "这个会话已经关闭，请先重新打开。")
             return True
+        admin_chat_id = (
+            int(message["chat"]["id"]) if message is not None else admin_id
+        )
+        admin_message_id = (
+            int(message["message_id"])
+            if message is not None
+            else -int(time.time_ns())
+        )
+        route = parts[0].lstrip("/")
+        delivery_status = prepare_admin_reply_delivery(
+            update_id,
+            admin_id,
+            admin_chat_id,
+            admin_message_id,
+            target_chat_id,
+            route,
+        )
+        if delivery_status == "sent":
+            await send_admin_reply_status(
+                admin_id, target_chat_id, route, duplicate=True
+            )
+            return True
+        if delivery_status == "unknown":
+            await send_admin_reply_uncertain(admin_id, target_chat_id)
+            return True
+        if delivery_status == "failed":
+            await send_message(
+                admin_id,
+                "上一轮发送已经明确失败。请检查原因后发送一条新的回复指令。",
+            )
+            return True
+        if not mark_admin_reply_sending(admin_chat_id, admin_message_id):
+            await send_admin_reply_uncertain(admin_id, target_chat_id)
+            return True
         delivery_result = await send_message(target_chat_id, content, parse_mode=None)
         if not delivery_result:
+            fail_admin_reply_delivery(
+                admin_chat_id, admin_message_id, delivery_result
+            )
             await send_message(admin_id, delivery_failure_message(delivery_result))
             return True
-        add_message_log(target_chat_id, "admin", admin_id, content)
-        mark_conversation_replied(target_chat_id)
-        add_admin_audit(
+        try:
+            complete_admin_reply_delivery(
+                admin_chat_id,
+                admin_message_id,
+                target_chat_id,
+                admin_id,
+                route,
+                content,
+                "text",
+                delivery_result,
+            )
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                mark_admin_reply_unknown(admin_chat_id, admin_message_id, str(exc))
+            await send_admin_reply_uncertain(admin_id, target_chat_id)
+            return True
+        await send_admin_reply_status(
             admin_id,
-            "message_sent",
             target_chat_id,
-            f"command={parts[0]} length={len(content)}",
-        )
-        await send_message(
-            admin_id,
-            "<b>消息已发送</b>\n\n"
-            f"用户：<code>{target_chat_id}</code>",
-            reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
+            route,
         )
         return True
 
@@ -2609,16 +2171,7 @@ async def handle_admin_command(admin_id: int, text: str) -> bool:
         return True
 
     if text == "/broadcast_status":
-        rows = db_fetchall(
-            """
-            SELECT id, status, total_count, sent_count, failed_count, created_at
-            FROM pending_broadcasts
-            WHERE admin_id = ?
-            ORDER BY created_at DESC
-            LIMIT 5
-            """,
-            (admin_id,),
-        )
+        rows = broadcast_repository.list_recent_jobs(DB_PATH, admin_id)
         if not rows:
             await send_message(admin_id, "暂无群发记录。")
             return True
@@ -2632,7 +2185,7 @@ async def handle_admin_command(admin_id: int, text: str) -> bool:
                 f"<b>{index}. {html.escape(status_label)}</b>\n"
                 f"任务：<code>{row['id']}</code>\n"
                 f"进度：{row['sent_count']}/{row['total_count']} · "
-                f"失败 {row['failed_count']}\n"
+                f"失败 {row['failed_count']} · 不确定 {row['unknown_count']}\n"
                 f"创建：{compact_timestamp(row['created_at'])}"
             )
         await send_message(admin_id, "\n\n".join(lines))
@@ -2666,14 +2219,7 @@ async def handle_admin_command(admin_id: int, text: str) -> bool:
         return True
 
     if text == "/audit":
-        rows = db_fetchall(
-            """
-            SELECT admin_id, action, target_chat_id, details, created_at
-            FROM admin_audit_logs
-            ORDER BY id DESC
-            LIMIT 15
-            """
-        )
+        rows = user_repository.list_admin_audits(DB_PATH, limit=15)
         if not rows:
             await send_message(admin_id, "暂无管理员操作记录。")
             return True
@@ -2789,14 +2335,7 @@ async def handle_admin_command(admin_id: int, text: str) -> bool:
         return True
 
     if text == "/blacklist_list":
-        rows = db_fetchall(
-            """
-            SELECT chat_id, reason, created_at
-            FROM blacklists
-            ORDER BY created_at DESC
-            LIMIT 20
-            """
-        )
+        rows = access_repository.list_blacklist(DB_PATH)
         if not rows:
             await send_message(admin_id, "黑名单为空。")
             return True
@@ -2812,7 +2351,7 @@ async def handle_admin_command(admin_id: int, text: str) -> bool:
     return False
 
 
-async def handle_admin_message(message: dict[str, Any]) -> None:
+async def handle_admin_message(message: dict[str, Any], update_id: int | None = None) -> None:
     admin_id = int(message["from"]["id"])
     if not is_admin(admin_id):
         return
@@ -2820,7 +2359,7 @@ async def handle_admin_message(message: dict[str, Any]) -> None:
     text = normalize_command_text(message.get("text") or message.get("caption") or "")
     content = message_content(message)
 
-    if await handle_admin_command(admin_id, text):
+    if await handle_admin_command(admin_id, text, message, update_id):
         return
 
     if text.startswith("/"):
@@ -2833,11 +2372,12 @@ async def handle_admin_message(message: dict[str, Any]) -> None:
 
     target_chat_id, target_source = resolve_admin_message_target(admin_id, message)
     if target_source == "unmapped_reply":
+        clear_admin_state(admin_id)
         await send_message(
             admin_id,
             "<b>无法识别回复对象</b>\n\n"
             "这条被回复的消息没有用户映射。为防止发错人，本次消息没有发送。\n"
-            "请点击用户通知下方的“回复”后重试。",
+            "请 Reply 用户通知，或点击下方“持续回复”后重试。",
             reply_markup=admin_dashboard_keyboard(),
         )
         return
@@ -2850,6 +2390,9 @@ async def handle_admin_message(message: dict[str, Any]) -> None:
         )
         return
 
+    if target_source == "reply":
+        clear_admin_state(admin_id)
+
     if is_blacklisted(target_chat_id):
         await send_message(
             admin_id,
@@ -2861,7 +2404,7 @@ async def handle_admin_message(message: dict[str, Any]) -> None:
     claim_result = claim_conversation(
         target_chat_id,
         admin_id,
-        activate_reply=target_source == "reply",
+        activate_reply=False,
     )
     if claim_result.status == "closed":
         await send_message(
@@ -2879,48 +2422,63 @@ async def handle_admin_message(message: dict[str, Any]) -> None:
         )
         return
 
+    admin_chat_id = int(message["chat"]["id"])
+    admin_message_id = int(message["message_id"])
+    delivery_status = prepare_admin_reply_delivery(
+        update_id,
+        admin_id,
+        admin_chat_id,
+        admin_message_id,
+        target_chat_id,
+        target_source,
+    )
+    if delivery_status == "sent":
+        await send_admin_reply_status(
+            admin_id, target_chat_id, target_source, duplicate=True
+        )
+        return
+    if delivery_status == "unknown":
+        await send_admin_reply_uncertain(admin_id, target_chat_id)
+        return
+    if delivery_status == "failed":
+        await send_message(
+            admin_id,
+            "上一轮发送已经明确失败。请检查原因后发送一条新的回复。",
+        )
+        return
+    if not mark_admin_reply_sending(admin_chat_id, admin_message_id):
+        await send_admin_reply_uncertain(admin_id, target_chat_id)
+        return
+
     delivery_result = await copy_message(
         target_chat_id,
-        int(message["chat"]["id"]),
-        int(message["message_id"]),
+        admin_chat_id,
+        admin_message_id,
     )
     if not delivery_result:
+        fail_admin_reply_delivery(
+            admin_chat_id, admin_message_id, delivery_result
+        )
         await send_message(admin_id, delivery_failure_message(delivery_result))
         return
-    if (
-        isinstance(delivery_result, TelegramSendResult)
-        and delivery_result.message_id is not None
-    ):
-        add_message_link(
+    try:
+        complete_admin_reply_delivery(
+            admin_chat_id,
+            admin_message_id,
             target_chat_id,
-            delivery_result.message_id,
-            int(message["chat"]["id"]),
-            int(message["message_id"]),
-            "admin_to_user",
-            "admin_reply",
+            admin_id,
+            target_source,
+            content,
+            message_kind(message),
+            delivery_result,
             message.get("message_thread_id"),
         )
-    add_message_log(
-        target_chat_id,
-        "admin",
-        admin_id,
-        content,
-        telegram_message_id=int(message["message_id"]),
-    )
-    mark_conversation_replied(target_chat_id)
-    add_admin_audit(
-        admin_id,
-        "message_sent",
-        target_chat_id,
-        f"type={message_kind(message)} route={target_source}",
-    )
-    await send_message(
-        admin_id,
-        "<b>消息已发送</b>\n\n"
-        f"目标用户：<code>{target_chat_id}</code>\n"
-        "回复模式仍然开启。",
-        reply_markup=exit_reply_keyboard(target_chat_id),
-    )
+    except Exception as exc:
+        with contextlib.suppress(Exception):
+            mark_admin_reply_unknown(admin_chat_id, admin_message_id, str(exc))
+        await send_admin_reply_uncertain(admin_id, target_chat_id)
+        return
+    await send_admin_reply_status(admin_id, target_chat_id, target_source)
 
 
 async def handle_callback(callback: dict[str, Any]) -> None:
@@ -2987,6 +2545,28 @@ async def handle_callback(callback: dict[str, Any]) -> None:
             page=page,
             callback=callback,
         )
+        return
+
+    if action == "delivery_retry":
+        if not is_owner(admin_id):
+            await answer_callback_query(callback_id, "仅负责人可重试投递")
+            return
+        if not raw_chat_id.isascii() or not raw_chat_id.isdigit():
+            await answer_callback_query(callback_id, "投递任务无效")
+            return
+        status = retry_admin_delivery(int(raw_chat_id))
+        if status == "pending":
+            if admin_delivery_wakeup:
+                admin_delivery_wakeup.set()
+            await answer_callback_query(callback_id, "已重新排队")
+            await send_message(
+                admin_id,
+                "投递已重新排队。若此前状态不确定，Telegram 中可能出现重复消息。",
+            )
+        elif status == "missing":
+            await answer_callback_query(callback_id, "投递任务不存在")
+        else:
+            await answer_callback_query(callback_id, f"任务当前状态：{status}")
         return
 
     if action in {"broadcast_confirm", "broadcast_cancel", "broadcast_retry"}:
@@ -3357,11 +2937,17 @@ async def healthz() -> dict[str, str | bool]:
         raise HTTPException(status_code=503, detail="db unavailable") from exc
     if broadcast_worker_task is None or broadcast_worker_task.done():
         raise HTTPException(status_code=503, detail="broadcast worker unavailable")
+    if admin_delivery_worker_task is None or admin_delivery_worker_task.done():
+        raise HTTPException(
+            status_code=503,
+            detail="administrator delivery worker unavailable",
+        )
     return {
         "ok": True,
         "version": APP_VERSION,
         "db": "ok",
         "broadcast_worker": "ok",
+        "admin_delivery_worker": "ok",
     }
 
 
@@ -3393,11 +2979,14 @@ async def telegram_webhook(
         raise HTTPException(status_code=400, detail="invalid update")
 
     update_id = update.get("update_id")
-    claimed = False
-    if isinstance(update_id, int):
-        if not claim_update(update_id):
-            return {"ok": True}
-        claimed = True
+    if not isinstance(update_id, int) or isinstance(update_id, bool):
+        raise HTTPException(status_code=400, detail="invalid update ID")
+    claim_status = claim_update(update_id)
+    if claim_status == "done":
+        return {"ok": True}
+    if claim_status == "processing":
+        raise HTTPException(status_code=503, detail="update is already processing")
+    claimed = True
 
     try:
         if "callback_query" in update:
@@ -3409,11 +2998,11 @@ async def telegram_webhook(
                 from_id = int(message["from"]["id"])
                 if is_admin(from_id):
                     if not edited:
-                        await handle_admin_message(message)
+                        await handle_admin_message(message, update_id)
                 elif edited:
-                    await handle_user_edited_message(message)
+                    await handle_user_edited_message(message, update_id)
                 else:
-                    await handle_user_message(message)
+                    await handle_user_message(message, update_id)
 
         if claimed:
             finish_update(update_id)

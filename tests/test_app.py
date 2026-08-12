@@ -73,14 +73,99 @@ class BotDatabaseTests(unittest.TestCase):
         return urlencode(fields)
 
     def test_failed_update_can_retry_but_done_update_cannot(self) -> None:
-        self.assertTrue(app.claim_update(100))
-        self.assertFalse(app.claim_update(100))
+        self.assertEqual(app.claim_update(100), "claimed")
+        self.assertEqual(app.claim_update(100), "processing")
 
         app.fail_update(100, "temporary failure")
-        self.assertTrue(app.claim_update(100))
+        self.assertEqual(app.claim_update(100), "claimed")
 
         app.finish_update(100)
-        self.assertFalse(app.claim_update(100))
+        self.assertEqual(app.claim_update(100), "done")
+
+    def test_interrupted_update_and_deliveries_recover_without_blind_replay(
+        self,
+    ) -> None:
+        self.assertEqual(app.claim_update(101), "claimed")
+        app.db_execute(
+            """
+            INSERT INTO admin_reply_deliveries (
+                admin_chat_id, admin_message_id, admin_id,
+                user_chat_id, route, status
+            ) VALUES (1, 10, 1, 20, 'reply', 'sending')
+            """
+        )
+
+        app.recover_interrupted_work()
+
+        self.assertEqual(app.claim_update(101), "claimed")
+        reply = app.db_fetchone(
+            "SELECT status FROM admin_reply_deliveries "
+            "WHERE admin_chat_id = 1 AND admin_message_id = 10"
+        )
+        self.assertEqual(reply["status"], "unknown")
+
+    def test_retention_cleanup_keeps_active_delivery_work(self) -> None:
+        old_timestamp = "2000-01-01 00:00:00"
+        for update_id, status in ((301, "sent"), (302, "pending")):
+            app.db_execute(
+                """
+                INSERT INTO inbound_events (
+                    update_id, chat_id, message_id, event_type, created_at
+                ) VALUES (?, ?, ?, 'message', ?)
+                """,
+                (update_id, update_id, update_id, old_timestamp),
+            )
+            app.db_execute(
+                """
+                INSERT INTO admin_deliveries (
+                    update_id, user_chat_id, source_message_id,
+                    admin_chat_id, delivery_kind, title, content_summary,
+                    status, updated_at, created_at
+                ) VALUES (?, ?, ?, 1, 'notification', 'title', 'content', ?, ?, ?)
+                """,
+                (
+                    update_id,
+                    update_id,
+                    update_id,
+                    status,
+                    old_timestamp,
+                    old_timestamp,
+                ),
+            )
+        app.db_execute(
+            """
+            INSERT INTO admin_reply_deliveries (
+                admin_chat_id, admin_message_id, admin_id,
+                user_chat_id, route, status, updated_at, created_at
+            ) VALUES (1, 401, 1, 301, 'reply', 'sent', ?, ?)
+            """,
+            (old_timestamp, old_timestamp),
+        )
+
+        with patch.object(app, "MESSAGE_RETENTION_DAYS", 180):
+            app.purge_expired_data()
+
+        self.assertIsNone(
+            app.db_fetchone("SELECT 1 FROM inbound_events WHERE update_id = 301")
+        )
+        self.assertIsNone(
+            app.db_fetchone(
+                "SELECT 1 FROM admin_deliveries WHERE update_id = 301"
+            )
+        )
+        self.assertIsNone(
+            app.db_fetchone(
+                "SELECT 1 FROM admin_reply_deliveries WHERE admin_message_id = 401"
+            )
+        )
+        self.assertIsNotNone(
+            app.db_fetchone("SELECT 1 FROM inbound_events WHERE update_id = 302")
+        )
+        self.assertIsNotNone(
+            app.db_fetchone(
+                "SELECT 1 FROM admin_deliveries WHERE update_id = 302"
+            )
+        )
 
     def test_legacy_schema_migrates_without_data_loss(self) -> None:
         for suffix in ("", "-wal", "-shm"):
@@ -143,6 +228,7 @@ class BotDatabaseTests(unittest.TestCase):
         self.assertEqual(update["status"], "done")
         self.assertIsNotNone(update["updated_at"])
         self.assertIn("sent_count", broadcast_columns)
+        self.assertIn("unknown_count", broadcast_columns)
         self.assertIn("unread_count", conversation_columns)
         self.assertIn("last_user_message_at", conversation_columns)
         self.assertIsNotNone(
@@ -280,9 +366,8 @@ class BotDatabaseTests(unittest.TestCase):
                 "send_message",
                 new=AsyncMock(return_value=True),
             ) as send_mock,
-            patch.object(app, "notify_admins", new=AsyncMock()) as notify_mock,
         ):
-            asyncio.run(app.handle_user_message(message))
+            asyncio.run(app.handle_user_message(message, 1001))
 
             self.assertEqual(send_mock.await_count, 1)
             reply_markup = send_mock.await_args.kwargs["reply_markup"]
@@ -290,7 +375,6 @@ class BotDatabaseTests(unittest.TestCase):
                 reply_markup["inline_keyboard"][0][0]["web_app"]["url"],
                 "https://bot.example.com/verify",
             )
-            notify_mock.assert_not_awaited()
             self.assertIsNone(
                 app.db_fetchone(
                     "SELECT id FROM message_logs WHERE chat_id = ?",
@@ -304,12 +388,16 @@ class BotDatabaseTests(unittest.TestCase):
             self.assertEqual(user["last_message"], "[等待人机验证]")
 
             send_mock.reset_mock()
-            asyncio.run(app.handle_user_message(message))
+            asyncio.run(app.handle_user_message(message, 1002))
             send_mock.assert_not_awaited()
 
             app.mark_user_verified(13)
-            asyncio.run(app.handle_user_message(message))
-            notify_mock.assert_awaited_once()
+            asyncio.run(app.handle_user_message(message, 1003))
+            delivery = app.db_fetchone(
+                "SELECT status FROM admin_deliveries WHERE update_id = ?",
+                (1003,),
+            )
+            self.assertEqual(delivery["status"], "pending")
 
     def test_failed_verification_prompt_can_be_retried_immediately(self) -> None:
         send_mock = AsyncMock(side_effect=[False, True])
@@ -445,6 +533,22 @@ class BotDatabaseTests(unittest.TestCase):
         self.assertEqual(app.get_admin_state(2), 30)
         self.assertEqual(app.get_conversation_owner(30), 2)
 
+    def test_expired_persistent_reply_state_is_deleted_before_routing(self) -> None:
+        app.set_admin_state(1, 31)
+        app.db_execute(
+            "UPDATE admin_states "
+            "SET updated_at = datetime('now', '-2 minutes') "
+            "WHERE admin_id = ?",
+            (1,),
+        )
+
+        with patch.object(app, "ADMIN_REPLY_STATE_TTL_SECONDS", 60):
+            self.assertIsNone(app.get_admin_state(1))
+
+        self.assertIsNone(
+            app.db_fetchone("SELECT 1 FROM admin_states WHERE admin_id = ?", (1,))
+        )
+
     def test_message_links_survive_database_reinitialization(self) -> None:
         app.add_message_link(
             user_chat_id=200,
@@ -495,15 +599,6 @@ class BotDatabaseTests(unittest.TestCase):
             "photo": [{"file_id": "photo"}],
             "caption": "mapped photo",
         }
-        app.upsert_user(user, app.message_content(source_message))
-        app.record_user_activity(201)
-        app.add_message_log(
-            201,
-            "user",
-            201,
-            app.message_content(source_message),
-            telegram_message_id=16,
-        )
         send = AsyncMock(
             return_value=app.TelegramSendResult(ok=True, message_id=600)
         )
@@ -516,13 +611,20 @@ class BotDatabaseTests(unittest.TestCase):
             patch.object(app, "send_message", send),
             patch.object(app, "copy_message", copy),
         ):
-            asyncio.run(
-                app.notify_admins(
+            self.assertTrue(
+                app.persist_user_event(
+                    2001,
                     user,
                     app.message_content(source_message),
-                    source_message=source_message,
+                    source_message,
+                    event_type="message",
+                    title="收到用户消息",
                 )
             )
+            first_delivery = app.claim_next_admin_delivery()
+            asyncio.run(app.process_admin_delivery(first_delivery))
+            second_delivery = app.claim_next_admin_delivery()
+            asyncio.run(app.process_admin_delivery(second_delivery))
 
         notification_link = app.get_message_link(1, 600)
         content_link = app.get_message_link(1, 601)
@@ -559,14 +661,22 @@ class BotDatabaseTests(unittest.TestCase):
             patch.object(app, "copy_message", copy),
             patch.object(app, "send_message", send),
         ):
-            asyncio.run(app.handle_admin_message(message))
+            asyncio.run(app.handle_admin_message(message, 2101))
+            asyncio.run(app.handle_admin_message(message, 2101))
 
         self.assertEqual(copy.await_args.args[0], 202)
-        self.assertEqual(app.get_admin_state(1), 202)
+        self.assertEqual(copy.await_count, 1)
+        self.assertIsNone(app.get_admin_state(1))
         self.assertEqual(app.get_conversation_owner(202), 1)
         reply_link = app.get_message_link(1, 701)
         self.assertEqual(int(reply_link["user_chat_id"]), 202)
         self.assertEqual(reply_link["direction"], "admin_to_user")
+        delivery = app.db_fetchone(
+            "SELECT status FROM admin_reply_deliveries "
+            "WHERE admin_chat_id = ? AND admin_message_id = ?",
+            (1, 701),
+        )
+        self.assertEqual(delivery["status"], "sent")
 
     def test_unmapped_native_reply_never_falls_back_to_stale_state(self) -> None:
         app.set_admin_state(1, 203)
@@ -591,8 +701,194 @@ class BotDatabaseTests(unittest.TestCase):
             asyncio.run(app.handle_admin_message(message))
 
         copy.assert_not_awaited()
-        self.assertEqual(app.get_admin_state(1), 203)
+        self.assertIsNone(app.get_admin_state(1))
         self.assertIn("无法识别回复对象", send.await_args.args[1])
+
+    def test_uncertain_admin_reply_is_not_automatically_replayed(self) -> None:
+        app.add_message_link(
+            user_chat_id=206,
+            user_message_id=30,
+            admin_chat_id=1,
+            admin_message_id=810,
+            direction="user_to_admin",
+            link_kind="notification",
+        )
+        message = {
+            "from": {"id": 1},
+            "chat": {"id": 1, "type": "private"},
+            "message_id": 811,
+            "text": "do not replay blindly",
+            "reply_to_message": {"message_id": 810},
+        }
+        copy = AsyncMock(
+            return_value=app.TelegramSendResult(
+                ok=False,
+                description="network result unknown",
+            )
+        )
+        send = AsyncMock(
+            return_value=app.TelegramSendResult(ok=True, message_id=812)
+        )
+
+        with (
+            patch.object(app, "copy_message", copy),
+            patch.object(app, "send_message", send),
+        ):
+            asyncio.run(app.handle_admin_message(message, 2102))
+            asyncio.run(app.handle_admin_message(message, 2102))
+
+        self.assertEqual(copy.await_count, 1)
+        delivery = app.db_fetchone(
+            "SELECT status, last_error FROM admin_reply_deliveries "
+            "WHERE admin_chat_id = ? AND admin_message_id = ?",
+            (1, 811),
+        )
+        self.assertEqual(delivery["status"], "unknown")
+        self.assertIn("network result unknown", delivery["last_error"])
+        self.assertIn("投递结果不确定", send.await_args.args[1])
+
+    def test_inbound_event_and_admin_outbox_are_idempotent(self) -> None:
+        user = {"id": 207, "username": "once", "first_name": "Once"}
+        source_message = {
+            "from": user,
+            "chat": {"id": 207, "type": "private"},
+            "message_id": 40,
+            "photo": [{"file_id": "photo"}],
+            "caption": "persist once",
+        }
+
+        with patch.object(app, "ADMIN_IDS", {1, 2}):
+            first = app.persist_user_event(
+                2103,
+                user,
+                app.message_content(source_message),
+                source_message,
+                event_type="message",
+                title="收到用户消息",
+            )
+            duplicate = app.persist_user_event(
+                2103,
+                user,
+                app.message_content(source_message),
+                source_message,
+                event_type="message",
+                title="收到用户消息",
+            )
+
+        self.assertTrue(first)
+        self.assertFalse(duplicate)
+        self.assertEqual(
+            int(app.db_fetchone("SELECT COUNT(*) AS count FROM inbound_events")["count"]),
+            1,
+        )
+        self.assertEqual(
+            int(app.db_fetchone("SELECT COUNT(*) AS count FROM message_logs")["count"]),
+            1,
+        )
+        self.assertEqual(
+            int(app.db_fetchone("SELECT COUNT(*) AS count FROM admin_deliveries")["count"]),
+            4,
+        )
+        conversation = app.get_conversation(207)
+        self.assertEqual(int(conversation["unread_count"]), 1)
+
+    def test_unknown_admin_outbox_delivery_requires_manual_retry(self) -> None:
+        user = {"id": 208, "first_name": "Retry"}
+        source_message = {
+            "from": user,
+            "chat": {"id": 208, "type": "private"},
+            "message_id": 41,
+            "text": "uncertain notification",
+        }
+        with patch.object(app, "ADMIN_IDS", {1}):
+            self.assertTrue(
+                app.persist_user_event(
+                    2104,
+                    user,
+                    app.message_content(source_message),
+                    source_message,
+                    event_type="message",
+                    title="收到用户消息",
+                )
+            )
+
+        delivery = app.claim_next_admin_delivery()
+        unknown_result = app.TelegramSendResult(
+            ok=False,
+            description="connection closed before response",
+        )
+        self.assertEqual(
+            app.defer_or_fail_admin_delivery(delivery, unknown_result),
+            "unknown",
+        )
+        failed_delivery = app.claim_unalerted_admin_delivery()
+        self.assertEqual(int(failed_delivery["id"]), int(delivery["id"]))
+
+        with (
+            patch.object(app, "OWNER_IDS", {1}),
+            patch.object(app, "send_message", new=AsyncMock(return_value=False)),
+        ):
+            alerted = asyncio.run(app.alert_admin_delivery_failure(failed_delivery))
+        self.assertFalse(alerted)
+        app.defer_admin_delivery_alert(failed_delivery)
+        alert_state = app.db_fetchone(
+            "SELECT alerted_at, alert_attempts, alert_next_attempt_at "
+            "FROM admin_deliveries WHERE id = ?",
+            (delivery["id"],),
+        )
+        self.assertIsNone(alert_state["alerted_at"])
+        self.assertEqual(int(alert_state["alert_attempts"]), 1)
+        self.assertGreater(int(alert_state["alert_next_attempt_at"]), int(time.time()))
+        self.assertIsNone(app.claim_unalerted_admin_delivery())
+
+        self.assertEqual(app.retry_admin_delivery(int(delivery["id"])), "pending")
+        retried = app.claim_next_admin_delivery()
+        self.assertEqual(int(retried["id"]), int(delivery["id"]))
+        self.assertEqual(retried["status"], "sending")
+
+    def test_server_errors_are_not_automatically_replayed(self) -> None:
+        user = {"id": 209, "first_name": "Uncertain"}
+        source_message = {
+            "from": user,
+            "chat": {"id": 209, "type": "private"},
+            "message_id": 42,
+            "text": "server error",
+        }
+        with patch.object(app, "ADMIN_IDS", {1}):
+            self.assertTrue(
+                app.persist_user_event(
+                    2105,
+                    user,
+                    app.message_content(source_message),
+                    source_message,
+                    event_type="message",
+                    title="收到用户消息",
+                )
+            )
+
+        delivery = app.claim_next_admin_delivery()
+        server_error = app.TelegramSendResult(
+            ok=False,
+            status_code=502,
+            description="bad gateway",
+        )
+        self.assertEqual(
+            app.defer_or_fail_admin_delivery(delivery, server_error),
+            "unknown",
+        )
+        self.assertIsNone(app.claim_next_admin_delivery())
+
+        self.assertEqual(
+            app.prepare_admin_reply_delivery(2106, 1, 1, 99, 209, "reply"),
+            "pending",
+        )
+        self.assertTrue(app.mark_admin_reply_sending(1, 99))
+        app.fail_admin_reply_delivery(1, 99, server_error)
+        reply = app.db_fetchone(
+            "SELECT status FROM admin_reply_deliveries "
+            "WHERE admin_chat_id = 1 AND admin_message_id = 99"
+        )
+        self.assertEqual(reply["status"], "unknown")
 
     def test_atomic_claim_allows_only_one_admin(self) -> None:
         barrier = threading.Barrier(2)
@@ -836,7 +1132,7 @@ class BotDatabaseTests(unittest.TestCase):
         self.assertIn("<b>11.", queue_text)
         self.assertEqual(
             queue_keyboard["inline_keyboard"][0][0]["text"],
-            "11 回复",
+            "11 持续回复",
         )
         queue_callbacks = {
             button["callback_data"]
@@ -1280,6 +1576,12 @@ class BotDatabaseTests(unittest.TestCase):
             self.assertEqual(health.status_code, 200)
             self.assertTrue(health.json()["ok"])
             self.assertEqual(health.json()["version"], app.APP_VERSION)
+
+            self.assertEqual(app.claim_update(203), "claimed")
+            in_progress = client.post(
+                "/tg/webhook", json={"update_id": 203}, headers=headers
+            )
+            self.assertEqual(in_progress.status_code, 503)
 
             failed = client.post(
                 "/tg/webhook",
