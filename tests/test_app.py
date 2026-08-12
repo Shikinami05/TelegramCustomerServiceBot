@@ -1338,7 +1338,11 @@ class BotDatabaseTests(unittest.TestCase):
 
         reply_buttons = app.exit_reply_keyboard(123)["inline_keyboard"][0]
         self.assertEqual(reply_buttons[0]["text"], "退出回复")
-        self.assertEqual(reply_buttons[0]["style"], "danger")
+        continue_button = app.admin_user_keyboard(
+            123,
+            viewer_admin_id=1,
+        )["inline_keyboard"][0][0]
+        self.assertEqual(reply_buttons[0]["style"], continue_button["style"])
         self.assertEqual(reply_buttons[1]["style"], "success")
 
         with self.assertRaises(ValueError):
@@ -1432,13 +1436,26 @@ class BotDatabaseTests(unittest.TestCase):
             ]
         )
         with patch.object(app, "tg", tg_mock):
-            sent = asyncio.run(app.send_message(1, "hello"))
+            sent = asyncio.run(
+                app.send_message(
+                    1,
+                    "hello",
+                    reply_markup=app.exit_reply_keyboard(123),
+                )
+            )
             copied = asyncio.run(app.copy_message(1, 2, 3))
             rejected = asyncio.run(app.send_message(1, "blocked"))
 
         self.assertTrue(sent)
         self.assertEqual(sent.message_id, 301)
         self.assertEqual(sent.message_thread_id, 9)
+        sent_markup = tg_mock.await_args_list[0].args[1]["reply_markup"]
+        sent_exit_button = sent_markup["inline_keyboard"][0][0]
+        continue_button = app.admin_user_keyboard(
+            123,
+            viewer_admin_id=1,
+        )["inline_keyboard"][0][0]
+        self.assertEqual(sent_exit_button["style"], continue_button["style"])
         self.assertEqual(copied.message_id, 302)
         self.assertFalse(rejected)
         self.assertEqual(rejected.status_code, 403)

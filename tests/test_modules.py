@@ -366,7 +366,7 @@ class BroadcastServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class KeyboardModuleTests(unittest.TestCase):
-    def test_keyboard_styles_and_callback_values_are_preserved(self) -> None:
+    def test_reply_mode_actions_share_the_same_style(self) -> None:
         markup = keyboards.admin_user_keyboard(
             123,
             blacklisted=False,
@@ -390,10 +390,27 @@ class KeyboardModuleTests(unittest.TestCase):
         self.assertEqual(
             owned_markup["inline_keyboard"][0][0]["text"], "持续回复"
         )
+        continue_button = owned_markup["inline_keyboard"][0][0]
 
         exit_button = keyboards.exit_reply_keyboard(123)["inline_keyboard"][0][0]
         self.assertEqual(exit_button["callback_data"], "cancel:123")
-        self.assertEqual(exit_button["style"], "danger")
+        self.assertEqual(exit_button["style"], continue_button["style"])
+        self.assertEqual(
+            exit_button["style"],
+            keyboards.REPLY_MODE_BUTTON_STYLE,
+        )
+
+        queue_markup = keyboards.conversation_queue_keyboard(
+            [{"chat_id": 123, "owner_admin_id": 8}],
+            "inbox",
+            viewer_admin_id=8,
+            page=1,
+            total_pages=1,
+            page_size=10,
+            counts={"inbox": 1, "pending": 0, "closed": 0},
+        )
+        queue_button = queue_markup["inline_keyboard"][0][0]
+        self.assertEqual(queue_button["style"], continue_button["style"])
 
     def test_pagination_and_verification_buttons_are_stable(self) -> None:
         navigation = keyboards.pagination_navigation_row("queue:inbox", 2, 3)

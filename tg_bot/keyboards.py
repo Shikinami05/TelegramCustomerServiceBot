@@ -3,6 +3,7 @@ from typing import Any
 
 ButtonSpec = tuple[str, str] | tuple[str, str, str]
 INLINE_BUTTON_STYLES = {"primary", "success", "danger"}
+REPLY_MODE_BUTTON_STYLE = "primary"
 
 
 def inline_keyboard(rows: list[list[ButtonSpec]]) -> dict[str, Any]:
@@ -60,7 +61,11 @@ def admin_user_keyboard(
     if owner_admin_id and viewer_admin_id and owner_admin_id != viewer_admin_id:
         reply_button: ButtonSpec = ("接管", f"takeover:{chat_id}", "primary")
     else:
-        reply_button = ("持续回复", f"reply:{chat_id}", "primary")
+        reply_button = (
+            "持续回复",
+            f"reply:{chat_id}",
+            REPLY_MODE_BUTTON_STYLE,
+        )
     return inline_keyboard(
         [
             [
@@ -190,7 +195,7 @@ def conversation_queue_keyboard(
             primary_button = (
                 f"{index} 持续回复",
                 f"reply:{chat_id}",
-                "primary",
+                REPLY_MODE_BUTTON_STYLE,
             )
         keyboard_rows.append(
             [
@@ -209,7 +214,11 @@ def exit_reply_keyboard(chat_id: int) -> dict[str, Any]:
     return inline_keyboard(
         [
             [
-                ("退出回复", f"cancel:{chat_id}", "danger"),
+                (
+                    "退出回复",
+                    f"cancel:{chat_id}",
+                    REPLY_MODE_BUTTON_STYLE,
+                ),
                 ("标记已处理", f"resolve:{chat_id}", "success"),
             ],
             [("用户详情", f"detail:{chat_id}")],
