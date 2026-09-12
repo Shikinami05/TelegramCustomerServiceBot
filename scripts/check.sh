@@ -13,7 +13,7 @@ cd "$PROJECT_DIR"
 "$PYTHON_BIN" -m compileall -q tg_bot
 "$PYTHON_BIN" -m py_compile \
     app.py scripts/manage_webhook.py scripts/manage_backup.py \
-    scripts/manage_turnstile.py
+    scripts/manage_moderation.py
 "$PYTHON_BIN" -m unittest discover -s tests -v
 
 if curl --fail --silent --show-error http://127.0.0.1:9000/healthz; then
@@ -22,3 +22,4 @@ if curl --fail --silent --show-error http://127.0.0.1:9000/healthz; then
 else
     echo "Service is not running yet; code checks passed."
 fi
+

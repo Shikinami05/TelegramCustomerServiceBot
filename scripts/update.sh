@@ -223,7 +223,7 @@ runuser -u "$APP_USER" -- \
 runuser -u "$APP_USER" -- "$PYTHON_BIN" -m compileall -q tg_bot
 runuser -u "$APP_USER" -- "$PYTHON_BIN" -m py_compile \
     app.py scripts/manage_webhook.py scripts/manage_backup.py \
-    scripts/manage_turnstile.py
+    scripts/manage_moderation.py
 runuser -u "$APP_USER" -- "$PYTHON_BIN" -m unittest discover -s tests -v
 runuser -u "$APP_USER" -- bash scripts/version.sh --short
 
@@ -250,3 +250,4 @@ if ! runuser -u "$APP_USER" -- \
 fi
 
 echo "Update complete: $TARGET_LABEL ($TARGET_COMMIT)"
+

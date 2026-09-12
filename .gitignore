@@ -1,5 +1,6 @@
 .env
 .env.*
+.moderation-*
 !.env.example
 *.db
 *.db-*
@@ -17,3 +18,4 @@ __pycache__/
 .coverage
 htmlcov/
 *.log
+

@@ -50,10 +50,9 @@ class DeploymentConfigTests(unittest.TestCase):
             "return 301 https://$host:8443$request_uri;",
             rendered,
         )
-        self.assertIn("location = /verify", template)
-        self.assertIn("location = /verify/complete", template)
+        self.assertNotIn("location = /verify", template)
+        self.assertNotIn("location = /verify/complete", template)
         self.assertIn("client_max_body_size 1m", template)
-        self.assertIn("client_max_body_size 16k", template)
         self.assertNotIn("location = /healthz", template)
 
     def test_updates_refresh_scoped_command_menus(self) -> None:
@@ -70,22 +69,13 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn("ADMIN_REPLY_STATE_TTL_SECONDS=1800", script)
         self.assertIn("BROADCAST_RATE_LIMIT_RETRIES=3", script)
         self.assertIn("DISPLAY_TIMEZONE=Asia/Hong_Kong", script)
-        self.assertIn("Enable Cloudflare Turnstile", script)
-        self.assertIn("TURNSTILE_ENABLED=%s", script)
-        self.assertIn("TURNSTILE_SECRET_KEY=%s", script)
-        self.assertIn("TURNSTILE_VERIFY_URL=%s", script)
-
+        self.assertIn("Enable DeepSeek ad review", script)
+        self.assertIn("AI_MODERATION_ENABLED=false", script)
+        self.assertIn("MODERATION_DAILY_LIMIT=500", script)
+        self.assertNotIn("TURNSTILE_", script)
         nginx_script = (
             PROJECT_DIR / "scripts" / "configure-nginx.sh"
         ).read_text(encoding="utf-8")
-        self.assertIn(
-            'TURNSTILE_VERIFY_URL_VALUE="https://${DOMAIN_NAME}/verify"',
-            nginx_script,
-        )
-        self.assertIn(
-            'TURNSTILE_VERIFY_URL_VALUE="https://${DOMAIN_NAME}:${HTTPS_PORT}/verify"',
-            nginx_script,
-        )
         self.assertIn('systemctl restart "$SERVICE_NAME"', nginx_script)
 
     def test_one_line_installer_and_management_command_are_wired(self) -> None:
@@ -119,12 +109,13 @@ class DeploymentConfigTests(unittest.TestCase):
             "logs)",
             "version)",
             "webhook)",
-            "turnstile)",
+            "moderation)",
             "configure)",
         ):
             self.assertIn(subcommand, command)
         self.assertIn("--kind manual", command)
-        self.assertIn("manage_turnstile.py", command)
+        self.assertIn("manage_moderation.py", command)
+        self.assertNotIn("nginx -T", command)
         self.assertIn("restoring the previous .env", command)
 
     def test_release_install_update_and_rollback_controls_exist(self) -> None:
@@ -175,8 +166,9 @@ class DeploymentConfigTests(unittest.TestCase):
         )
         self.assertIn('gh release create "${RELEASE_TAG}"', workflow)
         self.assertIn("does not match VERSION", release_script)
-        self.assertIn("scripts/manage_turnstile.py", release_script)
+        self.assertIn("scripts/manage_moderation.py", release_script)
 
 
 if __name__ == "__main__":
     unittest.main()
+
