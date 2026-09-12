@@ -130,7 +130,7 @@ if [[ ! -f "$PROJECT_DIR/.env" ]]; then
     read -r -p "Enable DeepSeek ad review (shares message text; API charges apply)? [y/N]: " AI_CHOICE
     case "${AI_CHOICE,,}" in
         y|yes)
-            runuser -u "$APP_USER" -- "$PROJECT_DIR/venv/bin/python" \\
+            runuser -u "$APP_USER" -- "$PROJECT_DIR/venv/bin/python" \
                 "$SCRIPT_DIR/manage_moderation.py" enable
             ;;
         ""|n|no) ;;
@@ -174,4 +174,3 @@ install -o root -g root -m 755 \
 echo
 echo "Bot service installation complete."
 echo "Next: sudo tg-bot configure DOMAIN EMAIL [443|8443]"
-
