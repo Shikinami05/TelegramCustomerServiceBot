@@ -1325,11 +1325,14 @@ def admin_user_keyboard(chat_id: int, viewer_admin_id: int | None = None) -> dic
     )
 
 
-def admin_dashboard_keyboard() -> dict[str, Any]:
+def admin_dashboard_keyboard(admin_id: int | None = None) -> dict[str, Any]:
     counts = get_queue_counts()
     row = db_fetchone("SELECT COUNT(*) AS count FROM moderation_jobs WHERE status='held'")
     counts["moderation"] = int(row["count"]) if row else 0
-    return keyboards.admin_dashboard_keyboard(counts)
+    return keyboards.admin_dashboard_keyboard(
+        counts,
+        show_ai_settings=admin_id is not None and is_owner(admin_id),
+    )
 
 
 def pagination_navigation_row(
@@ -1421,7 +1424,7 @@ async def show_admin_dashboard(
     await present_admin_view(
         admin_id,
         format_admin_dashboard(admin_id),
-        admin_dashboard_keyboard(),
+        admin_dashboard_keyboard(admin_id),
         callback,
     )
 
@@ -2382,7 +2385,7 @@ async def handle_admin_message(message: dict[str, Any], update_id: int | None = 
         await send_message(
             admin_id,
             "<b>未知管理员指令</b>\n\n请从命令菜单选择，或返回工作台。",
-            reply_markup=admin_dashboard_keyboard(),
+            reply_markup=admin_dashboard_keyboard(admin_id),
         )
         return
 
@@ -2394,7 +2397,7 @@ async def handle_admin_message(message: dict[str, Any], update_id: int | None = 
             "<b>无法识别回复对象</b>\n\n"
             "这条被回复的消息没有用户映射。为防止发错人，本次消息没有发送。\n"
             "请 Reply 用户通知，或点击下方“持续回复”后重试。",
-            reply_markup=admin_dashboard_keyboard(),
+            reply_markup=admin_dashboard_keyboard(admin_id),
         )
         return
     if not target_chat_id:
@@ -2402,7 +2405,7 @@ async def handle_admin_message(message: dict[str, Any], update_id: int | None = 
             admin_id,
             "<b>尚未选择回复对象</b>\n\n"
             "请从待处理队列选择用户，或使用 /reply 用户ID 内容。",
-            reply_markup=admin_dashboard_keyboard(),
+            reply_markup=admin_dashboard_keyboard(admin_id),
         )
         return
 
