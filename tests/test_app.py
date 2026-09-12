@@ -767,6 +767,24 @@ class BotDatabaseTests(unittest.TestCase):
         self.assertIn("<b>留言工作台</b>", dashboard)
         self.assertIn("待处理：<b>1</b>", dashboard)
 
+        previous_owners = app.OWNER_IDS
+        try:
+            app.OWNER_IDS = {1}
+            owner_callbacks = {
+                button["callback_data"]
+                for row in app.admin_dashboard_keyboard(1)["inline_keyboard"]
+                for button in row
+            }
+            admin_callbacks = {
+                button["callback_data"]
+                for row in app.admin_dashboard_keyboard(2)["inline_keyboard"]
+                for button in row
+            }
+        finally:
+            app.OWNER_IDS = previous_owners
+        self.assertIn("ai:panel", owner_callbacks)
+        self.assertNotIn("ai:panel", admin_callbacks)
+
         rows = app.get_conversation_queue("inbox")
         queue_text = app.format_conversation_queue("inbox", rows)
         queue_keyboard = app.conversation_queue_keyboard(
