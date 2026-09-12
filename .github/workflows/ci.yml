@@ -24,5 +24,6 @@ jobs:
       - run: bash -n scripts/*.sh
       - run: bash tests/test_scripts.sh
       - run: python -m compileall -q tg_bot
-      - run: python -m py_compile app.py scripts/manage_webhook.py scripts/manage_backup.py scripts/manage_turnstile.py
+      - run: python -m py_compile app.py scripts/manage_webhook.py scripts/manage_backup.py scripts/manage_moderation.py
       - run: python -m unittest discover -s tests -v
+

@@ -12,6 +12,7 @@ USER_COMMANDS = [
 ]
 
 ADMIN_COMMANDS = [
+    {"command": "moderation", "description": "查看广告审核待处理消息"},
     {"command": "start", "description": "打开留言工作台"},
     {"command": "inbox", "description": "查看待处理消息"},
     {"command": "pending", "description": "查看超时待处理消息"},
@@ -29,6 +30,7 @@ ADMIN_COMMANDS = [
 ]
 
 OWNER_COMMANDS = ADMIN_COMMANDS + [
+    {"command": "ai", "description": "管理 DeepSeek 密钥、模型和审核开关"},
     {"command": "broadcast", "description": "创建群发任务：内容"},
     {"command": "broadcast_status", "description": "查看最近群发进度"},
     {"command": "broadcast_retry", "description": "重试群发失败用户：任务ID"},
@@ -171,3 +173,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

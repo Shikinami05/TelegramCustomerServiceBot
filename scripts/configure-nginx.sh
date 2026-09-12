@@ -142,23 +142,14 @@ fi
 
 if [[ "$HTTPS_PORT" == "443" ]]; then
     WEBHOOK_URL_VALUE="https://${DOMAIN_NAME}/tg/webhook"
-    TURNSTILE_VERIFY_URL_VALUE="https://${DOMAIN_NAME}/verify"
 else
     WEBHOOK_URL_VALUE="https://${DOMAIN_NAME}:${HTTPS_PORT}/tg/webhook"
-    TURNSTILE_VERIFY_URL_VALUE="https://${DOMAIN_NAME}:${HTTPS_PORT}/verify"
 fi
 
 if grep -q '^WEBHOOK_URL=' "$ENV_FILE"; then
     sed -i "s|^WEBHOOK_URL=.*$|WEBHOOK_URL=$WEBHOOK_URL_VALUE|" "$ENV_FILE"
 else
     printf '\nWEBHOOK_URL=%s\n' "$WEBHOOK_URL_VALUE" >> "$ENV_FILE"
-fi
-if grep -q '^TURNSTILE_VERIFY_URL=' "$ENV_FILE"; then
-    sed -i \
-        "s|^TURNSTILE_VERIFY_URL=.*$|TURNSTILE_VERIFY_URL=$TURNSTILE_VERIFY_URL_VALUE|" \
-        "$ENV_FILE"
-else
-    printf 'TURNSTILE_VERIFY_URL=%s\n' "$TURNSTILE_VERIFY_URL_VALUE" >> "$ENV_FILE"
 fi
 chown "$APP_USER:$APP_USER" "$ENV_FILE"
 chmod 600 "$ENV_FILE"
@@ -183,3 +174,4 @@ echo "Public webhook: $WEBHOOK_URL_VALUE"
 if [[ "$HTTPS_PORT" == "8443" ]]; then
     echo "Ensure TCP port 8443 is allowed by UFW and the VPS provider firewall."
 fi
+

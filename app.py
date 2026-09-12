@@ -1,6 +1,5 @@
 import asyncio
 import contextlib
-import hashlib
 import hmac
 import html
 import json
@@ -14,16 +13,14 @@ from contextlib import AbstractContextManager, asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
 
 from tg_bot.config import (
+    Settings,
     load_display_timezone,
     load_settings,
-    turnstile_verify_hostname,
 )
 from tg_bot import database, keyboards
 from tg_bot.keyboards import ButtonSpec
@@ -34,10 +31,13 @@ from tg_bot.repositories import conversations as conversation_repository
 from tg_bot.repositories import deliveries as delivery_repository
 from tg_bot.repositories import inbound as inbound_repository
 from tg_bot.repositories import messages as message_repository
+from tg_bot.repositories import moderation as moderation_repository
 from tg_bot.repositories import updates as update_repository
 from tg_bot.repositories import users as user_repository
 from tg_bot.services import admin_delivery as admin_delivery_service
 from tg_bot.services import broadcast as broadcast_service
+from tg_bot.services import moderation as moderation_service
+from tg_bot.services.ai_settings import AISettingsController
 from tg_bot.telegram import TelegramAPIError, request as telegram_request
 from tg_bot.text import escape_html_limited, html_to_plain_text, truncate_text
 
@@ -65,14 +65,7 @@ ADMIN_REPLY_STATE_TTL_SECONDS = SETTINGS.admin_reply_state_ttl_seconds
 TELEGRAM_INLINE_RETRY_MAX_SECONDS = SETTINGS.telegram_inline_retry_max_seconds
 BROADCAST_RATE_LIMIT_RETRIES = SETTINGS.broadcast_rate_limit_retries
 WEBHOOK_MAX_BODY_BYTES = 1024 * 1024
-TURNSTILE_ENABLED = SETTINGS.turnstile_enabled
-TURNSTILE_SITE_KEY = SETTINGS.turnstile_site_key
-TURNSTILE_SECRET_KEY = SETTINGS.turnstile_secret_key
-TURNSTILE_VERIFY_URL = SETTINGS.turnstile_verify_url
-TURNSTILE_VERIFY_DAYS = SETTINGS.turnstile_verify_days
-TURNSTILE_INIT_DATA_MAX_AGE_SECONDS = (
-    SETTINGS.turnstile_init_data_max_age_seconds
-)
+AI_MODERATION_ENABLED = SETTINGS.ai_moderation_enabled
 DISPLAY_TIMEZONE_NAME = SETTINGS.display_timezone_name
 DISPLAY_TIMEZONE = SETTINGS.display_timezone
 LOG_LEVEL = SETTINGS.log_level
@@ -80,14 +73,6 @@ DB_PATH = SETTINGS.db_path
 DB_BACKUP_DIR = SETTINGS.db_backup_dir
 API_BASE = SETTINGS.api_base
 APP_VERSION = SETTINGS.app_version
-TURNSTILE_VERIFY_ACTION = "telegram_verify"
-TURNSTILE_SITEVERIFY_URL = (
-    "https://challenges.cloudflare.com/turnstile/v0/siteverify"
-)
-TURNSTILE_PAGE_TEMPLATE = (
-    BASE_DIR / "templates" / "turnstile.html"
-).read_text(encoding="utf-8")
-
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -104,15 +89,21 @@ broadcast_worker_task: asyncio.Task[None] | None = None
 broadcast_wakeup: asyncio.Event | None = None
 admin_delivery_worker_task: asyncio.Task[None] | None = None
 admin_delivery_wakeup: asyncio.Event | None = None
+moderation_worker_task: asyncio.Task[None] | None = None
+moderation_wakeup: asyncio.Event | None = None
+ai_settings_controller: AISettingsController | None = None
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global telegram_client, backup_task, broadcast_worker_task, broadcast_wakeup
     global admin_delivery_worker_task, admin_delivery_wakeup
+    global moderation_worker_task, moderation_wakeup, ai_settings_controller
 
     init_db()
+    ai_settings_controller = None
     recover_interrupted_work()
+    moderation_repository.recover(DB_PATH)
     purge_expired_data()
     try:
         await asyncio.to_thread(backup_database)
@@ -125,6 +116,13 @@ async def lifespan(_: FastAPI):
     )
     broadcast_wakeup = asyncio.Event()
     admin_delivery_wakeup = asyncio.Event()
+    moderation_wakeup = asyncio.Event()
+    moderation_worker_task = asyncio.create_task(
+        moderation_service.run_worker(
+            DB_PATH, lambda: SETTINGS, ADMIN_IDS, moderation_wakeup,
+            admin_delivery_wakeup, notify_moderation_pending, logger,
+        ), name="moderation-worker",
+    )
     backup_task = asyncio.create_task(periodic_db_backup(), name="database-backup")
     broadcast_worker_task = asyncio.create_task(
         periodic_broadcast_worker(), name="broadcast-worker"
@@ -137,6 +135,7 @@ async def lifespan(_: FastAPI):
         yield
     finally:
         for task in (
+            moderation_worker_task,
             admin_delivery_worker_task,
             broadcast_worker_task,
             backup_task,
@@ -144,6 +143,7 @@ async def lifespan(_: FastAPI):
             if task:
                 task.cancel()
         for task in (
+            moderation_worker_task,
             admin_delivery_worker_task,
             broadcast_worker_task,
             backup_task,
@@ -162,11 +162,6 @@ WELCOME_TEXT = (
     "<b>统一留言聊天入口</b>\n\n"
     "请直接在这里发送消息，我看到后会通过 Bot 回复你。"
 )
-VERIFICATION_REQUIRED_TEXT = (
-    "<b>发送留言前需要完成人机验证</b>\n\n"
-    "验证只用于拦截自动化垃圾消息，完成后即可正常留言。"
-)
-
 QUEUE_LABELS = {
     "inbox": "待处理",
     "pending": "超时",
@@ -191,6 +186,9 @@ AUDIT_ACTION_LABELS = {
     "conversation_reopened": "重新打开",
     "blacklist_add": "加入黑名单",
     "blacklist_remove": "解除黑名单",
+    "moderation_allow": "审核放行",
+    "moderation_block": "广告封禁",
+    "ai_settings": "AI 配置更新",
     "broadcast_created": "创建群发",
     "broadcast_confirmed": "确认群发",
     "broadcast_canceled": "取消群发",
@@ -263,7 +261,7 @@ def purge_expired_data() -> None:
             conn.execute(
                 """
                 DELETE FROM admin_reply_deliveries
-                WHERE status IN ('sent', 'failed', 'unknown')
+                WHERE status IN ('sent', 'failed', 'unknown', 'canceled')
                   AND updated_at < datetime('now', ?)
                 """,
                 (f"-{MESSAGE_RETENTION_DAYS} days",),
@@ -271,7 +269,7 @@ def purge_expired_data() -> None:
             conn.execute(
                 """
                 DELETE FROM admin_deliveries
-                WHERE status IN ('sent', 'failed', 'unknown')
+                WHERE status IN ('sent', 'failed', 'unknown', 'canceled')
                   AND updated_at < datetime('now', ?)
                 """,
                 (f"-{MESSAGE_RETENTION_DAYS} days",),
@@ -285,6 +283,12 @@ def purge_expired_data() -> None:
                       WHERE admin_deliveries.update_id = inbound_events.update_id
                   )
                 """,
+                (f"-{MESSAGE_RETENTION_DAYS} days",),
+            )
+            conn.execute(
+                "DELETE FROM moderation_jobs WHERE status IN ('approved','blocked','superseded') "
+                "AND updated_at < datetime('now', ?) "
+                "AND NOT EXISTS (SELECT 1 FROM admin_deliveries d WHERE d.update_id=moderation_jobs.update_id)",
                 (f"-{MESSAGE_RETENTION_DAYS} days",),
             )
         conn.execute(
@@ -330,12 +334,11 @@ def purge_expired_data() -> None:
             "DELETE FROM user_rate_limits WHERE window_started_at < ?",
             (int(time.time()) - 7 * 86400,),
         )
+        conn.execute("DELETE FROM moderation_usage WHERE day < date('now', '-30 days')")
         conn.execute(
-            """
-            DELETE FROM user_verifications
-            WHERE expires_at IS NOT NULL
-              AND expires_at <= CURRENT_TIMESTAMP
-            """
+            "DELETE FROM moderation_jobs WHERE status IN ('blocked','superseded') "
+            "AND updated_at < datetime('now','-30 days') "
+            "AND update_id NOT IN (SELECT update_id FROM admin_deliveries)"
         )
         conn.commit()
 
@@ -920,122 +923,6 @@ def unblacklist_user(chat_id: int) -> None:
     access_repository.unblacklist(DB_PATH, chat_id)
 
 
-def is_user_verified(chat_id: int) -> bool:
-    if not TURNSTILE_ENABLED or is_admin(chat_id):
-        return True
-    return access_repository.is_verified(DB_PATH, chat_id)
-
-
-def claim_verification_prompt(chat_id: int) -> bool:
-    return access_repository.claim_verification_prompt(DB_PATH, chat_id)
-
-
-def release_verification_prompt(chat_id: int) -> None:
-    access_repository.release_verification_prompt(DB_PATH, chat_id)
-
-
-def mark_user_verified(chat_id: int) -> None:
-    access_repository.mark_verified(DB_PATH, chat_id, TURNSTILE_VERIFY_DAYS)
-
-
-def validate_telegram_init_data(init_data: str) -> int:
-    if not init_data or len(init_data) > 8192:
-        raise ValueError("invalid init data length")
-    try:
-        pairs = parse_qsl(init_data, keep_blank_values=True, strict_parsing=True)
-    except ValueError as exc:
-        raise ValueError("invalid init data") from exc
-
-    fields: dict[str, str] = {}
-    for key, value in pairs:
-        if key in fields:
-            raise ValueError("duplicate init data field")
-        fields[key] = value
-
-    received_hash = fields.pop("hash", "")
-    if len(received_hash) != 64:
-        raise ValueError("invalid init data hash")
-    data_check_string = "\n".join(
-        f"{key}={fields[key]}" for key in sorted(fields)
-    )
-    secret_key = hmac.new(
-        b"WebAppData",
-        BOT_TOKEN.encode("utf-8"),
-        hashlib.sha256,
-    ).digest()
-    calculated_hash = hmac.new(
-        secret_key,
-        data_check_string.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    if not hmac.compare_digest(calculated_hash, received_hash.lower()):
-        raise ValueError("invalid init data signature")
-
-    try:
-        auth_date = int(fields["auth_date"])
-    except (KeyError, ValueError) as exc:
-        raise ValueError("invalid auth date") from exc
-    now = int(time.time())
-    if (
-        auth_date > now + 60
-        or now - auth_date > TURNSTILE_INIT_DATA_MAX_AGE_SECONDS
-    ):
-        raise ValueError("expired init data")
-
-    try:
-        user = json.loads(fields["user"])
-        chat_id = user["id"]
-    except (KeyError, TypeError, json.JSONDecodeError) as exc:
-        raise ValueError("invalid Telegram user") from exc
-    if isinstance(chat_id, bool) or not isinstance(chat_id, int) or chat_id <= 0:
-        raise ValueError("invalid Telegram user ID")
-    return chat_id
-
-
-async def verify_turnstile_token(token: str) -> bool:
-    if not token or len(token) > 2048:
-        return False
-    payload = {
-        "secret": TURNSTILE_SECRET_KEY,
-        "response": token,
-        "idempotency_key": str(uuid.uuid4()),
-    }
-    try:
-        if telegram_client is None:
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.post(TURNSTILE_SITEVERIFY_URL, json=payload)
-        else:
-            response = await telegram_client.post(
-                TURNSTILE_SITEVERIFY_URL,
-                json=payload,
-                timeout=10,
-            )
-        data = response.json()
-    except (httpx.RequestError, ValueError):
-        logger.warning("Turnstile Siteverify request failed")
-        return False
-    if response.is_error or not isinstance(data, dict) or not data.get("success"):
-        error_codes = data.get("error-codes", []) if isinstance(data, dict) else []
-        logger.info("Turnstile verification rejected error_codes=%s", error_codes)
-        return False
-
-    try:
-        expected_hostname = turnstile_verify_hostname(TURNSTILE_VERIFY_URL)
-    except ValueError:
-        logger.error("Turnstile verification URL is invalid")
-        return False
-    response_hostname = str(data.get("hostname", ""))
-    response_action = str(data.get("action", ""))
-    return (
-        bool(expected_hostname)
-        and hmac.compare_digest(
-            response_hostname.lower(),
-            expected_hostname.lower(),
-        )
-        and hmac.compare_digest(response_action, TURNSTILE_VERIFY_ACTION)
-    )
-
-
 def set_admin_state(admin_id: int, target_chat_id: int) -> None:
     conversation_repository.set_admin_state(DB_PATH, admin_id, target_chat_id)
 
@@ -1439,7 +1326,10 @@ def admin_user_keyboard(chat_id: int, viewer_admin_id: int | None = None) -> dic
 
 
 def admin_dashboard_keyboard() -> dict[str, Any]:
-    return keyboards.admin_dashboard_keyboard(get_queue_counts())
+    counts = get_queue_counts()
+    row = db_fetchone("SELECT COUNT(*) AS count FROM moderation_jobs WHERE status='held'")
+    counts["moderation"] = int(row["count"]) if row else 0
+    return keyboards.admin_dashboard_keyboard(counts)
 
 
 def pagination_navigation_row(
@@ -1500,10 +1390,6 @@ def exit_reply_keyboard(chat_id: int) -> dict[str, Any]:
 
 def welcome_keyboard() -> dict[str, Any]:
     return keyboards.welcome_keyboard()
-
-
-def verification_keyboard() -> dict[str, Any]:
-    return keyboards.verification_keyboard(TURNSTILE_VERIFY_URL)
 
 
 async def present_admin_view(
@@ -1717,10 +1603,24 @@ async def alert_admin_delivery_failure(delivery: sqlite3.Row) -> bool:
 
 
 async def process_admin_delivery(delivery: sqlite3.Row) -> None:
+    reviewed = moderation_repository.get(DB_PATH, int(delivery["update_id"]))
+    if reviewed and not moderation_repository.is_current(DB_PATH, int(delivery["update_id"])):
+        db_execute("UPDATE admin_deliveries SET status='canceled' WHERE id=?", (delivery["id"],))
+        return
+
+    async def copy_reviewed(to_chat_id: int, from_chat_id: int, message_id: int) -> TelegramSendResult:
+        if not reviewed:
+            return await copy_message(to_chat_id, from_chat_id, message_id)
+        try:
+            method, payload = moderation_service.delivery_payload(json.loads(reviewed["snapshot"]), to_chat_id)
+            return telegram_send_result(await tg(method, payload))
+        except Exception as exc:
+            return failed_send_result(exc)
+
     await admin_delivery_service.process_delivery(
         delivery,
         send_message,
-        copy_message,
+        copy_reviewed,
         format_admin_delivery_message,
         lambda chat_id, viewer_admin_id: admin_user_keyboard(
             chat_id,
@@ -1749,20 +1649,126 @@ async def periodic_admin_delivery_worker() -> None:
 async def send_welcome(chat_id: int) -> None:
     await send_message(
         chat_id,
-        WELCOME_TEXT,
+        WELCOME_TEXT + (
+            "\n\n本入口启用 DeepSeek 广告审核：消息文字及链接将提交给 DeepSeek，"
+            "请勿发送密码或其他敏感信息。可疑留言可能等待人工确认。"
+            if AI_MODERATION_ENABLED else ""
+        ),
         reply_markup=welcome_keyboard(),
     )
 
 
-async def send_verification_prompt(chat_id: int) -> None:
-    if claim_verification_prompt(chat_id):
-        sent = await send_message(
-            chat_id,
-            VERIFICATION_REQUIRED_TEXT,
-            reply_markup=verification_keyboard(),
+def apply_ai_settings(settings: Settings) -> None:
+    global SETTINGS, AI_MODERATION_ENABLED
+    SETTINGS = settings
+    AI_MODERATION_ENABLED = settings.ai_moderation_enabled
+    if moderation_wakeup:
+        moderation_wakeup.set()
+
+
+def get_ai_settings_controller() -> AISettingsController:
+    global ai_settings_controller
+    if ai_settings_controller is None:
+        ai_settings_controller = AISettingsController(
+            lambda: DB_PATH, lambda: BASE_DIR / ".env", lambda: SETTINGS,
+            apply_ai_settings, send_message, tg, is_owner, clear_admin_state,
         )
-        if not sent:
-            release_verification_prompt(chat_id)
+    return ai_settings_controller
+
+
+async def enqueue_moderation(message: dict[str, Any], update_id: int, text: str, *, edited: bool) -> None:
+    chat_id = int(message["chat"]["id"])
+    status = moderation_repository.enqueue(
+        DB_PATH, update_id, chat_id, int(message["message_id"]),
+        moderation_service.snapshot(message), text, edited,
+    )
+    if status == "full":
+        await send_message(chat_id, "留言队列暂时已满，这条消息尚未接收，请稍后重新发送。")
+        return
+    if status == "queued":
+        if moderation_wakeup:
+            moderation_wakeup.set()
+        await send_message(
+            chat_id, "留言已收到，正在进行 DeepSeek 广告审核，可疑内容将等待人工确认。"
+            "消息文字及链接会提交给 DeepSeek，请勿发送敏感信息。",
+        )
+
+
+async def notify_moderation_pending() -> None:
+    count = moderation_repository.claim_notice(DB_PATH)
+    if not count:
+        return
+    for admin_id in sorted(ADMIN_IDS):
+        await send_message(admin_id, f"广告审核有 {count} 条消息待确认。",
+                           reply_markup=inline_keyboard([[("查看待审核", "moderation:1")]]))
+
+
+async def show_moderation_queue(admin_id: int, page: int = 1,
+                                callback: dict[str, Any] | None = None) -> None:
+    if not is_admin(admin_id):
+        return
+    jobs, page, pages = moderation_repository.pending_page(DB_PATH, page)
+    lines = ["<b>广告审核 · 待确认</b>", ""]
+    buttons: list[list[ButtonSpec]] = []
+    for job in jobs:
+        update_id = int(job["update_id"])
+        lines.append(f"<b>#{update_id}</b> · 用户 <code>{job['chat_id']}</code>\n"
+                     f"{escape_html_limited(job['reason'], 100)}\n"
+                     f"{escape_html_limited(job['summary'], 350)}\n")
+        buttons.append([(f"#{update_id} 放行", f"moderation_allow:{update_id}", "success"),
+                        ("封禁", f"moderation_block:{update_id}", "danger"),
+                        ("查看原消息", f"moderation_preview:{update_id}")])
+    if not jobs:
+        lines.append("暂无待审核消息。")
+    buttons.append(keyboards.pagination_navigation_row("moderation", page, pages))
+    buttons.append([("返回", "admin:dashboard")])
+    await present_admin_view(admin_id, "\n".join(lines), inline_keyboard(buttons), callback)
+
+
+async def handle_moderation_callback(callback: dict[str, Any], action: str, value: str) -> None:
+    admin_id = int(callback["from"]["id"])
+    if not is_admin(admin_id) or not is_private_callback(callback):
+        await answer_callback_query(callback["id"], "无权限")
+        return
+    if not value.isascii() or not value.isdigit() or len(value) > 18:
+        await answer_callback_query(callback["id"], "参数无效")
+        return
+    number = int(value)
+    if action == "moderation":
+        await answer_callback_query(callback["id"])
+        await show_moderation_queue(admin_id, number, callback)
+        return
+    job = moderation_repository.get(DB_PATH, number)
+    if not job or job["status"] != "held":
+        await answer_callback_query(callback["id"], "消息已处理或已被新版本替代")
+        return
+    if action == "moderation_block":
+        await answer_callback_query(callback["id"])
+        await present_admin_view(
+            admin_id, f"确认将用户 <code>{job['chat_id']}</code> 加入黑名单？该用户的待审核消息将被拦截。",
+            inline_keyboard([[("确认封禁", f"moderation_confirm:{number}", "danger"),
+                              ("取消", "moderation:1")]]), callback,
+        )
+        return
+    if action == "moderation_preview":
+        await answer_callback_query(callback["id"], "查看的是待审核内容")
+        try:
+            method, payload = moderation_service.delivery_payload(json.loads(job["snapshot"]), admin_id)
+            await tg(method, payload)
+        except Exception:
+            await send_message(admin_id, "无法显示原消息，请根据列表中的内容摘要处理。")
+        return
+    if action == "moderation_allow":
+        changed = moderation_repository.approve(DB_PATH, number, ADMIN_IDS, admin_id)
+        if changed and admin_delivery_wakeup:
+            admin_delivery_wakeup.set()
+    elif action == "moderation_confirm":
+        changed = moderation_repository.block(DB_PATH, number, admin_id)
+    else:
+        await answer_callback_query(callback["id"], "未知操作")
+        return
+    await answer_callback_query(callback["id"], "已处理" if changed else "状态已变化，请刷新")
+    await show_moderation_queue(admin_id, callback=callback)
 
 
 def normalize_command_text(text: str) -> str:
@@ -1792,12 +1798,7 @@ async def handle_user_message(message: dict[str, Any], update_id: int) -> None:
             )
         return
 
-    if not is_user_verified(chat_id):
-        upsert_user(user, "[等待人机验证]")
-        await send_verification_prompt(chat_id)
-        return
-
-    upsert_user(user, text)
+    upsert_user(user, "[待广告审核]" if AI_MODERATION_ENABLED else text)
 
     command_text = normalize_command_text(message.get("text") or "")
     if command_text == "/start" or command_text.startswith("/start "):
@@ -1821,6 +1822,10 @@ async def handle_user_message(message: dict[str, Any], update_id: int) -> None:
             )
         return
 
+    if AI_MODERATION_ENABLED:
+        await enqueue_moderation(message, update_id, text, edited=False)
+        return
+
     persist_user_event(
         update_id,
         user,
@@ -1842,11 +1847,7 @@ async def handle_user_edited_message(message: dict[str, Any], update_id: int) ->
 
     if is_blacklisted(chat_id) or text == "/start":
         return
-    if not is_user_verified(chat_id):
-        upsert_user(user, "[等待人机验证]")
-        return
-
-    upsert_user(user, text)
+    upsert_user(user, "[待广告审核]" if AI_MODERATION_ENABLED else text)
 
     allowed, should_notify, retry_after = check_user_rate_limit(chat_id)
     if not allowed:
@@ -1856,6 +1857,10 @@ async def handle_user_edited_message(message: dict[str, Any], update_id: int) ->
                 f"修改得太频繁了，请等待约 {retry_after} 秒后再试。",
                 parse_mode=None,
             )
+        return
+
+    if AI_MODERATION_ENABLED:
+        await enqueue_moderation(message, update_id, text, edited=True)
         return
 
     persist_user_event(
@@ -1991,6 +1996,10 @@ async def handle_admin_command(
     if not is_admin(admin_id):
         return False
 
+    if text == "/ai":
+        await get_ai_settings_controller().panel(admin_id)
+        return True
+
     owner_only_command = (
         text == "/broadcast"
         or text.startswith("/broadcast ")
@@ -2030,6 +2039,10 @@ async def handle_admin_command(
 
     if text in {"/inbox", "/pending", "/closed"}:
         await show_conversation_queue(admin_id, text[1:])
+        return True
+
+    if text == "/moderation":
+        await show_moderation_queue(admin_id)
         return True
 
     if text == "/users":
@@ -2356,6 +2369,9 @@ async def handle_admin_message(message: dict[str, Any], update_id: int | None = 
     if not is_admin(admin_id):
         return
 
+    if await get_ai_settings_controller().message(message):
+        return
+
     text = normalize_command_text(message.get("text") or message.get("caption") or "")
     content = message_content(message)
 
@@ -2513,6 +2529,16 @@ async def handle_callback(callback: dict[str, Any]) -> None:
         return
 
     action, raw_chat_id = data.split(":", 1)
+    if action == "ai":
+        if not is_owner(admin_id):
+            await answer_callback_query(callback_id, "仅负责人可管理 AI 配置")
+            return
+        await answer_callback_query(callback_id)
+        await get_ai_settings_controller().callback(admin_id, raw_chat_id)
+        return
+    if action.startswith("moderation"):
+        await handle_moderation_callback(callback, action, raw_chat_id)
+        return
     if action == "admin":
         view_name, separator, raw_page = raw_chat_id.partition(":")
         if view_name == "dashboard" and not separator:
@@ -2821,39 +2847,6 @@ async def handle_callback(callback: dict[str, Any]) -> None:
     await answer_callback_query(callback_id)
 
 
-def turnstile_page_response() -> HTMLResponse:
-    nonce = secrets.token_urlsafe(24)
-    site_key_json = json.dumps(TURNSTILE_SITE_KEY).replace("<", "\\u003c")
-    content = (
-        TURNSTILE_PAGE_TEMPLATE
-        .replace("__NONCE__", nonce)
-        .replace("__SITE_KEY_JSON__", site_key_json)
-    )
-    content_security_policy = (
-        "default-src 'none'; "
-        f"script-src 'nonce-{nonce}' 'strict-dynamic' "
-        "https://telegram.org https://challenges.cloudflare.com; "
-        f"style-src 'nonce-{nonce}'; "
-        "frame-src https://challenges.cloudflare.com; "
-        "connect-src 'self' https://challenges.cloudflare.com; "
-        "img-src data: https://challenges.cloudflare.com; "
-        "base-uri 'none'; form-action 'none'; "
-        "frame-ancestors 'self' https://web.telegram.org https://*.telegram.org"
-    )
-    return HTMLResponse(
-        content,
-        headers={
-            "Cache-Control": "no-store",
-            "Content-Security-Policy": content_security_policy,
-            "Referrer-Policy": "no-referrer",
-            "X-Content-Type-Options": "nosniff",
-            "Permissions-Policy": (
-                "camera=(), microphone=(), geolocation=(), payment=()"
-            ),
-        },
-    )
-
-
 async def read_limited_request_body(request: Request, max_bytes: int) -> bytes:
     content_length = request.headers.get("content-length")
     if content_length is not None:
@@ -2877,58 +2870,6 @@ async def read_limited_request_body(request: Request, max_bytes: int) -> bytes:
     return bytes(body)
 
 
-@app.get("/verify", response_class=HTMLResponse)
-async def turnstile_verification_page() -> HTMLResponse:
-    if not TURNSTILE_ENABLED:
-        raise HTTPException(status_code=404, detail="not found")
-    return turnstile_page_response()
-
-
-@app.post("/verify/complete")
-async def complete_turnstile_verification(request: Request) -> JSONResponse:
-    if not TURNSTILE_ENABLED:
-        raise HTTPException(status_code=404, detail="not found")
-    content_type = (
-        request.headers.get("content-type", "")
-        .partition(";")[0]
-        .strip()
-        .lower()
-    )
-    if content_type != "application/json":
-        raise HTTPException(status_code=415, detail="JSON request required")
-    body = await read_limited_request_body(request, 16384)
-    try:
-        payload = json.loads(body)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=400, detail="invalid request") from exc
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="invalid request")
-
-    init_data = payload.get("init_data")
-    turnstile_token = payload.get("turnstile_token")
-    if not isinstance(init_data, str) or not isinstance(turnstile_token, str):
-        raise HTTPException(status_code=400, detail="invalid request")
-    try:
-        chat_id = validate_telegram_init_data(init_data)
-    except ValueError:
-        return JSONResponse(
-            {"ok": False, "message": "Telegram 身份已失效，请返回 Bot 重新打开验证。"},
-            status_code=403,
-            headers={"Cache-Control": "no-store"},
-        )
-
-    if not await verify_turnstile_token(turnstile_token):
-        return JSONResponse(
-            {"ok": False, "message": "人机验证未通过，请重新尝试。"},
-            status_code=400,
-            headers={"Cache-Control": "no-store"},
-        )
-
-    mark_user_verified(chat_id)
-    await send_welcome(chat_id)
-    return JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
-
-
 @app.get("/healthz")
 async def healthz() -> dict[str, str | bool]:
     try:
@@ -2942,9 +2883,12 @@ async def healthz() -> dict[str, str | bool]:
             status_code=503,
             detail="administrator delivery worker unavailable",
         )
+    if moderation_worker_task is None or moderation_worker_task.done():
+        raise HTTPException(status_code=503, detail="moderation worker unavailable")
     return {
         "ok": True,
         "version": APP_VERSION,
+        "moderation_worker": "ok",
         "db": "ok",
         "broadcast_worker": "ok",
         "admin_delivery_worker": "ok",
@@ -2997,7 +2941,9 @@ async def telegram_webhook(
             if message and "from" in message and is_private_chat_message(message):
                 from_id = int(message["from"]["id"])
                 if is_admin(from_id):
-                    if not edited:
+                    if edited:
+                        await get_ai_settings_controller().message(message, edited=True)
+                    else:
                         await handle_admin_message(message, update_id)
                 elif edited:
                     await handle_user_edited_message(message, update_id)
@@ -3013,3 +2959,4 @@ async def telegram_webhook(
                 fail_update(update_id, str(exc))
         logger.exception("Webhook update processing failed update_id=%s", update_id)
         raise HTTPException(status_code=500, detail="update processing failed") from exc
+

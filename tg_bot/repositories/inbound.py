@@ -1,3 +1,5 @@
+import sqlite3
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -17,10 +19,13 @@ def persist_event(
     edited: bool,
     admin_ids: set[int],
     include_content_delivery: bool,
+    connection: sqlite3.Connection | None = None,
 ) -> bool:
     """Persist one inbound event and all administrator deliveries atomically."""
-    with database.connect(db_path) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    context = nullcontext(connection) if connection is not None else database.connect(db_path)
+    with context as conn:
+        if connection is None:
+            conn.execute("BEGIN IMMEDIATE")
         claimed = conn.execute(
             """
             INSERT OR IGNORE INTO inbound_events (
@@ -30,7 +35,8 @@ def persist_event(
             (update_id, chat_id, message_id, event_type),
         )
         if claimed.rowcount == 0:
-            conn.commit()
+            if connection is None:
+                conn.commit()
             return False
 
         conn.execute(
@@ -117,5 +123,7 @@ def persist_event(
                     """,
                     (update_id, chat_id, message_id, admin_id, title, text),
                 )
-        conn.commit()
+        if connection is None:
+            conn.commit()
         return True
+

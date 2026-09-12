@@ -1,7 +1,6 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
@@ -38,49 +37,6 @@ def env_bool(name: str, default: bool = False) -> bool:
     raise RuntimeError(f"{name} must be true or false")
 
 
-def turnstile_verify_hostname(url: str) -> str:
-    try:
-        parsed = urlsplit(url)
-        port = parsed.port
-    except ValueError as exc:
-        raise ValueError("invalid Turnstile verification URL") from exc
-    hostname = parsed.hostname or ""
-    hostname_labels = hostname.split(".")
-    if (
-        parsed.scheme != "https"
-        or not hostname
-        or not hostname.isascii()
-        or len(hostname) > 253
-        or port == 0
-        or any(
-            not label
-            or len(label) > 63
-            or label.startswith("-")
-            or label.endswith("-")
-            or any(
-                not (character.isalnum() or character == "-")
-                for character in label
-            )
-            for label in hostname_labels
-        )
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.path != "/verify"
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ValueError(
-            "Turnstile verification URL must be an HTTPS /verify URL "
-            "without credentials, query, or fragment"
-        )
-    expected_netloc = hostname
-    if port is not None:
-        expected_netloc = f"{hostname}:{port}"
-    if parsed.netloc.lower() != expected_netloc.lower():
-        raise ValueError("invalid Turnstile verification URL host")
-    return hostname.lower()
-
-
 def load_display_timezone(name: str) -> ZoneInfo:
     try:
         return ZoneInfo(name)
@@ -99,8 +55,8 @@ def parse_id_set(name: str) -> set[int]:
 @dataclass(frozen=True, slots=True)
 class Settings:
     base_dir: Path
-    bot_token: str
-    webhook_secret: str
+    bot_token: str = field(repr=False)
+    webhook_secret: str = field(repr=False)
     admin_ids: frozenset[int]
     owner_ids: frozenset[int]
     db_backup_enabled: bool
@@ -116,18 +72,17 @@ class Settings:
     admin_reply_state_ttl_seconds: int
     telegram_inline_retry_max_seconds: int
     broadcast_rate_limit_retries: int
-    turnstile_enabled: bool
-    turnstile_site_key: str
-    turnstile_secret_key: str
-    turnstile_verify_url: str
-    turnstile_verify_days: int
-    turnstile_init_data_max_age_seconds: int
+    ai_moderation_enabled: bool
+    deepseek_api_key: str = field(repr=False)
+    deepseek_model: str
+    moderation_timeout_seconds: int
+    moderation_daily_limit: int
     display_timezone_name: str
     display_timezone: ZoneInfo
     log_level: str
     db_path: Path
     db_backup_dir: Path
-    api_base: str
+    api_base: str = field(repr=False)
     app_version: str
 
 
@@ -140,10 +95,9 @@ def load_settings(base_dir: Path) -> Settings:
     owner_ids = parse_id_set("OWNER_IDS") or set(admin_ids)
     admin_ids |= owner_ids
 
-    turnstile_enabled = env_bool("TURNSTILE_ENABLED", False)
-    turnstile_site_key = os.getenv("TURNSTILE_SITE_KEY", "").strip()
-    turnstile_secret_key = os.getenv("TURNSTILE_SECRET_KEY", "").strip()
-    turnstile_verify_url = os.getenv("TURNSTILE_VERIFY_URL", "").strip()
+    ai_moderation_enabled = env_bool("AI_MODERATION_ENABLED", False)
+    deepseek_api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    deepseek_model = os.getenv("DEEPSEEK_MODEL", "deepseek-flash").strip()
     display_timezone_name = os.getenv(
         "DISPLAY_TIMEZONE", "Asia/Hong_Kong"
     ).strip()
@@ -154,20 +108,15 @@ def load_settings(base_dir: Path) -> Settings:
         raise RuntimeError("WEBHOOK_SECRET is missing")
     if not admin_ids:
         raise RuntimeError("ADMIN_IDS is missing")
-    if turnstile_enabled:
-        if (
-            not turnstile_site_key
-            or not turnstile_secret_key
-            or not turnstile_verify_url
-        ):
-            raise RuntimeError(
-                "TURNSTILE_SITE_KEY, TURNSTILE_SECRET_KEY and "
-                "TURNSTILE_VERIFY_URL are required when Turnstile is enabled"
-            )
-        try:
-            turnstile_verify_hostname(turnstile_verify_url)
-        except ValueError as exc:
-            raise RuntimeError(str(exc)) from exc
+    if ai_moderation_enabled and not deepseek_api_key:
+        raise RuntimeError("DEEPSEEK_API_KEY is required when AI moderation is enabled")
+    if any(character.isspace() for character in deepseek_api_key):
+        raise RuntimeError("DEEPSEEK_API_KEY must not contain whitespace")
+    if not deepseek_model or len(deepseek_model) > 100 or any(
+        not (character.isascii() and (character.isalnum() or character in "-_."))
+        for character in deepseek_model
+    ):
+        raise RuntimeError("DEEPSEEK_MODEL is invalid")
 
     return Settings(
         base_dir=base_dir,
@@ -204,14 +153,11 @@ def load_settings(base_dir: Path) -> Settings:
         broadcast_rate_limit_retries=env_int(
             "BROADCAST_RATE_LIMIT_RETRIES", 3, 0
         ),
-        turnstile_enabled=turnstile_enabled,
-        turnstile_site_key=turnstile_site_key,
-        turnstile_secret_key=turnstile_secret_key,
-        turnstile_verify_url=turnstile_verify_url,
-        turnstile_verify_days=env_int("TURNSTILE_VERIFY_DAYS", 30, 1),
-        turnstile_init_data_max_age_seconds=env_int(
-            "TURNSTILE_INIT_DATA_MAX_AGE_SECONDS", 600, 60
-        ),
+        ai_moderation_enabled=ai_moderation_enabled,
+        deepseek_api_key=deepseek_api_key,
+        deepseek_model=deepseek_model,
+        moderation_timeout_seconds=env_int("MODERATION_TIMEOUT_SECONDS", 15, 1),
+        moderation_daily_limit=env_int("MODERATION_DAILY_LIMIT", 500, 1),
         display_timezone_name=display_timezone_name,
         display_timezone=load_display_timezone(display_timezone_name),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -222,3 +168,4 @@ def load_settings(base_dir: Path) -> Settings:
         api_base=f"https://api.telegram.org/bot{bot_token}",
         app_version=(base_dir / "VERSION").read_text(encoding="ascii").strip(),
     )
+

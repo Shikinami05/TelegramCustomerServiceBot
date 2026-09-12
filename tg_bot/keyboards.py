@@ -92,6 +92,7 @@ def admin_dashboard_keyboard(counts: dict[str, int]) -> dict[str, Any]:
                 (f"已处理 {counts['closed']}", "queue:closed:1", "success"),
                 ("最近用户", "admin:users:1"),
             ],
+            [(f"广告待审 {counts.get('moderation', 0)}", "moderation:1")],
             [("刷新", "admin:dashboard")],
         ]
     )
@@ -236,16 +237,3 @@ def welcome_keyboard() -> dict[str, Any]:
         ]
     )
 
-
-def verification_keyboard(verify_url: str) -> dict[str, Any]:
-    return {
-        "inline_keyboard": [
-            [
-                {
-                    "text": "完成人机验证",
-                    "web_app": {"url": verify_url},
-                    "style": "primary",
-                }
-            ]
-        ]
-    }

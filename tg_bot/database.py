@@ -251,16 +251,26 @@ def initialize(db_path: Path) -> None:
         )
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS user_verifications (
-                chat_id INTEGER PRIMARY KEY,
-                verified_at DATETIME,
-                expires_at DATETIME,
-                last_prompted_at DATETIME
+            CREATE TABLE IF NOT EXISTS moderation_jobs (
+                update_id INTEGER PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                snapshot TEXT NOT NULL,
+                version_at INTEGER NOT NULL DEFAULT 0,
+                summary TEXT NOT NULL,
+                edited INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'queued',
+                reason TEXT NOT NULL DEFAULT '',
+                requested_at DATETIME,
+                decided_by INTEGER,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
 
         ensure_column(conn, "message_logs", "telegram_message_id", "INTEGER")
+        ensure_column(conn, "moderation_jobs", "version_at", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "message_logs", "edited_at", "DATETIME")
         ensure_column(
             conn,
@@ -383,8 +393,27 @@ def initialize(db_path: Path) -> None:
             "ON admin_audit_logs(created_at DESC)"
         )
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_user_verifications_expires "
-            "ON user_verifications(expires_at)"
+            "CREATE INDEX IF NOT EXISTS idx_moderation_jobs_status "
+            "ON moderation_jobs(status, update_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_moderation_jobs_message "
+            "ON moderation_jobs(chat_id, message_id, update_id)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS moderation_usage ("
+            "day TEXT PRIMARY KEY, requests INTEGER NOT NULL DEFAULT 0)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS moderation_notices ("
+            "id INTEGER PRIMARY KEY CHECK(id=1), sent_at DATETIME)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS admin_config_inputs ("
+            "admin_id INTEGER NOT NULL, prompt_id INTEGER NOT NULL, "
+            "kind TEXT NOT NULL, expires_at INTEGER NOT NULL, "
+            "status TEXT NOT NULL DEFAULT 'pending', "
+            "PRIMARY KEY(admin_id, prompt_id))"
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_admin_deliveries_pending "
@@ -428,3 +457,4 @@ def fetchall(
 ) -> list[sqlite3.Row]:
     with connect(db_path) as conn:
         return conn.execute(sql, params).fetchall()
+

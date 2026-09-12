@@ -2,14 +2,14 @@
 
 这是一个基于 FastAPI、Telegram Webhook 和 SQLite 的双向留言 Bot。用户通过 Bot 留言，无需直接私聊个人账号；管理员会收到带历史记录的通知，并可接管会话持续回复。
 
-当前版本不包含广告或 AI 内容审核。垃圾消息通过可选 Cloudflare Turnstile、发送频率限制和管理员手动黑名单处理，避免自动内容审核误伤正常用户。
+支持可选 DeepSeek 广告审核：正常留言自动转发，可疑内容和接口异常进入人工待审队列。保留发送频率限制与手动黑名单，不会由 AI 自动永久封禁用户。
 
 ## 主要功能
 
 ### 用户侧
 
 - `/start` 留言入口
-- 可选首次留言前 Cloudflare Turnstile 人机验证
+- 可选 DeepSeek 文字及链接广告审核，无需打开网页验证
 - 支持文字、图片、文件、语音、视频等消息
 - 消息送达确认
 - 编辑消息会更新原历史记录，并通知管理员“用户修改了消息”
@@ -41,7 +41,7 @@
 
 - 强制校验 `WEBHOOK_SECRET`
 - Webhook 只接受 JSON，应用层限制为 1 MiB，Nginx 部署模板同步限制请求大小
-- Turnstile Token 与 Telegram Mini App 身份均在服务端验证
+- AI 审核队列持久化、每日调用限额、严格结果校验；超时和异常不自动放行
 - 所有管理命令和管理按钮均校验 `ADMIN_IDS`
 - Webhook 更新使用 `processing/done/failed` 状态；并发处理中返回 503，异常或重启中断后允许 Telegram 重试
 - 原生 Reply 优先按持久化消息映射查找用户，无法识别时拒绝发送，不会回退到旧回复状态
@@ -79,8 +79,7 @@ tg_bot/keyboards.py    Inline Keyboard、分页、按钮颜色和回调数据
 tg_bot/models.py       共享结果类型
 tg_bot/text.py         HTML 与 Telegram 文本长度处理
 tg_bot/repositories/   Update、会话、映射、投递和群发的 SQLite 事务
-tg_bot/services/       管理员通知与群发后台任务编排
-templates/             Turnstile 验证页面
+tg_bot/services/       管理员通知、群发与 DeepSeek 审核后台任务
 scripts/               安装、更新、备份、Webhook 和运维命令
 tests/                 业务、模块、安全边界和部署脚本回归测试
 ```
@@ -110,7 +109,7 @@ curl -fsSL https://raw.githubusercontent.com/Shikinami05/TelegramCustomerService
 - 全新安装及现有 `~/tg-bot` 安装迁移
 - 自动选择最新稳定 GitHub Release
 - 交互输入域名、证书邮箱、Bot Token 和管理员 ID
-- 可选启用 Cloudflare Turnstile，并隐藏输入 Secret Key
+- 可选启用 DeepSeek 广告审核，隐藏输入 API Key，可选模型与每日调用上限
 - 自动创建 `.env`、随机 `WEBHOOK_SECRET` 和 Python 虚拟环境
 - 自动配置 systemd、Nginx、HTTPS 证书、Webhook 和 Telegram 命令菜单
 - HTTPS `443` 和 Telegram 支持的 `8443`
@@ -130,9 +129,9 @@ curl -fsSL https://raw.githubusercontent.com/Shikinami05/TelegramCustomerService
 | `sudo tg-bot logs [LINES]` | 查看最近日志；默认显示 100 行 |
 | `sudo tg-bot version` | 查看版本、Git 引用、提交和工作区状态 |
 | `sudo tg-bot webhook` | 查看 Telegram Webhook 状态 |
-| `sudo tg-bot turnstile status` | 查看 Turnstile 是否启用及配置完整性，不显示密钥 |
-| `sudo tg-bot turnstile enable` | 交互式填写或保留 Turnstile 密钥并启用 |
-| `sudo tg-bot turnstile disable` | 关闭 Turnstile，保留密钥便于以后重新启用 |
+| `sudo tg-bot moderation status` | 查看 AI 审核开关、模型及每日调用上限，不显示密钥 |
+| `sudo tg-bot moderation enable` | 隐藏输入 DeepSeek API Key，选择模型和调用上限并启用 |
+| `sudo tg-bot moderation disable` | 关闭新消息 AI 审核，保留密钥和待人工处理的历史消息 |
 | `sudo tg-bot configure DOMAIN EMAIL [443\|8443]` | 配置 Nginx、HTTPS、Webhook 和命令菜单；默认端口 `443` |
 | `sudo tg-bot help` | 显示脚本支持的全部命令 |
 
@@ -142,7 +141,7 @@ curl -fsSL https://raw.githubusercontent.com/Shikinami05/TelegramCustomerService
 sudo tg-bot update
 sudo tg-bot backup 20
 sudo tg-bot logs 200
-sudo tg-bot turnstile status
+sudo tg-bot moderation status
 sudo tg-bot configure bot.example.com admin@example.com 8443
 ```
 
@@ -187,12 +186,11 @@ PENDING_REMINDER_MINUTES=30
 TELEGRAM_INLINE_RETRY_MAX_SECONDS=5
 ADMIN_REPLY_STATE_TTL_SECONDS=1800
 
-TURNSTILE_ENABLED=false
-TURNSTILE_SITE_KEY=
-TURNSTILE_SECRET_KEY=
-TURNSTILE_VERIFY_URL=https://bot.example.com/verify
-TURNSTILE_VERIFY_DAYS=30
-TURNSTILE_INIT_DATA_MAX_AGE_SECONDS=600
+AI_MODERATION_ENABLED=false
+DEEPSEEK_API_KEY=
+DEEPSEEK_MODEL=deepseek-flash
+MODERATION_TIMEOUT_SECONDS=15
+MODERATION_DAILY_LIMIT=500
 
 DISPLAY_TIMEZONE=Asia/Hong_Kong
 LOG_LEVEL=INFO
@@ -206,44 +204,46 @@ LOG_LEVEL=INFO
 
 `DISPLAY_TIMEZONE` 使用 IANA 时区名称，只影响管理员界面的时间显示，不改变 SQLite 中的 UTC 时间。默认值为 `Asia/Hong_Kong`；例如可改为 `Asia/Shanghai` 或 `UTC`。无效名称会让服务在启动时直接报错，避免静默显示错误时间。
 
-## Cloudflare Turnstile（可选）
+## DeepSeek 广告审核（可选）
 
-安装时会询问：
+安装时可选择启用，已有安装在更新到支持该功能的版本后运行：
 
-```text
-Enable Cloudflare Turnstile before users can leave messages? [y/N]
-```
+也可以直接在 Telegram 中由负责人发送 `/ai`，管理 API Key、模型、每日限额和审核开关，无需登录 VPS 或重启服务。该指令只出现在 `OWNER_IDS` 的命令菜单中，普通管理员仅能通过 `/moderation` 处理待审消息。
 
-直接回车或选择 `n` 时功能保持关闭。选择 `y` 后，安装器会继续询问 Site Key，并隐藏输入 Secret Key。需要先在 Cloudflare Turnstile 创建 Managed Widget，把 Bot 域名加入允许列表。
+更新密钥时先确认风险，再回复 Bot 的专用输入提示。提示 3 分钟内有效，可用 `/cancel` 取消。Bot 会先尝试删除输入消息，再检查 DeepSeek 鉴权；删除或鉴权失败时不更新密钥。保存到 `.env` 后后续审核立即采用新配置。更换密钥不会自动开启审核，开启需要额外确认费用和隐私提示。
 
-启用后的流程：
+密钥不会写入消息历史、操作日志或转发给留言用户。输入元数据会保存在数据库以防重启后误路由，密钥本身只保存在 `.env`。配置提示的过期回复和疑似密钥的管理员消息也会被拦截，避免进入持续回复流程。
 
-1. 新用户发送 `/start` 或留言
-2. Bot 只发送“完成人机验证”按钮，不保存本条内容，也不通知管理员
-3. Telegram 内打开 `/verify` 页面并完成 Turnstile
-4. 后端验证 Telegram `initData` 签名、时效、Turnstile Token、Action 和 Hostname
-5. 验证状态写入 SQLite，默认有效 30 天
-6. 验证通过后用户才能发送留言
-
-管理员自动跳过验证。Turnstile Site Key 会出现在网页中，Secret Key 只保存在权限为 `600` 的 `.env`。`/verify/complete` 请求体限制为 16 KiB，验证页面禁止缓存并使用 CSP；Turnstile Token 必须经过 Cloudflare Siteverify 服务端确认。
-
-Turnstile 不要求域名经过 Cloudflare 代理。如果域名启用了 Cloudflare Proxy、WAF 或 Under Attack Mode，必须确保 `/tg/webhook` 跳过所有交互式挑战，否则 Telegram 无法投递 Webhook。
-
-现有安装启用时：
+注意：Telegram Bot 私聊不是端到端加密的密钥输入通道，自动删除也不能保证清除通知或其他副本。连接检查只验证鉴权，不保证余额、模型可用性或广告识别效果。更稳妥的方式仍是在 VPS 隐藏输入密钥：
 
 ```bash
-sudo tg-bot update
-sudo tg-bot turnstile enable
+sudo tg-bot moderation enable
 ```
 
-脚本会隐藏 Secret Key 输入，并从现有 Webhook 地址生成验证地址。可随时查看状态或关闭：
+按提示在 VPS 上填写 API Key、模型和每日请求上限，密钥不会回显。默认模型为 `deepseek-flash`，默认每日最多调用 500 次，以 UTC 日期结算；限制的是请求数，不是固定金额。每次输入最多 8000 字符、输出最多 128 tokens。使用 DeepSeek 官方 HTTPS 接口，关闭思考模式并要求 JSON 分类，不允许模型调用工具。模型和接口格式参考 [DeepSeek 官方文档](https://api-docs.deepseek.com/api/create-chat-completion/)。
+
+处理流程：
+
+1. 黑名单和发送频率限制优先执行，管理员回复不会送去 AI 审核。
+2. 用户消息先持久化，再由后台审核；Webhook 不等待 DeepSeek 返回。
+3. 正常内容进入原有转发队列，可疑广告、判断不确定、接口超时、余额或限额问题均留在待审列表。
+4. 管理员通过聊天框命令菜单的 `/moderation` 或面板“广告待审”查看，支持分页、“放行”“查看原消息”和二次确认封禁。放行仅作用于这一条消息。
+5. 有待审内容时每 10 分钟最多发送一次汇总提醒，不逐条推送广告正文。
+6. 编辑消息重新审核；转发使用审核过的文字、caption 和文件 ID 快照，避免之后的修改绕过审核。旧版未发出的任务会取消。
+7. 重启保留审核记录，审核中断的消息等待人工确认。关闭功能后，历史待审消息不会自动放行。
+
+当前只自动审核文字、caption 和隐藏链接的目标地址，不下载链接、不上传图片或文件，不分析图片内部文字或语音。没有文字的媒体需人工放行；带有正常 caption 的图片仍可能包含未识别广告。AI 也可能误判，不能保证拦截全部广告。待处理队列最多容纳 2000 条，满载时会明确提示用户稍后重发，不假装接收成功。
+
+启用后，留言中的文字及链接会发送给 DeepSeek，可能包含用户自己写入的个人信息；不额外提交 Telegram ID、用户名或完整历史。欢迎语和消息回执包含第三方审核提示，请在启用前确认符合自己的隐私要求。API Key 只保存在权限为 `600` 的 `.env`，不要发送到聊天中或提交到 GitHub。
 
 ```bash
-sudo tg-bot turnstile status
-sudo tg-bot turnstile disable
+sudo tg-bot moderation status
+sudo tg-bot moderation disable
 ```
 
-启用前脚本会确认 Nginx 已包含验证路由；如果提示路由不存在，先执行一次 `sudo tg-bot configure DOMAIN EMAIL [443|8443]`。配置修改后会重启服务并检查 `/healthz`，失败时自动恢复原 `.env`。关闭功能只修改开关，不会删除 Site Key 或 Secret Key。
+管理脚本修改配置后会重启服务并检查健康状态，失败时恢复旧配置。关闭审核不删除 DeepSeek 密钥，方便重新开启。
+
+CF 人机验证功能已移除，旧 `TURNSTILE_*` 环境变量不再读取；配置 AI 审核时会清除这些旧变量。旧数据库验证表保留但不再使用，避免升级时破坏历史数据。旧 Nginx 验证路径即使保留也只会返回 404，无需为了启用审核重新申请证书或修改端口。
 
 ## 管理员命令
 
@@ -261,6 +261,7 @@ sudo tg-bot turnstile disable
 /blacklist 用户ID 可选原因
 /unblacklist 用户ID
 /blacklist_list
+/moderation
 ```
 
 负责人额外拥有：
@@ -270,6 +271,7 @@ sudo tg-bot turnstile disable
 /broadcast_status
 /broadcast_retry 任务ID
 /audit
+/ai
 ```
 
 待处理流程：
@@ -321,7 +323,10 @@ bot.db
 - `broadcast_recipients`：群发接收人及发送结果
 - `processed_updates`：Webhook 幂等和失败重试状态
 - `user_rate_limits`：用户临时频率限制
-- `user_verifications`：Turnstile 验证状态和有效期
+- `moderation_jobs`：审核消息快照、状态和人工决定
+- `moderation_usage`：按 UTC 日期记录的 API 请求数
+- `moderation_notices`：待审汇总提醒节流
+- `admin_config_inputs`：负责人配置提示、有效期和使用状态，不保存密钥或输入内容
 
 旧数据库会在启动时自动增加新字段，不需要删除 `bot.db`。
 超过 `MESSAGE_RETENTION_DAYS` 的消息历史、消息映射和已结束投递台账会在维护任务中清理；待发送、发送中及仍有关联的入站事件不会被删除。
@@ -447,7 +452,7 @@ Telegram API 错误日志只记录方法、HTTP 状态和错误描述，不记�
 PROJECT_DIR="$(sudo systemctl show tg-bot -p WorkingDirectory --value)"
 cd "$PROJECT_DIR"
 ./venv/bin/python -m compileall -q tg_bot
-./venv/bin/python -m py_compile app.py scripts/manage_webhook.py scripts/manage_backup.py scripts/manage_turnstile.py
+./venv/bin/python -m py_compile app.py scripts/manage_webhook.py scripts/manage_backup.py scripts/manage_moderation.py
 ./venv/bin/python -m unittest discover -s tests -v
 ```
 
@@ -464,3 +469,4 @@ GitHub Actions 会在 Python 3.10 和 3.12 上自动执行这些检查，不需�
 - 日志文件
 
 当前 `.gitignore` 已覆盖这些文件。公开仓库前还应选择许可证，并把文档中的真实域名替换为示例域名。
+

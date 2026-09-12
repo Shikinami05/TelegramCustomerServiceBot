@@ -18,8 +18,8 @@ Commands:
   logs [LINES]                 Show recent service logs (default: 100)
   version                      Show the deployed version
   webhook                      Show Telegram webhook status
-  turnstile status|enable|disable
-                               Manage Cloudflare Turnstile
+  moderation status|enable|disable
+                               Manage DeepSeek advertisement filtering
   configure DOMAIN EMAIL [PORT] Configure HTTPS and webhook (443 or 8443)
   help                         Show this help
 EOF
@@ -137,7 +137,7 @@ case "$command_name" in
         exec runuser -u "$APP_USER" -- \
             "$PYTHON_BIN" "$SCRIPT_DIR/manage_webhook.py" --info
         ;;
-    turnstile)
+    moderation)
         if [[ $# -ne 1 ]] \
             || [[ "$1" != "status" && "$1" != "enable" && "$1" != "disable" ]]; then
             usage >&2
@@ -146,33 +146,20 @@ case "$command_name" in
         action="$1"
         resolve_app_identity "$SERVICE_NAME"
         env_file="$PROJECT_DIR/.env"
-        helper="$SCRIPT_DIR/manage_turnstile.py"
+        helper="$SCRIPT_DIR/manage_moderation.py"
         if [[ ! -x "$PYTHON_BIN" || ! -f "$helper" || ! -f "$env_file" ]]; then
-            echo "The installed environment or Turnstile helper is missing." >&2
+            echo "The installed environment or moderation helper is missing." >&2
             exit 1
         fi
         if [[ "$action" == "status" ]]; then
             exec runuser -u "$APP_USER" -- "$PYTHON_BIN" "$helper" status
         fi
-        if [[ "$action" == "enable" ]]; then
-            nginx_config="$(nginx -T 2>&1)" || {
-                echo "Unable to inspect the active Nginx configuration." >&2
-                exit 1
-            }
-            if [[ "$nginx_config" != *"location = /verify {"* ]] \
-                || [[ "$nginx_config" != *"location = /verify/complete {"* ]]; then
-                echo "Turnstile verification routes are not active in Nginx." >&2
-                echo "Configure HTTPS first: sudo tg-bot configure DOMAIN EMAIL [443|8443]" >&2
-                exit 1
-            fi
-        fi
-
         env_backup="$(mktemp)"
         cp --preserve=mode,ownership,timestamps "$env_file" "$env_backup"
-        cleanup_turnstile_backup() {
+        cleanup_moderation_backup() {
             rm -f "$env_backup"
         }
-        trap cleanup_turnstile_backup EXIT
+        trap cleanup_moderation_backup EXIT
 
         if [[ "$action" == "enable" ]]; then
             if ! runuser -u "$APP_USER" -- \
@@ -215,3 +202,4 @@ case "$command_name" in
         exit 2
         ;;
 esac
+

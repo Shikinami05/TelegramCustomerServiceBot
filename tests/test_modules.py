@@ -412,7 +412,7 @@ class KeyboardModuleTests(unittest.TestCase):
         queue_button = queue_markup["inline_keyboard"][0][0]
         self.assertEqual(queue_button["style"], continue_button["style"])
 
-    def test_pagination_and_verification_buttons_are_stable(self) -> None:
+    def test_pagination_buttons_are_stable(self) -> None:
         navigation = keyboards.pagination_navigation_row("queue:inbox", 2, 3)
         self.assertEqual(
             navigation,
@@ -422,13 +422,6 @@ class KeyboardModuleTests(unittest.TestCase):
                 ("下一页", "queue:inbox:3"),
             ],
         )
-        verification = keyboards.verification_keyboard(
-            "https://bot.example.com/verify"
-        )
-        button = verification["inline_keyboard"][0][0]
-        self.assertEqual(button["web_app"]["url"], "https://bot.example.com/verify")
-        self.assertEqual(button["style"], "primary")
-
     def test_unknown_button_style_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "unsupported inline button style"):
             keyboards.inline_keyboard([[('测试', 'test:1', 'neon')]])
@@ -490,3 +483,4 @@ class TextModuleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
