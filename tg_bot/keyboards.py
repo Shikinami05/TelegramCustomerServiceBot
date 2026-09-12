@@ -81,21 +81,26 @@ def admin_user_keyboard(
     )
 
 
-def admin_dashboard_keyboard(counts: dict[str, int]) -> dict[str, Any]:
-    return inline_keyboard(
+def admin_dashboard_keyboard(
+    counts: dict[str, int],
+    *,
+    show_ai_settings: bool = False,
+) -> dict[str, Any]:
+    rows: list[list[ButtonSpec]] = [
         [
-            [
-                (f"待处理 {counts['inbox']}", "queue:inbox:1", "primary"),
-                (f"超时 {counts['pending']}", "queue:pending:1"),
-            ],
-            [
-                (f"已处理 {counts['closed']}", "queue:closed:1", "success"),
-                ("最近用户", "admin:users:1"),
-            ],
-            [(f"广告待审 {counts.get('moderation', 0)}", "moderation:1")],
-            [("刷新", "admin:dashboard")],
-        ]
-    )
+            (f"待处理 {counts['inbox']}", "queue:inbox:1", "primary"),
+            (f"超时 {counts['pending']}", "queue:pending:1"),
+        ],
+        [
+            (f"已处理 {counts['closed']}", "queue:closed:1", "success"),
+            ("最近用户", "admin:users:1"),
+        ],
+        [(f"广告待审 {counts.get('moderation', 0)}", "moderation:1")],
+    ]
+    if show_ai_settings:
+        rows.append([("AI 审核设置", "ai:panel", "primary")])
+    rows.append([("刷新", "admin:dashboard")])
+    return inline_keyboard(rows)
 
 
 def pagination_navigation_row(
