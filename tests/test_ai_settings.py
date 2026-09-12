@@ -59,6 +59,19 @@ class AISettingsTests(unittest.IsolatedAsyncioTestCase):
         await self.controller.callback(2, "key_input")
         self.assertEqual(database.fetchall(self.db, "SELECT * FROM admin_config_inputs"), [])
 
+    async def test_ai_command_opens_settings_when_ai_is_disabled_and_key_is_empty(self):
+        message = {"from": {"id": 1}, "chat": {"id": 1, "type": "private"},
+                   "text": "/ai", "message_id": 201}
+        with patch.object(app, "ADMIN_IDS", {1, 2}), \
+             patch.object(app, "ai_settings_controller", self.controller), \
+             patch.object(app, "send_message", new_callable=AsyncMock) as fallback:
+            await app.handle_admin_message(message)
+        fallback.assert_not_awaited()
+        self.assertEqual(self.send.await_count, 1)
+        buttons = self.send.await_args.kwargs["reply_markup"]["inline_keyboard"]
+        self.assertIn("ai:key", {button["callback_data"] for row in buttons for button in row})
+        self.telegram.assert_not_awaited()
+
     async def test_key_update_deletes_input_persists_and_takes_effect_without_restart(self):
         await self.controller.prompt(1, "key")
         with patch.object(ai_settings, "probe_key", AsyncMock(return_value=True)) as probe:
@@ -195,4 +208,3 @@ class AISettingsTests(unittest.IsolatedAsyncioTestCase):
              patch.object(ai_settings, "configure_moderation", side_effect=OSError("write failed")):
             await self.controller.message(self.message())
         self.assertEqual(self.settings.deepseek_api_key, "")
-
