@@ -366,6 +366,27 @@ class BroadcastServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class KeyboardModuleTests(unittest.TestCase):
+    def test_ai_settings_button_is_only_added_for_owner_dashboard(self) -> None:
+        counts = {"inbox": 0, "pending": 0, "closed": 0, "moderation": 0}
+        admin_markup = keyboards.admin_dashboard_keyboard(counts)
+        owner_markup = keyboards.admin_dashboard_keyboard(
+            counts,
+            show_ai_settings=True,
+        )
+
+        admin_callbacks = {
+            button["callback_data"]
+            for row in admin_markup["inline_keyboard"]
+            for button in row
+        }
+        owner_callbacks = {
+            button["callback_data"]
+            for row in owner_markup["inline_keyboard"]
+            for button in row
+        }
+        self.assertNotIn("ai:panel", admin_callbacks)
+        self.assertIn("ai:panel", owner_callbacks)
+
     def test_reply_mode_actions_share_the_same_style(self) -> None:
         markup = keyboards.admin_user_keyboard(
             123,
