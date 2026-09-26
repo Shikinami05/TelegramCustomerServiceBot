@@ -800,8 +800,8 @@ class BotDatabaseTests(unittest.TestCase):
         self.assertEqual(first_row[0]["callback_data"], "takeover:32")
         self.assertEqual(first_row[0]["style"], "primary")
         self.assertEqual(first_row[1]["text"], "1 详情")
-        self.assertEqual(first_row[2]["text"], "1 处理")
-        self.assertEqual(first_row[2]["style"], "success")
+        self.assertEqual(len(first_row), 2)
+        self.assertEqual(first_row[1]["callback_data"], "user:32:inbox:1")
         self.assertEqual(
             queue_keyboard["inline_keyboard"][-1][0]["callback_data"],
             "admin:dashboard",
@@ -1081,7 +1081,7 @@ class BotDatabaseTests(unittest.TestCase):
             123,
             viewer_admin_id=1,
         )["inline_keyboard"][0][0]
-        self.assertEqual(reply_buttons[0]["style"], continue_button["style"])
+        self.assertEqual(reply_buttons[0]["style"], "danger")
         self.assertEqual(reply_buttons[1]["style"], "success")
 
         with self.assertRaises(ValueError):
@@ -1194,7 +1194,7 @@ class BotDatabaseTests(unittest.TestCase):
             123,
             viewer_admin_id=1,
         )["inline_keyboard"][0][0]
-        self.assertEqual(sent_exit_button["style"], continue_button["style"])
+        self.assertEqual(sent_exit_button["style"], "danger")
         self.assertEqual(copied.message_id, 302)
         self.assertFalse(rejected)
         self.assertEqual(rejected.status_code, 403)
@@ -1362,4 +1362,3 @@ class BotDatabaseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

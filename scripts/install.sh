@@ -127,7 +127,7 @@ if [[ ! -f "$PROJECT_DIR/.env" ]]; then
     } > "$PROJECT_DIR/.env"
     chown "$APP_USER:$APP_USER" "$PROJECT_DIR/.env"
     chmod 600 "$PROJECT_DIR/.env"
-    read -r -p "Enable DeepSeek ad review (shares message text; API charges apply)? [y/N]: " AI_CHOICE
+    read -r -p "Enable AI ad review (shares message text; API charges apply)? [y/N]: " AI_CHOICE
     case "${AI_CHOICE,,}" in
         y|yes)
             runuser -u "$APP_USER" -- "$PROJECT_DIR/venv/bin/python" \
