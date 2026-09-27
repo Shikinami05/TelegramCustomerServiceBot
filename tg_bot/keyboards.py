@@ -87,18 +87,18 @@ def admin_dashboard_keyboard(
     show_ai_settings: bool = False,
 ) -> dict[str, Any]:
     rows: list[list[ButtonSpec]] = [
-        [
-            (f"待处理 {counts['inbox']}", "queue:inbox:1", "primary"),
-            (f"超时 {counts['pending']}", "queue:pending:1"),
-        ],
-        [
-            (f"已处理 {counts['closed']}", "queue:closed:1", "success"),
-            ("最近用户", "admin:users:1"),
-        ],
-        [(f"广告待审 {counts.get('moderation', 0)}", "moderation:1")],
+            [
+                (f"待处理 {counts['inbox']}", "queue:inbox:1", "primary"),
+                (f"超时 {counts['pending']}", "queue:pending:1"),
+            ],
+            [
+                (f"已处理 {counts['closed']}", "queue:closed:1", "success"),
+                ("最近用户", "admin:users:1"),
+            ],
+            [(f"暂存箱 {counts.get('moderation', 0)}", "moderation:1")],
     ]
     if show_ai_settings:
-        rows.append([("AI 审核设置", "ai:panel", "primary")])
+        rows.append([("防广告设置", "ai:panel")])
     rows.append([("刷新", "admin:dashboard")])
     return inline_keyboard(rows)
 
@@ -181,7 +181,7 @@ def conversation_queue_keyboard(
             keyboard_rows.append(
                 [
                     (f"{index} 重开", f"reopen:{chat_id}", "primary"),
-                    (f"{index} 详情", f"detail:{chat_id}"),
+                    (f"{index} 详情", f"user:{chat_id}:{queue_name}:{page}"),
                 ]
             )
             continue
@@ -206,8 +206,7 @@ def conversation_queue_keyboard(
         keyboard_rows.append(
             [
                 primary_button,
-                (f"{index} 详情", f"detail:{chat_id}"),
-                (f"{index} 处理", f"resolve:{chat_id}", "success"),
+                (f"{index} 详情", f"user:{chat_id}:{queue_name}:{page}"),
             ]
         )
     keyboard_rows.extend(
@@ -223,7 +222,7 @@ def exit_reply_keyboard(chat_id: int) -> dict[str, Any]:
                 (
                     "退出回复",
                     f"cancel:{chat_id}",
-                    REPLY_MODE_BUTTON_STYLE,
+                    "danger",
                 ),
                 ("标记已处理", f"resolve:{chat_id}", "success"),
             ],
@@ -241,4 +240,3 @@ def welcome_keyboard() -> dict[str, Any]:
             ]
         ]
     )
-

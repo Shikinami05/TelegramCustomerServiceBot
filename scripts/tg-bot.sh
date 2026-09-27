@@ -19,7 +19,7 @@ Commands:
   version                      Show the deployed version
   webhook                      Show Telegram webhook status
   moderation status|enable|disable
-                               Manage DeepSeek advertisement filtering
+                               Manage AI provider, model and advertisement filtering
   configure DOMAIN EMAIL [PORT] Configure HTTPS and webhook (443 or 8443)
   help                         Show this help
 EOF
@@ -202,4 +202,3 @@ case "$command_name" in
         exit 2
         ;;
 esac
-

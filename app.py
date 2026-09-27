@@ -38,6 +38,7 @@ from tg_bot.services import admin_delivery as admin_delivery_service
 from tg_bot.services import broadcast as broadcast_service
 from tg_bot.services import moderation as moderation_service
 from tg_bot.services.ai_settings import AISettingsController
+from tg_bot.services.moderation_ui import ModerationInbox
 from tg_bot.telegram import TelegramAPIError, request as telegram_request
 from tg_bot.text import escape_html_limited, html_to_plain_text, truncate_text
 
@@ -188,6 +189,8 @@ AUDIT_ACTION_LABELS = {
     "blacklist_remove": "解除黑名单",
     "moderation_allow": "审核放行",
     "moderation_block": "广告封禁",
+    "moderation_dismiss": "忽略单条留言",
+    "moderation_retry": "重新检测留言",
     "ai_settings": "AI 配置更新",
     "broadcast_created": "创建群发",
     "broadcast_confirmed": "确认群发",
@@ -286,7 +289,7 @@ def purge_expired_data() -> None:
                 (f"-{MESSAGE_RETENTION_DAYS} days",),
             )
             conn.execute(
-                "DELETE FROM moderation_jobs WHERE status IN ('approved','blocked','superseded') "
+                "DELETE FROM moderation_jobs WHERE status IN ('approved','blocked','superseded','dismissed') "
                 "AND updated_at < datetime('now', ?) "
                 "AND NOT EXISTS (SELECT 1 FROM admin_deliveries d WHERE d.update_id=moderation_jobs.update_id)",
                 (f"-{MESSAGE_RETENTION_DAYS} days",),
@@ -336,7 +339,7 @@ def purge_expired_data() -> None:
         )
         conn.execute("DELETE FROM moderation_usage WHERE day < date('now', '-30 days')")
         conn.execute(
-            "DELETE FROM moderation_jobs WHERE status IN ('blocked','superseded') "
+            "DELETE FROM moderation_jobs WHERE status IN ('blocked','superseded','dismissed') "
             "AND updated_at < datetime('now','-30 days') "
             "AND update_id NOT IN (SELECT update_id FROM admin_deliveries)"
         )
@@ -351,8 +354,8 @@ def backup_database() -> Path | None:
     enforce_private_mode(DB_BACKUP_DIR, 0o700)
     backup_path = DB_BACKUP_DIR / f"bot-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db"
 
-    with sqlite3.connect(DB_PATH, timeout=30) as source:
-        with sqlite3.connect(backup_path) as backup:
+    with contextlib.closing(sqlite3.connect(DB_PATH, timeout=30)) as source:
+        with contextlib.closing(sqlite3.connect(backup_path)) as backup:
             source.backup(backup)
     enforce_private_mode(backup_path, 0o600)
     secure_database_files()
@@ -1406,7 +1409,9 @@ async def present_admin_view(
         callback_chat = callback_message.get("chat") or {}
         callback_chat_id = callback_chat.get("id")
         callback_message_id = callback_message.get("message_id")
-        if isinstance(callback_chat_id, int) and isinstance(callback_message_id, int):
+        # Keep original message-to-user links intact: never turn a replyable notification into a menu.
+        if (callback_chat_id == admin_id and isinstance(callback_message_id, int)
+                and get_message_link(admin_id, callback_message_id) is None):
             if await edit_message_text(
                 callback_chat_id,
                 callback_message_id,
@@ -1421,6 +1426,8 @@ async def show_admin_dashboard(
     admin_id: int,
     callback: dict[str, Any] | None = None,
 ) -> None:
+    clear_admin_state(admin_id)
+    moderation_repository.cancel_config_input(DB_PATH, admin_id)
     await present_admin_view(
         admin_id,
         format_admin_dashboard(admin_id),
@@ -1435,6 +1442,8 @@ async def show_conversation_queue(
     page: int = 1,
     callback: dict[str, Any] | None = None,
 ) -> None:
+    clear_admin_state(admin_id)
+    moderation_repository.cancel_config_input(DB_PATH, admin_id)
     total_count = count_conversation_queue(queue_name)
     page, total_pages, offset = paginate(page, total_count)
     rows = get_conversation_queue(
@@ -1467,6 +1476,8 @@ async def show_recent_users(
     page: int = 1,
     callback: dict[str, Any] | None = None,
 ) -> None:
+    clear_admin_state(admin_id)
+    moderation_repository.cancel_config_input(DB_PATH, admin_id)
     total_count = count_recent_users()
     page, total_pages, offset = paginate(page, total_count)
     rows = get_recent_users(limit=ADMIN_PAGE_SIZE, offset=offset)
@@ -1652,11 +1663,7 @@ async def periodic_admin_delivery_worker() -> None:
 async def send_welcome(chat_id: int) -> None:
     await send_message(
         chat_id,
-        WELCOME_TEXT + (
-            "\n\n本入口启用 DeepSeek 广告审核：消息文字及链接将提交给 DeepSeek，"
-            "请勿发送密码或其他敏感信息。可疑留言可能等待人工确认。"
-            if AI_MODERATION_ENABLED else ""
-        ),
+        WELCOME_TEXT,
         reply_markup=welcome_keyboard(),
     )
 
@@ -1674,7 +1681,7 @@ def get_ai_settings_controller() -> AISettingsController:
     if ai_settings_controller is None:
         ai_settings_controller = AISettingsController(
             lambda: DB_PATH, lambda: BASE_DIR / ".env", lambda: SETTINGS,
-            apply_ai_settings, send_message, tg, is_owner, clear_admin_state,
+            apply_ai_settings, send_message, tg, is_owner, clear_admin_state, present_admin_view,
         )
     return ai_settings_controller
 
@@ -1691,10 +1698,8 @@ async def enqueue_moderation(message: dict[str, Any], update_id: int, text: str,
     if status == "queued":
         if moderation_wakeup:
             moderation_wakeup.set()
-        await send_message(
-            chat_id, "留言已收到，正在进行 DeepSeek 广告审核，可疑内容将等待人工确认。"
-            "消息文字及链接会提交给 DeepSeek，请勿发送敏感信息。",
-        )
+        if not edited:
+            await send_message(chat_id, "留言已收到，我看到后会通过 Bot 回复你。")
 
 
 async def notify_moderation_pending() -> None:
@@ -1702,30 +1707,23 @@ async def notify_moderation_pending() -> None:
     if not count:
         return
     for admin_id in sorted(ADMIN_IDS):
-        await send_message(admin_id, f"广告审核有 {count} 条消息待确认。",
-                           reply_markup=inline_keyboard([[("查看待审核", "moderation:1")]]))
+        await send_message(admin_id, f"暂存箱：{count} 条留言待处理。",
+                           reply_markup=inline_keyboard([[("打开暂存箱", "moderation:1")]]))
+
+
+def moderation_inbox() -> ModerationInbox:
+    return ModerationInbox(DB_PATH, ADMIN_IDS, present_admin_view, send_message, tg,
+                           answer_callback_query, admin_delivery_wakeup, moderation_wakeup,
+                           AI_MODERATION_ENABLED)
 
 
 async def show_moderation_queue(admin_id: int, page: int = 1,
                                 callback: dict[str, Any] | None = None) -> None:
     if not is_admin(admin_id):
         return
-    jobs, page, pages = moderation_repository.pending_page(DB_PATH, page)
-    lines = ["<b>广告审核 · 待确认</b>", ""]
-    buttons: list[list[ButtonSpec]] = []
-    for job in jobs:
-        update_id = int(job["update_id"])
-        lines.append(f"<b>#{update_id}</b> · 用户 <code>{job['chat_id']}</code>\n"
-                     f"{escape_html_limited(job['reason'], 100)}\n"
-                     f"{escape_html_limited(job['summary'], 350)}\n")
-        buttons.append([(f"#{update_id} 放行", f"moderation_allow:{update_id}", "success"),
-                        ("封禁", f"moderation_block:{update_id}", "danger"),
-                        ("查看原消息", f"moderation_preview:{update_id}")])
-    if not jobs:
-        lines.append("暂无待审核消息。")
-    buttons.append(keyboards.pagination_navigation_row("moderation", page, pages))
-    buttons.append([("返回", "admin:dashboard")])
-    await present_admin_view(admin_id, "\n".join(lines), inline_keyboard(buttons), callback)
+    clear_admin_state(admin_id)
+    moderation_repository.cancel_config_input(DB_PATH, admin_id)
+    await moderation_inbox().show(admin_id, page, callback)
 
 
 async def handle_moderation_callback(callback: dict[str, Any], action: str, value: str) -> None:
@@ -1733,45 +1731,8 @@ async def handle_moderation_callback(callback: dict[str, Any], action: str, valu
     if not is_admin(admin_id) or not is_private_callback(callback):
         await answer_callback_query(callback["id"], "无权限")
         return
-    if not value.isascii() or not value.isdigit() or len(value) > 18:
-        await answer_callback_query(callback["id"], "参数无效")
-        return
-    number = int(value)
-    if action == "moderation":
-        await answer_callback_query(callback["id"])
-        await show_moderation_queue(admin_id, number, callback)
-        return
-    job = moderation_repository.get(DB_PATH, number)
-    if not job or job["status"] != "held":
-        await answer_callback_query(callback["id"], "消息已处理或已被新版本替代")
-        return
-    if action == "moderation_block":
-        await answer_callback_query(callback["id"])
-        await present_admin_view(
-            admin_id, f"确认将用户 <code>{job['chat_id']}</code> 加入黑名单？该用户的待审核消息将被拦截。",
-            inline_keyboard([[("确认封禁", f"moderation_confirm:{number}", "danger"),
-                              ("取消", "moderation:1")]]), callback,
-        )
-        return
-    if action == "moderation_preview":
-        await answer_callback_query(callback["id"], "查看的是待审核内容")
-        try:
-            method, payload = moderation_service.delivery_payload(json.loads(job["snapshot"]), admin_id)
-            await tg(method, payload)
-        except Exception:
-            await send_message(admin_id, "无法显示原消息，请根据列表中的内容摘要处理。")
-        return
-    if action == "moderation_allow":
-        changed = moderation_repository.approve(DB_PATH, number, ADMIN_IDS, admin_id)
-        if changed and admin_delivery_wakeup:
-            admin_delivery_wakeup.set()
-    elif action == "moderation_confirm":
-        changed = moderation_repository.block(DB_PATH, number, admin_id)
-    else:
-        await answer_callback_query(callback["id"], "未知操作")
-        return
-    await answer_callback_query(callback["id"], "已处理" if changed else "状态已变化，请刷新")
-    await show_moderation_queue(admin_id, callback=callback)
+    clear_admin_state(admin_id)
+    await moderation_inbox().callback(callback, action, value)
 
 
 def normalize_command_text(text: str) -> str:
@@ -2377,6 +2338,8 @@ async def handle_admin_message(message: dict[str, Any], update_id: int | None = 
 
     text = normalize_command_text(message.get("text") or message.get("caption") or "")
     content = message_content(message)
+    if text.startswith("/"):
+        moderation_repository.cancel_config_input(DB_PATH, admin_id)
 
     if await handle_admin_command(admin_id, text, message, update_id):
         return
@@ -2404,7 +2367,7 @@ async def handle_admin_message(message: dict[str, Any], update_id: int | None = 
         await send_message(
             admin_id,
             "<b>尚未选择回复对象</b>\n\n"
-            "请从待处理队列选择用户，或使用 /reply 用户ID 内容。",
+            "请打开收件箱选择用户，或直接 Reply 该用户的留言通知。",
             reply_markup=admin_dashboard_keyboard(admin_id),
         )
         return
@@ -2537,7 +2500,21 @@ async def handle_callback(callback: dict[str, Any]) -> None:
             await answer_callback_query(callback_id, "仅负责人可管理 AI 配置")
             return
         await answer_callback_query(callback_id)
-        await get_ai_settings_controller().callback(admin_id, raw_chat_id)
+        await get_ai_settings_controller().callback(admin_id, raw_chat_id, callback)
+        return
+    moderation_repository.cancel_config_input(DB_PATH, admin_id)
+    if action == "user":
+        parts = raw_chat_id.split(":")
+        if (len(parts) != 3 or not parts[0].isascii() or not parts[0].isdigit() or len(parts[0]) > 18
+                or parts[1] not in QUEUE_LABELS or parse_callback_page(parts[2]) is None):
+            await answer_callback_query(callback_id, "页面无效")
+            return
+        target_chat_id = int(parts[0])
+        clear_admin_state(admin_id)
+        markup = admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id)
+        markup["inline_keyboard"].insert(-1, [{"text": "返回列表", "callback_data": f"queue:{parts[1]}:{parts[2]}"}])
+        await answer_callback_query(callback_id)
+        await present_admin_view(admin_id, format_user_detail(target_chat_id), markup, callback)
         return
     if action.startswith("moderation"):
         await handle_moderation_callback(callback, action, raw_chat_id)
@@ -2714,12 +2691,12 @@ async def handle_callback(callback: dict[str, Any]) -> None:
             return
         add_admin_audit(admin_id, "reply_mode_enter", target_chat_id)
         await answer_callback_query(callback_id, "已进入回复模式")
-        await send_message(
+        await present_admin_view(
             admin_id,
             "<b>回复模式已开启</b>\n\n"
             f"目标用户：<code>{target_chat_id}</code>\n"
             "接下来发送的消息会转发给该用户。",
-            reply_markup=exit_reply_keyboard(target_chat_id),
+            exit_reply_keyboard(target_chat_id), callback,
         )
         return
 
@@ -2732,10 +2709,10 @@ async def handle_callback(callback: dict[str, Any]) -> None:
         else:
             add_admin_audit(admin_id, "reply_mode_exit", target_chat_id)
             await answer_callback_query(callback_id, "已退出")
-            await send_message(
+            await present_admin_view(
                 admin_id,
                 "已退出持续回复模式。",
-                reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
+                admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id), callback,
             )
         return
 
@@ -2749,12 +2726,12 @@ async def handle_callback(callback: dict[str, Any]) -> None:
         )
         add_admin_audit(admin_id, "conversation_takeover", target_chat_id)
         await answer_callback_query(callback_id, "已接管")
-        await send_message(
+        await present_admin_view(
             admin_id,
             "<b>会话已接管</b>\n\n"
             f"目标用户：<code>{target_chat_id}</code>\n"
             "接下来发送的消息会转发给该用户。",
-            reply_markup=exit_reply_keyboard(target_chat_id),
+            exit_reply_keyboard(target_chat_id), callback,
         )
         return
 
@@ -2762,11 +2739,11 @@ async def handle_callback(callback: dict[str, Any]) -> None:
         close_conversation(target_chat_id)
         add_admin_audit(admin_id, "conversation_resolved", target_chat_id)
         await answer_callback_query(callback_id, "已标记处理")
-        await send_message(
+        await present_admin_view(
             admin_id,
             "<b>已标记处理</b>\n\n"
             f"用户：<code>{target_chat_id}</code>",
-            reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
+            admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id), callback,
         )
         return
 
@@ -2774,20 +2751,22 @@ async def handle_callback(callback: dict[str, Any]) -> None:
         reopen_conversation(target_chat_id)
         add_admin_audit(admin_id, "conversation_reopened", target_chat_id)
         await answer_callback_query(callback_id, "已重新打开")
-        await send_message(
+        await present_admin_view(
             admin_id,
             "<b>会话已重新打开</b>\n\n"
             f"用户：<code>{target_chat_id}</code>",
-            reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
+            admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id), callback,
         )
         return
 
     if action == "detail":
+        clear_admin_state(admin_id)
         await answer_callback_query(callback_id)
-        await send_message(
+        await present_admin_view(
             admin_id,
             format_user_detail(target_chat_id),
-            reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
+            admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
+            callback,
         )
         return
 
@@ -2962,4 +2941,3 @@ async def telegram_webhook(
                 fail_update(update_id, str(exc))
         logger.exception("Webhook update processing failed update_id=%s", update_id)
         raise HTTPException(status_code=500, detail="update processing failed") from exc
-

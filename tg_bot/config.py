@@ -4,6 +4,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
+from tg_bot.ai_providers import MODEL_PATTERN, PROVIDERS, normalize_model
 
 
 def env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -84,6 +85,19 @@ class Settings:
     db_backup_dir: Path
     api_base: str = field(repr=False)
     app_version: str
+    ai_provider: str = "deepseek"
+    ai_api_key: str = field(default="", repr=False)
+    ai_model: str = ""
+    moderation_media_policy: str = "hold"
+
+    @property
+    def moderation_key(self) -> str:
+        return self.ai_api_key or (self.deepseek_api_key if self.ai_provider == "deepseek" else "")
+
+    @property
+    def moderation_model(self) -> str:
+        legacy = self.deepseek_model if self.ai_provider == "deepseek" else ""
+        return normalize_model(self.ai_provider, self.ai_model or legacy)
 
 
 def load_settings(base_dir: Path) -> Settings:
@@ -97,7 +111,15 @@ def load_settings(base_dir: Path) -> Settings:
 
     ai_moderation_enabled = env_bool("AI_MODERATION_ENABLED", False)
     deepseek_api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
-    deepseek_model = os.getenv("DEEPSEEK_MODEL", "deepseek-flash").strip()
+    provider = os.getenv("AI_PROVIDER", "deepseek").strip()
+    if provider not in PROVIDERS:
+        raise RuntimeError("AI_PROVIDER is invalid")
+    deepseek_model = normalize_model("deepseek", os.getenv("DEEPSEEK_MODEL", "").strip())
+    ai_key = os.getenv("AI_API_KEY", "").strip()
+    ai_model = os.getenv("AI_MODEL", "").strip()
+    media_policy = os.getenv("MODERATION_MEDIA_POLICY", "hold").strip()
+    if media_policy not in {"hold", "allow"}:
+        raise RuntimeError("MODERATION_MEDIA_POLICY must be hold or allow")
     display_timezone_name = os.getenv(
         "DISPLAY_TIMEZONE", "Asia/Hong_Kong"
     ).strip()
@@ -108,15 +130,13 @@ def load_settings(base_dir: Path) -> Settings:
         raise RuntimeError("WEBHOOK_SECRET is missing")
     if not admin_ids:
         raise RuntimeError("ADMIN_IDS is missing")
-    if ai_moderation_enabled and not deepseek_api_key:
-        raise RuntimeError("DEEPSEEK_API_KEY is required when AI moderation is enabled")
-    if any(character.isspace() for character in deepseek_api_key):
-        raise RuntimeError("DEEPSEEK_API_KEY must not contain whitespace")
-    if not deepseek_model or len(deepseek_model) > 100 or any(
-        not (character.isascii() and (character.isalnum() or character in "-_."))
-        for character in deepseek_model
-    ):
-        raise RuntimeError("DEEPSEEK_MODEL is invalid")
+    active_key = ai_key or (deepseek_api_key if provider == "deepseek" else "")
+    if ai_moderation_enabled and not active_key:
+        raise RuntimeError("AI_API_KEY (legacy: DEEPSEEK_API_KEY) is required when AI moderation is enabled")
+    if any(character.isspace() for character in active_key):
+        raise RuntimeError("AI_API_KEY must not contain whitespace")
+    if not MODEL_PATTERN.fullmatch(normalize_model(provider, ai_model or (deepseek_model if provider == "deepseek" else ""))):
+        raise RuntimeError("AI_MODEL is invalid")
 
     return Settings(
         base_dir=base_dir,
@@ -167,5 +187,8 @@ def load_settings(base_dir: Path) -> Settings:
         ),
         api_base=f"https://api.telegram.org/bot{bot_token}",
         app_version=(base_dir / "VERSION").read_text(encoding="ascii").strip(),
+        ai_provider=provider,
+        ai_api_key=ai_key,
+        ai_model=ai_model,
+        moderation_media_policy=media_policy,
     )
-

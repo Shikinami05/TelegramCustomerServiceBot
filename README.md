@@ -2,16 +2,16 @@
 
 这是一个基于 FastAPI、Telegram Webhook 和 SQLite 的双向留言 Bot。用户通过 Bot 留言，无需直接私聊个人账号；管理员会收到带历史记录的通知，并可接管会话持续回复。
 
-支持可选 DeepSeek 广告审核：正常留言自动转发，可疑内容和接口异常进入人工待审队列。保留发送频率限制与手动黑名单，不会由 AI 自动永久封禁用户。
+支持可选 AI 防广告，可选择 DeepSeek 或硅基流动（中国站 / 国际站）。正常留言自动转发，可疑内容和检测故障分类暂存，由管理员处理，不会由 AI 自动永久封禁用户。
 
 ## 主要功能
 
 ### 用户侧
 
 - `/start` 留言入口
-- 可选 DeepSeek 文字及链接广告审核，无需打开网页验证
+- 可直接留言，无需打开网页验证；回执不显示内部审核结果或模型信息
 - 支持文字、图片、文件、语音、视频等消息
-- 消息送达确认
+- 消息接收回执（不代表管理员已经阅读或消息已经放行）
 - 编辑消息会更新原历史记录，并通知管理员“用户修改了消息”
 - 短时间刷屏会进入临时冷却，但不会自动加入黑名单
 - 只处理 Telegram 私聊，不处理群聊或频道消息
@@ -29,6 +29,10 @@
 - 管理端消息 ID 与用户消息 ID 持久化关联，服务重启后仍可准确回复
 - 点击“持续回复”后进入有时限的持续回复模式，支持文字和媒体
 - 多管理员接管与标记已处理
+- 设置、暂存箱及会话操作优先在原面板更新；详情可返回原列表页
+- 返回工作台、列表或设置时退出持续回复，防止浏览菜单后误发给上一位用户
+- 暂存箱按疑似广告、检测故障及待确认分类；支持单条放行、忽略、重新检测、预览和确认封禁
+- 负责人使用 `/ai` 选择服务商、密钥、模型和媒体策略，配置即时生效
 - 手动加入或解除黑名单，按钮操作需要二次确认
 - `OWNER_IDS` 负责人专用群发与管理员审计权限
 - 群发二次确认、后台发送、进度记录、失败用户重试和服务重启续发
@@ -45,6 +49,7 @@
 - 所有管理命令和管理按钮均校验 `ADMIN_IDS`
 - Webhook 更新使用 `processing/done/failed` 状态；并发处理中返回 503，异常或重启中断后允许 Telegram 重试
 - 原生 Reply 优先按持久化消息映射查找用户，无法识别时拒绝发送，不会回退到旧回复状态
+- 带用户映射的原始通知不会被菜单覆盖；切换 AI 服务商会暂停拦截并清空密钥
 - 用户入站事件、管理员通知和媒体投递使用 SQLite 持久化队列；通知完成前不会丢失任务
 - Telegram 投递结果不确定时不会自动盲目重放，负责人确认后可通过告警按钮人工重试
 - 管理员回复使用投递台账去重；服务在 Telegram 调用后中断时记录为 `unknown`，避免恢复后重复发给用户
@@ -79,7 +84,8 @@ tg_bot/keyboards.py    Inline Keyboard、分页、按钮颜色和回调数据
 tg_bot/models.py       共享结果类型
 tg_bot/text.py         HTML 与 Telegram 文本长度处理
 tg_bot/repositories/   Update、会话、映射、投递和群发的 SQLite 事务
-tg_bot/services/       管理员通知、群发与 DeepSeek 审核后台任务
+tg_bot/ai_providers.py 固定服务商端点、模型预设和兼容参数
+tg_bot/services/       投递后台任务、防广告、负责人设置及暂存箱交互
 scripts/               安装、更新、备份、Webhook 和运维命令
 tests/                 业务、模块、安全边界和部署脚本回归测试
 ```
@@ -109,7 +115,7 @@ curl -fsSL https://raw.githubusercontent.com/Shikinami05/TelegramCustomerService
 - 全新安装及现有 `~/tg-bot` 安装迁移
 - 自动选择最新稳定 GitHub Release
 - 交互输入域名、证书邮箱、Bot Token 和管理员 ID
-- 可选启用 DeepSeek 广告审核，隐藏输入 API Key，可选模型与每日调用上限
+- 可选启用 AI 防广告，选择服务商，隐藏输入 API Key，设置模型、每日调用上限和无文字媒体策略
 - 自动创建 `.env`、随机 `WEBHOOK_SECRET` 和 Python 虚拟环境
 - 自动配置 systemd、Nginx、HTTPS 证书、Webhook 和 Telegram 命令菜单
 - HTTPS `443` 和 Telegram 支持的 `8443`
@@ -130,7 +136,7 @@ curl -fsSL https://raw.githubusercontent.com/Shikinami05/TelegramCustomerService
 | `sudo tg-bot version` | 查看版本、Git 引用、提交和工作区状态 |
 | `sudo tg-bot webhook` | 查看 Telegram Webhook 状态 |
 | `sudo tg-bot moderation status` | 查看 AI 审核开关、模型及每日调用上限，不显示密钥 |
-| `sudo tg-bot moderation enable` | 隐藏输入 DeepSeek API Key，选择模型和调用上限并启用 |
+| `sudo tg-bot moderation enable` | 选择 AI 服务商，隐藏输入密钥，设置模型、限额和无文字媒体策略 |
 | `sudo tg-bot moderation disable` | 关闭新消息 AI 审核，保留密钥和待人工处理的历史消息 |
 | `sudo tg-bot configure DOMAIN EMAIL [443\|8443]` | 配置 Nginx、HTTPS、Webhook 和命令菜单；默认端口 `443` |
 | `sudo tg-bot help` | 显示脚本支持的全部命令 |
@@ -187,8 +193,10 @@ TELEGRAM_INLINE_RETRY_MAX_SECONDS=5
 ADMIN_REPLY_STATE_TTL_SECONDS=1800
 
 AI_MODERATION_ENABLED=false
-DEEPSEEK_API_KEY=
-DEEPSEEK_MODEL=deepseek-flash
+AI_PROVIDER=deepseek
+AI_API_KEY=
+AI_MODEL=deepseek-flash
+MODERATION_MEDIA_POLICY=hold
 MODERATION_TIMEOUT_SECONDS=15
 MODERATION_DAILY_LIMIT=500
 
@@ -204,44 +212,46 @@ LOG_LEVEL=INFO
 
 `DISPLAY_TIMEZONE` 使用 IANA 时区名称，只影响管理员界面的时间显示，不改变 SQLite 中的 UTC 时间。默认值为 `Asia/Hong_Kong`；例如可改为 `Asia/Shanghai` 或 `UTC`。无效名称会让服务在启动时直接报错，避免静默显示错误时间。
 
-## DeepSeek 广告审核（可选）
+## AI 防广告（可选）
 
-安装时可选择启用，已有安装在更新到支持该功能的版本后运行：
+负责人在 Telegram 发送 `/ai`，或从工作台打开「防广告设置」。普通管理员只能处理暂存消息，不能查看或修改密钥。
 
-也可以直接在 Telegram 中由负责人发送 `/ai`，管理 API Key、模型、每日限额和审核开关，无需登录 VPS 或重启服务。该指令只出现在 `OWNER_IDS` 的命令菜单中，普通管理员仅能通过 `/moderation` 处理待审消息。
+配置顺序：选择服务商 → 输入密钥 → 选择模型 → 连接检查 → 开启拦截。设置立即生效，无需重启。模型按钮提供常用预设，也可输入完整模型 ID；硅基流动支持如 `Qwen/Qwen3-32B` 这样的带斜杠 ID。中国站和国际站使用各自的端点和密钥，不能混用。
 
-更新密钥时先确认风险，再回复 Bot 的专用输入提示。提示 3 分钟内有效，可用 `/cancel` 取消。Bot 会先尝试删除输入消息，再检查 DeepSeek 鉴权；删除或鉴权失败时不更新密钥。保存到 `.env` 后后续审核立即采用新配置。更换密钥不会自动开启审核，开启需要额外确认费用和隐私提示。
+密钥输入需先确认风险。提示有效期 3 分钟，回复提示或直接发送均可，`/cancel` 取消。Bot 先删除输入再验证密钥；删除或验证失败不更新配置。切换服务商会关闭拦截、清空旧密钥并使旧输入失效，防止把一个平台的密钥提交给另一个平台。更新密钥不会自动开启拦截。
 
 密钥不会写入消息历史、操作日志或转发给留言用户。输入元数据会保存在数据库以防重启后误路由，密钥本身只保存在 `.env`。配置提示的过期回复和疑似密钥的管理员消息也会被拦截，避免进入持续回复流程。
 
-注意：Telegram Bot 私聊不是端到端加密的密钥输入通道，自动删除也不能保证清除通知或其他副本。连接检查只验证鉴权，不保证余额、模型可用性或广告识别效果。更稳妥的方式仍是在 VPS 隐藏输入密钥：
+「连接检查」验证鉴权及所选模型是否在服务商列表中；「测试检测」经确认后发送内置测试文本，验证实际调用与 JSON 解析，计入每日调用限额。两者都不保证广告识别准确率。Telegram Bot 私聊不是端到端加密通道，删除输入不能保证清除通知副本；更稳妥的方式是在 VPS 隐藏输入密钥：
 
 ```bash
 sudo tg-bot moderation enable
 ```
 
-按提示在 VPS 上填写 API Key、模型和每日请求上限，密钥不会回显。默认模型为 `deepseek-flash`，默认每日最多调用 500 次，以 UTC 日期结算；限制的是请求数，不是固定金额。每次输入最多 8000 字符、输出最多 128 tokens。使用 DeepSeek 官方 HTTPS 接口，关闭思考模式并要求 JSON 分类，不允许模型调用工具。模型和接口格式参考 [DeepSeek 官方文档](https://api-docs.deepseek.com/api/create-chat-completion/)。
+默认 DeepSeek 模型为 `deepseek-flash`，硅基流动默认 `Qwen/Qwen3-32B`。模型以服务商当前可用列表为准，不承诺永久可用。默认每日最多调用 500 次，以 UTC 日期结算；限制的是请求数，不是固定金额。每次输入最多 8000 字符、输出最多 128 tokens。仅使用预置官方 HTTPS 端点，不跟随重定向，不允许模型调用工具。参数依照 [DeepSeek 官方文档](https://api-docs.deepseek.com/api/create-chat-completion/) 和 [SiliconFlow 官方文档](https://docs.siliconflow.com/en/api-reference/chat-completions/chat-completions) 按服务商分别发送。
 
 处理流程：
 
 1. 黑名单和发送频率限制优先执行，管理员回复不会送去 AI 审核。
-2. 用户消息先持久化，再由后台审核；Webhook 不等待 DeepSeek 返回。
-3. 正常内容进入原有转发队列，可疑广告、判断不确定、接口超时、余额或限额问题均留在待审列表。
-4. 管理员通过聊天框命令菜单的 `/moderation` 或面板“广告待审”查看，支持分页、“放行”“查看原消息”和二次确认封禁。放行仅作用于这一条消息。
-5. 有待审内容时每 10 分钟最多发送一次汇总提醒，不逐条推送广告正文。
+2. 用户消息先持久化，再由后台检测；Webhook 不等待 AI 返回。用户只收到普通留言回执。
+3. 正常内容进入收件箱；疑似广告、不确定内容及服务故障在「暂存箱」中分类展示。故障不会伪装成广告判断。
+4. `/moderation` 打开暂存箱，进入单条详情后可放行、忽略、重新检测或预览。忽略只结束该条处理，不封禁用户；封禁必须二次确认。操作后保留分类和页码。详情记录检测时的服务商与请求模型，不用当前设置冒充历史来源。
+5. 暂存内容发生变化时每 10 分钟最多汇总提醒一次；未变化的旧队列不反复提醒，不逐条推送广告正文。
 6. 编辑消息重新审核；转发使用审核过的文字、caption 和文件 ID 快照，避免之后的修改绕过审核。旧版未发出的任务会取消。
 7. 重启保留审核记录，审核中断的消息等待人工确认。关闭功能后，历史待审消息不会自动放行。
 
-当前只自动审核文字、caption 和隐藏链接的目标地址，不下载链接、不上传图片或文件，不分析图片内部文字或语音。没有文字的媒体需人工放行；带有正常 caption 的图片仍可能包含未识别广告。AI 也可能误判，不能保证拦截全部广告。待处理队列最多容纳 2000 条，满载时会明确提示用户稍后重发，不假装接收成功。
+当前只检测文字、caption 和隐藏链接，不下载链接、不上传媒体，不做图片 OCR 或语音识别。无文字媒体默认暂存；可在 `/ai` 的「无文字媒体」中改为直接接收，但纯图片广告也可能通过。带正常 caption 的媒体仍可能含未识别广告，AI 也可能误判。待处理队列最多 2000 条，满载时明确提示用户稍后重发。
 
-启用后，留言中的文字及链接会发送给 DeepSeek，可能包含用户自己写入的个人信息；不额外提交 Telegram ID、用户名或完整历史。欢迎语和消息回执包含第三方审核提示，请在启用前确认符合自己的隐私要求。API Key 只保存在权限为 `600` 的 `.env`，不要发送到聊天中或提交到 GitHub。
+启用后，留言中的文字及链接会发送给所选服务商，可能含用户自行写入的个人信息；不额外提交 Telegram ID、用户名或完整历史。普通欢迎语及回执不显示审核或模型信息，运营者应自行提供适当的隐私说明并确认第三方处理符合使用场景。密钥只保存在权限 `600` 的 `.env`，不要提交 GitHub。
 
 ```bash
 sudo tg-bot moderation status
 sudo tg-bot moderation disable
 ```
 
-管理脚本修改配置后会重启服务并检查健康状态，失败时恢复旧配置。关闭审核不删除 DeepSeek 密钥，方便重新开启。
+管理脚本修改配置后重启并检查健康状态，失败时恢复旧配置。暂停拦截保留当前密钥，切换服务商清空密钥。旧 `DEEPSEEK_API_KEY` / `DEEPSEEK_MODEL` 继续兼容；如同时配置新旧变量，`AI_API_KEY` / `AI_MODEL` 优先。
+
+交互设计参考 [aiogram-dialog](https://github.com/Tishka17/aiogram_dialog) 的页面与状态分离、[grammY menu](https://grammy.dev/plugins/menu.html) 的原消息更新与返回路径，以及 [tg-spam](https://github.com/umputun/tg-spam) 的静默拦截与人工纠错思路。没有引入这些框架或照搬其实现，原有 FastAPI、SQLite 与持久化消息映射保留。
 
 CF 人机验证功能已移除，旧 `TURNSTILE_*` 环境变量不再读取；配置 AI 审核时会清除这些旧变量。旧数据库验证表保留但不再使用，避免升级时破坏历史数据。旧 Nginx 验证路径即使保留也只会返回 404，无需为了启用审核重新申请证书或修改端口。
 

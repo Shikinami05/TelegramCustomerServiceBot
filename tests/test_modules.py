@@ -387,7 +387,7 @@ class KeyboardModuleTests(unittest.TestCase):
         self.assertNotIn("ai:panel", admin_callbacks)
         self.assertIn("ai:panel", owner_callbacks)
 
-    def test_reply_mode_actions_share_the_same_style(self) -> None:
+    def test_reply_mode_actions_use_semantic_styles(self) -> None:
         markup = keyboards.admin_user_keyboard(
             123,
             blacklisted=False,
@@ -415,10 +415,10 @@ class KeyboardModuleTests(unittest.TestCase):
 
         exit_button = keyboards.exit_reply_keyboard(123)["inline_keyboard"][0][0]
         self.assertEqual(exit_button["callback_data"], "cancel:123")
-        self.assertEqual(exit_button["style"], continue_button["style"])
+        self.assertEqual(exit_button["style"], "danger")
         self.assertEqual(
             exit_button["style"],
-            keyboards.REPLY_MODE_BUTTON_STYLE,
+            "danger",
         )
 
         queue_markup = keyboards.conversation_queue_keyboard(
@@ -504,4 +504,3 @@ class TextModuleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

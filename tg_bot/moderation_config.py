@@ -1,23 +1,28 @@
 import os
-import re
 import tempfile
 from pathlib import Path
 
 from dotenv import dotenv_values, set_key, unset_key
+from tg_bot.ai_providers import KEY_PATTERN, MODEL_PATTERN, PROVIDERS, normalize_model
 
 
-DEFAULT_MODEL = "deepseek-flash"
+DEFAULT_MODEL = PROVIDERS["deepseek"].default_model
 
 
 def configure_moderation(env_path: Path, enabled: bool, *, api_key: str = "",
-                         model: str = DEFAULT_MODEL, daily_limit: int = 500) -> None:
+                         model: str = DEFAULT_MODEL, daily_limit: int = 500,
+                         provider: str | None = None, media_policy: str | None = None) -> None:
     if env_path.is_symlink() or not env_path.is_file():
         raise ValueError("A regular .env file is required")
-    if enabled or api_key:
-        if not re.fullmatch(r"[A-Za-z0-9_.-]{8,256}", api_key):
-            raise ValueError("DEEPSEEK_API_KEY is missing or contains invalid characters")
-        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", model):
-            raise ValueError("DEEPSEEK_MODEL is invalid")
+    selected = provider or (dotenv_values(env_path, interpolate=False).get("AI_PROVIDER") or "deepseek")
+    if selected not in PROVIDERS or media_policy not in {None, "hold", "allow"}:
+        raise ValueError("Invalid provider or media policy")
+    model = normalize_model(selected, model)
+    if enabled or api_key or provider is not None:
+        if (enabled or api_key) and not KEY_PATTERN.fullmatch(api_key):
+            raise ValueError("AI_API_KEY is missing or contains invalid characters")
+        if not MODEL_PATTERN.fullmatch(model):
+            raise ValueError("AI_MODEL is invalid")
         if not 1 <= daily_limit <= 1000000:
             raise ValueError("Daily limit must be between 1 and 1000000")
     # Stage every change together, so failed configuration cannot leave half a key set.
@@ -29,9 +34,13 @@ def configure_moderation(env_path: Path, enabled: bool, *, api_key: str = "",
             handle.write(env_path.read_text(encoding="utf-8"))
         staging.chmod(0o600)
         values = {"AI_MODERATION_ENABLED": "true" if enabled else "false"}
-        if enabled or api_key:
-            values.update(DEEPSEEK_API_KEY=api_key, DEEPSEEK_MODEL=model,
+        if enabled or api_key or provider is not None:
+            values.update(AI_PROVIDER=selected, AI_API_KEY=api_key, AI_MODEL=model,
+                          DEEPSEEK_API_KEY=api_key if selected == "deepseek" else "",
+                          DEEPSEEK_MODEL=model if selected == "deepseek" else DEFAULT_MODEL,
                           MODERATION_DAILY_LIMIT=str(daily_limit))
+        if media_policy is not None:
+            values["MODERATION_MEDIA_POLICY"] = media_policy
         for key, value in values.items():
             if not set_key(str(staging), key, value, quote_mode="always")[0]:
                 raise RuntimeError("Unable to save moderation configuration")
@@ -43,4 +52,3 @@ def configure_moderation(env_path: Path, enabled: bool, *, api_key: str = "",
     finally:
         if staging is not None and staging.exists():
             staging.unlink()
-

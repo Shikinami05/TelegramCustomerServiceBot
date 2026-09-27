@@ -69,7 +69,7 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn("ADMIN_REPLY_STATE_TTL_SECONDS=1800", script)
         self.assertIn("BROADCAST_RATE_LIMIT_RETRIES=3", script)
         self.assertIn("DISPLAY_TIMEZONE=Asia/Hong_Kong", script)
-        self.assertIn("Enable DeepSeek ad review", script)
+        self.assertIn("Enable AI ad review", script)
         self.assertIn("AI_MODERATION_ENABLED=false", script)
         self.assertIn("MODERATION_DAILY_LIMIT=500", script)
         self.assertNotIn("TURNSTILE_", script)
@@ -171,4 +171,3 @@ class DeploymentConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

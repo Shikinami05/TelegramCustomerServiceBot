@@ -1,4 +1,5 @@
 import json
+import hashlib
 import sqlite3
 import time
 from pathlib import Path
@@ -42,7 +43,7 @@ def enqueue(db_path: Path, update_id: int, chat_id: int, message_id: int,
 
 
 def recover(db_path: Path) -> None:
-    database.execute(db_path, "UPDATE moderation_jobs SET status='held', reason='服务重启，等待人工确认' "
+    database.execute(db_path, "UPDATE moderation_jobs SET status='held', verdict='error', reason='服务重启，等待人工确认' "
                      "WHERE status='running'")
 
 
@@ -73,24 +74,51 @@ def reserve_request(db_path: Path, update_id: int, daily_limit: int) -> bool:
         return True
 
 
-def hold(db_path: Path, update_id: int, reason: str) -> None:
-    database.execute(db_path, "UPDATE moderation_jobs SET status='held',reason=?,updated_at=CURRENT_TIMESTAMP "
-                     "WHERE update_id=? AND status='running'", (reason, update_id))
+def hold(db_path: Path, update_id: int, reason: str, verdict: str = "error") -> None:
+    database.execute(db_path, "UPDATE moderation_jobs SET status='held',reason=?,verdict=?,updated_at=CURRENT_TIMESTAMP "
+                     "WHERE update_id=? AND status='running'", (reason, verdict, update_id))
+
+
+def record_result(db_path: Path, update_id: int, provider: str, model: str, verdict: str, reason: str) -> None:
+    database.execute(db_path, "UPDATE moderation_jobs SET provider=?,model=?,verdict=?,reason=? "
+                     "WHERE update_id=? AND status='running'", (provider, model, verdict, reason, update_id))
 
 
 def get(db_path: Path, update_id: int) -> sqlite3.Row | None:
     return database.fetchone(db_path, "SELECT * FROM moderation_jobs WHERE update_id=?", (update_id,))
 
 
-def pending_page(db_path: Path, page: int, size: int = 5) -> tuple[list[sqlite3.Row], int, int]:
+FILTERS = {"all": "1=1", "spam": "verdict='spam'", "error": "verdict='error'",
+           "other": "verdict NOT IN ('spam','error')"}
+
+
+def pending_page(db_path: Path, page: int, size: int = 5, category: str = "all") -> tuple[list[sqlite3.Row], int, int]:
+    condition = FILTERS[category]
     with database.connect(db_path) as conn:
         conn.execute("BEGIN")
-        total = conn.execute("SELECT COUNT(*) FROM moderation_jobs WHERE status='held'").fetchone()[0]
+        total = conn.execute(f"SELECT COUNT(*) FROM moderation_jobs WHERE status='held' AND {condition}").fetchone()[0]
         pages = max(1, (total + size - 1) // size)
         page = min(max(1, page), pages)
-        rows = conn.execute("SELECT * FROM moderation_jobs WHERE status='held' ORDER BY update_id LIMIT ? OFFSET ?",
+        rows = conn.execute(f"SELECT * FROM moderation_jobs WHERE status='held' AND {condition} ORDER BY created_at,update_id LIMIT ? OFFSET ?",
                             (size, (page - 1) * size)).fetchall()
         return rows, page, pages
+
+
+def decide(db_path: Path, update_id: int, admin_id: int, *, retry: bool = False) -> bool:
+    with database.connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT chat_id FROM moderation_jobs WHERE update_id=? AND status='held'",
+                           (update_id,)).fetchone()
+        if not row:
+            return False
+        if retry and conn.execute("SELECT 1 FROM blacklists WHERE chat_id=?", (row[0],)).fetchone():
+            return False
+        conn.execute("UPDATE moderation_jobs SET status=?,decided_by=?,updated_at=CURRENT_TIMESTAMP WHERE update_id=?",
+                     ("queued" if retry else "dismissed", admin_id, update_id))
+        conn.execute("INSERT INTO admin_audit_logs(admin_id,action,target_chat_id,details) VALUES(?,?,?,?)",
+                     (admin_id, "moderation_retry" if retry else "moderation_dismiss", row[0], f"update_id={update_id}"))
+        conn.commit()
+        return True
 
 
 def approve(db_path: Path, update_id: int, admin_ids: set[int], admin_id: int | None = None) -> bool:
@@ -155,30 +183,38 @@ def is_current(db_path: Path, update_id: int) -> bool:
 def claim_notice(db_path: Path) -> int:
     with database.connect(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
-        count = conn.execute("SELECT COUNT(*) FROM moderation_jobs WHERE status='held'").fetchone()[0]
+        rows = conn.execute("SELECT update_id,updated_at FROM moderation_jobs WHERE status='held' ORDER BY update_id").fetchall()
+        count = len(rows)
         if not count:
             return 0
+        signature = hashlib.sha256(str([tuple(row) for row in rows]).encode()).hexdigest()
         cursor = conn.execute(
-            "INSERT INTO moderation_notices(id,sent_at) VALUES(1,CURRENT_TIMESTAMP) "
-            "ON CONFLICT(id) DO UPDATE SET sent_at=CURRENT_TIMESTAMP "
-            "WHERE sent_at < datetime('now','-10 minutes')"
+            "INSERT INTO moderation_notices(id,sent_at,signature) VALUES(1,CURRENT_TIMESTAMP,?) "
+            "ON CONFLICT(id) DO UPDATE SET sent_at=CURRENT_TIMESTAMP,signature=excluded.signature "
+            "WHERE sent_at < datetime('now','-10 minutes') AND signature<>excluded.signature", (signature,)
         )
         conn.commit()
         return count if cursor.rowcount else 0
 
 
-def begin_config_input(db_path: Path, admin_id: int, prompt_id: int, kind: str) -> None:
+def begin_config_input(db_path: Path, admin_id: int, prompt_id: int, kind: str,
+                       provider: str = "deepseek", panel_id: int | None = None) -> None:
     with database.connect(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("UPDATE admin_config_inputs SET status='canceled' WHERE admin_id=? AND status='pending'", (admin_id,))
-        conn.execute("INSERT INTO admin_config_inputs(admin_id,prompt_id,kind,expires_at) VALUES(?,?,?,?)",
-                     (admin_id, prompt_id, kind, int(time.time()) + 180))
+        conn.execute("INSERT INTO admin_config_inputs(admin_id,prompt_id,kind,expires_at,provider,panel_id) VALUES(?,?,?,?,?,?)",
+                     (admin_id, prompt_id, kind, int(time.time()) + 180, provider, panel_id))
         conn.commit()
 
 
 def config_input(db_path: Path, admin_id: int, prompt_id: int) -> sqlite3.Row | None:
     return database.fetchone(db_path, "SELECT * FROM admin_config_inputs WHERE admin_id=? AND prompt_id=?",
                              (admin_id, prompt_id))
+
+
+def pending_config_input(db_path: Path, admin_id: int) -> sqlite3.Row | None:
+    return database.fetchone(db_path, "SELECT * FROM admin_config_inputs WHERE admin_id=? AND status='pending' "
+                             "ORDER BY prompt_id DESC LIMIT 1", (admin_id,))
 
 
 def consume_config_input(db_path: Path, admin_id: int, prompt_id: int) -> bool:
@@ -192,4 +228,3 @@ def consume_config_input(db_path: Path, admin_id: int, prompt_id: int) -> bool:
 
 def cancel_config_input(db_path: Path, admin_id: int) -> None:
     database.execute(db_path, "UPDATE admin_config_inputs SET status='canceled' WHERE admin_id=? AND status='pending'", (admin_id,))
-

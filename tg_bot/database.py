@@ -271,6 +271,8 @@ def initialize(db_path: Path) -> None:
 
         ensure_column(conn, "message_logs", "telegram_message_id", "INTEGER")
         ensure_column(conn, "moderation_jobs", "version_at", "INTEGER NOT NULL DEFAULT 0")
+        for column in ("provider", "model", "verdict"):
+            ensure_column(conn, "moderation_jobs", column, "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "message_logs", "edited_at", "DATETIME")
         ensure_column(
             conn,
@@ -415,6 +417,9 @@ def initialize(db_path: Path) -> None:
             "status TEXT NOT NULL DEFAULT 'pending', "
             "PRIMARY KEY(admin_id, prompt_id))"
         )
+        ensure_column(conn, "admin_config_inputs", "provider", "TEXT NOT NULL DEFAULT 'deepseek'")
+        ensure_column(conn, "admin_config_inputs", "panel_id", "INTEGER")
+        ensure_column(conn, "moderation_notices", "signature", "TEXT NOT NULL DEFAULT ''")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_admin_deliveries_pending "
             "ON admin_deliveries(status, next_attempt_at, id)"
@@ -457,4 +462,3 @@ def fetchall(
 ) -> list[sqlite3.Row]:
     with connect(db_path) as conn:
         return conn.execute(sql, params).fetchall()
-

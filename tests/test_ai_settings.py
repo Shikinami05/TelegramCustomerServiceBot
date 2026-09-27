@@ -76,7 +76,7 @@ class AISettingsTests(unittest.IsolatedAsyncioTestCase):
         await self.controller.prompt(1, "key")
         with patch.object(ai_settings, "probe_key", AsyncMock(return_value=True)) as probe:
             self.assertTrue(await self.controller.message(self.message()))
-        probe.assert_awaited_once_with("sk-new-test-private")
+        probe.assert_awaited_once_with("sk-new-test-private", "deepseek")
         self.telegram.assert_awaited_once_with("deleteMessage", {"chat_id": 1, "message_id": 200})
         self.assertEqual(self.settings.deepseek_api_key, "sk-new-test-private")
         self.assertFalse(self.settings.ai_moderation_enabled)
@@ -125,7 +125,7 @@ class AISettingsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_invalidates_input(self):
         await self.controller.prompt(1, "key")
-        self.assertFalse(await self.controller.message(self.message(text="/cancel")))
+        self.assertTrue(await self.controller.message(self.message(text="/cancel")))
         with patch.object(ai_settings, "probe_key", new_callable=AsyncMock) as probe:
             await self.controller.message(self.message())
         probe.assert_not_awaited()

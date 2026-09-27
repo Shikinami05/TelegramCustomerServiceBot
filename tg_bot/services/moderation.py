@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 
 from tg_bot.config import Settings
+from tg_bot.ai_providers import PROVIDERS, request_options
 from tg_bot.repositories import access, moderation
 
 
@@ -37,6 +38,7 @@ MEDIA_METHODS = {
 class Verdict:
     verdict: str
     reason: str
+    failed: bool = False
 
 
 def snapshot(message: dict[str, Any]) -> dict[str, Any]:
@@ -59,7 +61,7 @@ def review_text(message: dict[str, Any]) -> str:
 
 
 async def classify(client: httpx.AsyncClient, api_key: str, model: str,
-                   text: str, timeout: int) -> Verdict:
+                   text: str, timeout: int, provider: str = "deepseek") -> Verdict:
     if not text.strip():
         return Verdict("uncertain", "无可审核文字的媒体，请人工确认")
     if len(text) > 8000:
@@ -68,11 +70,11 @@ async def classify(client: httpx.AsyncClient, api_key: str, model: str,
         "model": model,
         "messages": [{"role": "system", "content": SYSTEM_PROMPT},
                      {"role": "user", "content": json.dumps({"content": text}, ensure_ascii=False)}],
-        "thinking": {"type": "disabled"}, "stream": False,
+        **request_options(provider, model), "stream": False,
         "response_format": {"type": "json_object"}, "max_tokens": 128, "temperature": 0,
     }
     async def read_response() -> tuple[int, bytearray]:
-        async with client.stream("POST", DEEPSEEK_URL, json=payload,
+        async with client.stream("POST", PROVIDERS[provider].base_url + "/chat/completions", json=payload,
                                  headers={"Authorization": f"Bearer {api_key}"},
                                  follow_redirects=False) as response:
             body = bytearray()
@@ -87,20 +89,21 @@ async def classify(client: httpx.AsyncClient, api_key: str, model: str,
         # Bound the whole response, including trickling bytes; compatible with Python 3.10.
         status, body = await asyncio.wait_for(read_response(), timeout=timeout)
         if status != 200:
-            return Verdict("uncertain", f"审核接口异常（HTTP {status}）")
+            hints = {401: "密钥无效或已失效", 402: "余额不足", 403: "无访问权限", 404: "模型不可用", 429: "服务限流，请稍后重试"}
+            return Verdict("uncertain", hints.get(status, f"服务异常（HTTP {status}）"), True)
         choice = json.loads(body)["choices"][0]
         if choice.get("finish_reason") != "stop":
-            return Verdict("uncertain", "审核响应未完整结束")
+            return Verdict("uncertain", "审核响应未完整结束", True)
         data = json.loads(choice["message"]["content"])
         if not isinstance(data, dict) or set(data) != {"verdict"}:
-            return Verdict("uncertain", "审核响应格式异常")
+            return Verdict("uncertain", "审核响应格式异常", True)
         verdict = data["verdict"]
         if not isinstance(verdict, str) or verdict not in REASONS:
-            return Verdict("uncertain", "审核响应分类无效")
+            return Verdict("uncertain", "审核响应分类无效", True)
         return Verdict(verdict, REASONS[verdict])
     except (httpx.HTTPError, asyncio.TimeoutError, ValueError, KeyError, IndexError, TypeError, AttributeError):
         # Never log the request, credentials, response body, or private message.
-        return Verdict("uncertain", "审核暂时不可用，请人工确认")
+        return Verdict("uncertain", "服务超时、网络或响应异常，可稍后重新检测", True)
 
 
 def delivery_payload(message: dict[str, Any], chat_id: int) -> tuple[str, dict[str, Any]]:
@@ -137,18 +140,26 @@ async def process_job(db_path: Path, job: sqlite3.Row, client: httpx.AsyncClient
         moderation.hold(db_path, update_id, "用户已在黑名单中")
         return False
     text = review_text(json.loads(job["snapshot"]))
+    provider = ""
+    model = ""
     if not settings.ai_moderation_enabled:
         result = Verdict("uncertain", "自动审核已关闭，历史任务等待人工处理")
+    elif not text.strip() and settings.moderation_media_policy == "allow":
+        result = Verdict("allow", "按无文字媒体策略接收；未进行图像或语音识别")
     elif not text.strip() or len(text) > 8000:
         result = Verdict("uncertain", "无可审核文字或文字过长，请人工确认")
     elif not moderation.reserve_request(db_path, update_id, settings.moderation_daily_limit):
-        result = Verdict("uncertain", "已达到每日审核调用上限")
+        result = Verdict("uncertain", "已达到每日审核调用上限", True)
     else:
-        result = await classify(client, settings.deepseek_api_key, settings.deepseek_model,
-                                text, settings.moderation_timeout_seconds)
+        provider, model = settings.ai_provider, settings.moderation_model
+        moderation.record_result(db_path, update_id, provider, model, "", "检测中")
+        result = await classify(client, settings.moderation_key, model,
+                                text, settings.moderation_timeout_seconds, provider=provider)
+    verdict = "error" if result.failed else result.verdict
+    moderation.record_result(db_path, update_id, provider, model, verdict, result.reason)
     if result.verdict == "allow":
         return moderation.approve(db_path, update_id, admin_ids)
-    moderation.hold(db_path, update_id, result.reason)
+    moderation.hold(db_path, update_id, result.reason, verdict)
     return False
 
 
@@ -178,4 +189,3 @@ async def run_worker(db_path: Path, get_settings: Callable[[], Settings], admin_
                     with contextlib.suppress(Exception):
                         moderation.hold(db_path, int(job["update_id"]), "审核异常，请人工确认")
                 await asyncio.sleep(2)
-

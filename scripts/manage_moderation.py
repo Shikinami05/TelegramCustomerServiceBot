@@ -10,19 +10,25 @@ from dotenv import dotenv_values
 DEFAULT_ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 sys.path.insert(0, str(DEFAULT_ENV_PATH.parent))
 from tg_bot.moderation_config import DEFAULT_MODEL, configure_moderation
+from tg_bot.ai_providers import PROVIDERS, normalize_model
 
 
 def format_status(values: dict[str, str | None]) -> str:
     enabled = (values.get("AI_MODERATION_ENABLED") or "false").lower() in {"true", "1", "yes", "on"}
-    return "\n".join((f"DeepSeek moderation: {'enabled' if enabled else 'disabled'}",
-                       f"Model: {values.get('DEEPSEEK_MODEL') or DEFAULT_MODEL}",
-                       f"API key: {'configured' if values.get('DEEPSEEK_API_KEY') else 'not configured'}",
+    provider = values.get("AI_PROVIDER") or "deepseek"
+    model = values.get("AI_MODEL") or (values.get("DEEPSEEK_MODEL") if provider == "deepseek" else "") or ""
+    key = values.get("AI_API_KEY") or (values.get("DEEPSEEK_API_KEY") if provider == "deepseek" else "")
+    return "\n".join((f"AI moderation: {'enabled' if enabled else 'disabled'}",
+                       f"Provider: {provider}",
+                       f"Model: {normalize_model(provider, model)}",
+                       f"API key: {'configured' if key else 'not configured'}",
                        f"Daily request limit (UTC): {values.get('MODERATION_DAILY_LIMIT') or '500'}",
-                       "Suspicious messages and API failures require manual review: /moderation"))
+                       f"Media without text: {values.get('MODERATION_MEDIA_POLICY') or 'hold'}",
+                       "Held messages: /moderation; settings: /ai"))
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Manage optional DeepSeek advertisement filtering.")
+    parser = argparse.ArgumentParser(description="Manage optional AI advertisement filtering.")
     parser.add_argument("action", choices=("status", "enable", "disable"))
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_PATH, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -32,11 +38,20 @@ def main() -> int:
             raise ValueError(".env file not found")
         values = dict(dotenv_values(path, interpolate=False))
         if args.action == "enable":
-            print("Message text and hidden link targets will be sent to DeepSeek. API usage is billed by DeepSeek.")
-            key = getpass.getpass("DeepSeek API key (Enter to keep existing): ").strip() or values.get("DEEPSEEK_API_KEY") or ""
-            model = input(f"DeepSeek model [{values.get('DEEPSEEK_MODEL') or DEFAULT_MODEL}]: ").strip() or values.get("DEEPSEEK_MODEL") or DEFAULT_MODEL
+            old_provider = values.get("AI_PROVIDER") or "deepseek"
+            print("Providers: deepseek, siliconflow (China), siliconflow-intl (international)")
+            provider = input(f"AI provider [{old_provider}]: ").strip() or old_provider
+            if provider not in PROVIDERS:
+                raise ValueError("Invalid provider")
+            print(f"Message text and hidden links will be sent to {PROVIDERS[provider].name}. API fees may apply.")
+            existing_key = (values.get("AI_API_KEY") or (values.get("DEEPSEEK_API_KEY") if provider == "deepseek" else "")) if provider == old_provider else ""
+            key = getpass.getpass("API key (Enter to keep existing for this provider): ").strip() or existing_key or ""
+            old_model = (values.get("AI_MODEL") or values.get("DEEPSEEK_MODEL") or "") if provider == old_provider else ""
+            default_model = normalize_model(provider, old_model)
+            model = input(f"Model [{default_model}]: ").strip() or default_model
             limit = input(f"Daily request limit [{values.get('MODERATION_DAILY_LIMIT') or '500'}]: ").strip() or values.get("MODERATION_DAILY_LIMIT") or "500"
-            configure_moderation(path, True, api_key=key, model=model, daily_limit=int(limit))
+            media_policy = input(f"Media without text: hold or allow [{values.get('MODERATION_MEDIA_POLICY') or 'hold'}]: ").strip() or values.get("MODERATION_MEDIA_POLICY") or "hold"
+            configure_moderation(path, True, api_key=key, model=model, daily_limit=int(limit), provider=provider, media_policy=media_policy)
         elif args.action == "disable":
             configure_moderation(path, False)
         print(format_status(dict(dotenv_values(path, interpolate=False))))
@@ -48,4 +63,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
