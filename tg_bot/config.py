@@ -67,12 +67,9 @@ class Settings:
     user_rate_limit_window_seconds: int
     user_rate_limit_cooldown_seconds: int
     message_retention_days: int
-    broadcast_send_delay_seconds: float
     update_processing_timeout_seconds: int
-    pending_reminder_minutes: int
     admin_reply_state_ttl_seconds: int
     telegram_inline_retry_max_seconds: int
-    broadcast_rate_limit_retries: int
     ai_moderation_enabled: bool
     deepseek_api_key: str = field(repr=False)
     deepseek_model: str
@@ -89,6 +86,7 @@ class Settings:
     ai_api_key: str = field(default="", repr=False)
     ai_model: str = ""
     moderation_media_policy: str = "hold"
+    spam_rules_enabled: bool = True
 
     @property
     def moderation_key(self) -> str:
@@ -157,21 +155,14 @@ def load_settings(base_dir: Path) -> Settings:
             "USER_RATE_LIMIT_COOLDOWN_SECONDS", 300, 1
         ),
         message_retention_days=env_int("MESSAGE_RETENTION_DAYS", 0, 0),
-        broadcast_send_delay_seconds=env_float(
-            "BROADCAST_SEND_DELAY_SECONDS", 0.05, 0.0
-        ),
         update_processing_timeout_seconds=env_int(
             "UPDATE_PROCESSING_TIMEOUT_SECONDS", 300, 30
         ),
-        pending_reminder_minutes=env_int("PENDING_REMINDER_MINUTES", 30, 1),
         admin_reply_state_ttl_seconds=env_int(
             "ADMIN_REPLY_STATE_TTL_SECONDS", 1800, 60
         ),
         telegram_inline_retry_max_seconds=env_int(
             "TELEGRAM_INLINE_RETRY_MAX_SECONDS", 5, 0
-        ),
-        broadcast_rate_limit_retries=env_int(
-            "BROADCAST_RATE_LIMIT_RETRIES", 3, 0
         ),
         ai_moderation_enabled=ai_moderation_enabled,
         deepseek_api_key=deepseek_api_key,
@@ -191,4 +182,5 @@ def load_settings(base_dir: Path) -> Settings:
         ai_api_key=ai_key,
         ai_model=ai_model,
         moderation_media_policy=media_policy,
+        spam_rules_enabled=env_bool("SPAM_RULES_ENABLED", True),
     )

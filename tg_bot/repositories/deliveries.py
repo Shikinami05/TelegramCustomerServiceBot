@@ -3,6 +3,7 @@ import time
 from pathlib import Path
 
 from tg_bot import database
+from tg_bot.repositories.conversations import mark_read_in_connection
 from tg_bot.models import TelegramSendResult
 from tg_bot.repositories.messages import add_link_in_connection
 from tg_bot.text import truncate_text
@@ -221,6 +222,7 @@ def prepare_reply(
     admin_message_id: int,
     user_chat_id: int,
     route: str,
+    read_through_seq: int = 0,
 ) -> str:
     with database.connect(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -257,8 +259,8 @@ def prepare_reply(
             """
             INSERT INTO admin_reply_deliveries (
                 admin_chat_id, admin_message_id, update_id, admin_id,
-                user_chat_id, route, status
-            ) VALUES (?, ?, ?, ?, ?, ?, 'pending')
+                user_chat_id, route, read_through_seq, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
             """,
             (
                 admin_chat_id,
@@ -267,6 +269,7 @@ def prepare_reply(
                 admin_id,
                 user_chat_id,
                 route,
+                read_through_seq,
             ),
         )
         conn.commit()
@@ -353,7 +356,7 @@ def complete_reply(
         conn.execute("BEGIN IMMEDIATE")
         delivery = conn.execute(
             """
-            SELECT status, user_chat_id, route
+            SELECT status, user_chat_id, route, read_through_seq
             FROM admin_reply_deliveries
             WHERE admin_chat_id = ? AND admin_message_id = ?
             """,
@@ -390,12 +393,13 @@ def complete_reply(
                 chat_id, status, unread_count, last_admin_reply_at, updated_at
             ) VALUES (?, 'open', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             ON CONFLICT(chat_id) DO UPDATE SET
-                status = 'open', unread_count = 0,
+                status = 'open',
                 last_admin_reply_at = CURRENT_TIMESTAMP,
                 updated_at = CURRENT_TIMESTAMP, closed_at = NULL
             """,
             (user_chat_id,),
         )
+        mark_read_in_connection(conn, user_chat_id, int(delivery["read_through_seq"]))
         conn.execute(
             """
             INSERT INTO admin_audit_logs (

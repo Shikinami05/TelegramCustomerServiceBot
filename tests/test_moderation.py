@@ -324,7 +324,7 @@ class ModerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.get_message_link(1, 456)["user_chat_id"], 50)
 
     async def test_disabled_moderation_preserves_existing_delivery(self):
-        with patch.object(app, "AI_MODERATION_ENABLED", False), \
+        with patch.object(app, "AI_MODERATION_ENABLED", False), patch.object(app, "SETTINGS", replace(app.SETTINGS, spam_rules_enabled=False)), \
              patch.object(app, "send_message", new_callable=AsyncMock):
             await app.handle_user_message(self.message(), 100)
         self.assertIsNone(repository.get(self.db_path, 100))
@@ -395,4 +395,3 @@ class ModerationConfigTests(unittest.TestCase):
                 os.environ["AI_MODERATION_ENABLED"] = "true"
                 with self.assertRaisesRegex(RuntimeError, "DEEPSEEK_API_KEY"):
                     load_settings(root)
-

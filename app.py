@@ -5,10 +5,8 @@ import html
 import json
 import logging
 import os
-import secrets
 import sqlite3
 import time
-import uuid
 from contextlib import AbstractContextManager, asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,9 +22,8 @@ from tg_bot.config import (
 )
 from tg_bot import database, keyboards
 from tg_bot.keyboards import ButtonSpec
-from tg_bot.models import ConversationClaimResult, TelegramSendResult
+from tg_bot.models import TelegramSendResult
 from tg_bot.repositories import access as access_repository
-from tg_bot.repositories import broadcasts as broadcast_repository
 from tg_bot.repositories import conversations as conversation_repository
 from tg_bot.repositories import deliveries as delivery_repository
 from tg_bot.repositories import inbound as inbound_repository
@@ -35,7 +32,6 @@ from tg_bot.repositories import moderation as moderation_repository
 from tg_bot.repositories import updates as update_repository
 from tg_bot.repositories import users as user_repository
 from tg_bot.services import admin_delivery as admin_delivery_service
-from tg_bot.services import broadcast as broadcast_service
 from tg_bot.services import moderation as moderation_service
 from tg_bot.services.ai_settings import AISettingsController
 from tg_bot.services.moderation_ui import ModerationInbox
@@ -59,12 +55,9 @@ USER_RATE_LIMIT_COUNT = SETTINGS.user_rate_limit_count
 USER_RATE_LIMIT_WINDOW_SECONDS = SETTINGS.user_rate_limit_window_seconds
 USER_RATE_LIMIT_COOLDOWN_SECONDS = SETTINGS.user_rate_limit_cooldown_seconds
 MESSAGE_RETENTION_DAYS = SETTINGS.message_retention_days
-BROADCAST_SEND_DELAY_SECONDS = SETTINGS.broadcast_send_delay_seconds
 UPDATE_PROCESSING_TIMEOUT_SECONDS = SETTINGS.update_processing_timeout_seconds
-PENDING_REMINDER_MINUTES = SETTINGS.pending_reminder_minutes
 ADMIN_REPLY_STATE_TTL_SECONDS = SETTINGS.admin_reply_state_ttl_seconds
 TELEGRAM_INLINE_RETRY_MAX_SECONDS = SETTINGS.telegram_inline_retry_max_seconds
-BROADCAST_RATE_LIMIT_RETRIES = SETTINGS.broadcast_rate_limit_retries
 WEBHOOK_MAX_BODY_BYTES = 1024 * 1024
 AI_MODERATION_ENABLED = SETTINGS.ai_moderation_enabled
 DISPLAY_TIMEZONE_NAME = SETTINGS.display_timezone_name
@@ -86,22 +79,22 @@ for dependency_logger_name in ("httpx", "httpcore"):
 
 telegram_client: httpx.AsyncClient | None = None
 backup_task: asyncio.Task[None] | None = None
-broadcast_worker_task: asyncio.Task[None] | None = None
-broadcast_wakeup: asyncio.Event | None = None
 admin_delivery_worker_task: asyncio.Task[None] | None = None
 admin_delivery_wakeup: asyncio.Event | None = None
 moderation_worker_task: asyncio.Task[None] | None = None
 moderation_wakeup: asyncio.Event | None = None
 ai_settings_controller: AISettingsController | None = None
+admin_ui_locks: dict[int, asyncio.Lock] = {}
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global telegram_client, backup_task, broadcast_worker_task, broadcast_wakeup
+    global telegram_client, backup_task
     global admin_delivery_worker_task, admin_delivery_wakeup
     global moderation_worker_task, moderation_wakeup, ai_settings_controller
 
     init_db()
+    admin_ui_locks.clear()
     ai_settings_controller = None
     recover_interrupted_work()
     moderation_repository.recover(DB_PATH)
@@ -115,7 +108,6 @@ async def lifespan(_: FastAPI):
         timeout=httpx.Timeout(20.0),
         limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
     )
-    broadcast_wakeup = asyncio.Event()
     admin_delivery_wakeup = asyncio.Event()
     moderation_wakeup = asyncio.Event()
     moderation_worker_task = asyncio.create_task(
@@ -125,9 +117,6 @@ async def lifespan(_: FastAPI):
         ), name="moderation-worker",
     )
     backup_task = asyncio.create_task(periodic_db_backup(), name="database-backup")
-    broadcast_worker_task = asyncio.create_task(
-        periodic_broadcast_worker(), name="broadcast-worker"
-    )
     admin_delivery_worker_task = asyncio.create_task(
         periodic_admin_delivery_worker(), name="admin-delivery-worker"
     )
@@ -138,7 +127,6 @@ async def lifespan(_: FastAPI):
         for task in (
             moderation_worker_task,
             admin_delivery_worker_task,
-            broadcast_worker_task,
             backup_task,
         ):
             if task:
@@ -146,7 +134,6 @@ async def lifespan(_: FastAPI):
         for task in (
             moderation_worker_task,
             admin_delivery_worker_task,
-            broadcast_worker_task,
             backup_task,
         ):
             if task:
@@ -163,40 +150,9 @@ WELCOME_TEXT = (
     "<b>统一留言聊天入口</b>\n\n"
     "请直接在这里发送消息，我看到后会通过 Bot 回复你。"
 )
-QUEUE_LABELS = {
-    "inbox": "待处理",
-    "pending": "超时",
-    "closed": "已处理",
-}
+QUEUE_LABELS = {"inbox": "未读", "all": "全部"}
 ADMIN_PAGE_SIZE = 10
 
-BROADCAST_STATUS_LABELS = {
-    "pending": "等待确认",
-    "queued": "等待发送",
-    "running": "发送中",
-    "completed": "已完成",
-    "canceled": "已取消",
-}
-
-AUDIT_ACTION_LABELS = {
-    "reply_mode_enter": "进入回复",
-    "reply_mode_exit": "退出回复",
-    "message_sent": "发送回复",
-    "conversation_takeover": "接管会话",
-    "conversation_resolved": "标记已处理",
-    "conversation_reopened": "重新打开",
-    "blacklist_add": "加入黑名单",
-    "blacklist_remove": "解除黑名单",
-    "moderation_allow": "审核放行",
-    "moderation_block": "广告封禁",
-    "moderation_dismiss": "忽略单条留言",
-    "moderation_retry": "重新检测留言",
-    "ai_settings": "AI 配置更新",
-    "broadcast_created": "创建群发",
-    "broadcast_confirmed": "确认群发",
-    "broadcast_canceled": "取消群发",
-    "broadcast_retry": "重试群发",
-}
 
 # =========================
 # 数据库
@@ -305,32 +261,6 @@ def purge_expired_data() -> None:
             """
             DELETE FROM admin_audit_logs
             WHERE created_at < datetime('now', '-365 days')
-            """
-        )
-        conn.execute(
-            """
-            UPDATE pending_broadcasts
-            SET status = 'canceled', completed_at = CURRENT_TIMESTAMP,
-                last_error = 'confirmation expired'
-            WHERE status = 'pending'
-              AND created_at < datetime('now', '-1 day')
-            """
-        )
-        conn.execute(
-            """
-            DELETE FROM broadcast_recipients
-            WHERE broadcast_id IN (
-                SELECT id FROM pending_broadcasts
-                WHERE status IN ('completed', 'canceled')
-                  AND created_at < datetime('now', '-30 days')
-            )
-            """
-        )
-        conn.execute(
-            """
-            DELETE FROM pending_broadcasts
-            WHERE status IN ('completed', 'canceled')
-              AND created_at < datetime('now', '-30 days')
             """
         )
         conn.execute(
@@ -649,24 +579,6 @@ def user_label(user: dict[str, Any]) -> str:
     return name or str(user.get("id"))
 
 
-def user_identity_html(user: dict[str, Any]) -> str:
-    username = (
-        f"@{escape_html_limited(str(user['username']), 80)}"
-        if user.get("username")
-        else "-"
-    )
-    name = " ".join(
-        str(value)
-        for value in (user.get("first_name"), user.get("last_name"))
-        if value
-    ).strip()
-    return (
-        f"ID：<code>{int(user['id'])}</code>\n"
-        f"Username：{username}\n"
-        f"Name：{escape_html_limited(name, 100) if name else '-'}"
-    )
-
-
 def compact_timestamp(value: Any) -> str:
     if not value:
         return "-"
@@ -689,7 +601,7 @@ def row_user_label(row: sqlite3.Row) -> str:
     name = " ".join(
         value for value in (row["first_name"], row["last_name"]) if value
     ).strip()
-    return name or str(row["chat_id"])
+    return name or "未命名联系人"
 
 
 def message_content(message: dict[str, Any]) -> str:
@@ -961,42 +873,8 @@ def record_user_activity(chat_id: int, increment_unread: bool = True) -> None:
     )
 
 
-def mark_conversation_replied(chat_id: int) -> None:
-    conversation_repository.mark_replied(DB_PATH, chat_id)
-
-
-def reopen_conversation(chat_id: int) -> None:
-    conversation_repository.reopen(DB_PATH, chat_id)
-
-
 def get_conversation(chat_id: int) -> sqlite3.Row | None:
     return conversation_repository.get(DB_PATH, chat_id)
-
-
-def get_conversation_owner(chat_id: int) -> int | None:
-    return conversation_repository.get_owner(DB_PATH, chat_id)
-
-
-def claim_conversation(
-    chat_id: int,
-    admin_id: int,
-    *,
-    force: bool = False,
-    reopen: bool = False,
-    activate_reply: bool = False,
-) -> ConversationClaimResult:
-    return conversation_repository.claim(
-        DB_PATH,
-        chat_id,
-        admin_id,
-        force=force,
-        reopen_closed=reopen,
-        activate_reply=activate_reply,
-    )
-
-
-def close_conversation(chat_id: int) -> None:
-    conversation_repository.close(DB_PATH, chat_id)
 
 
 def conversation_queue_filter(
@@ -1004,7 +882,6 @@ def conversation_queue_filter(
 ) -> tuple[str, str, tuple[Any, ...]]:
     return conversation_repository.queue_filter(
         queue_name,
-        PENDING_REMINDER_MINUTES,
     )
 
 
@@ -1012,7 +889,6 @@ def count_conversation_queue(queue_name: str) -> int:
     return conversation_repository.count_queue(
         DB_PATH,
         queue_name,
-        PENDING_REMINDER_MINUTES,
     )
 
 
@@ -1024,7 +900,6 @@ def get_conversation_queue(
     return conversation_repository.list_queue(
         DB_PATH,
         queue_name,
-        PENDING_REMINDER_MINUTES,
         limit,
         offset,
     )
@@ -1058,129 +933,36 @@ def parse_callback_page(raw_page: str | None) -> int | None:
 def get_queue_counts() -> dict[str, int]:
     return conversation_repository.queue_counts(
         DB_PATH,
-        PENDING_REMINDER_MINUTES,
     )
+
+
+def chat_label_html(chat_id: int) -> str:
+    user = user_repository.get(DB_PATH, chat_id)
+    return escape_html_limited(row_user_label(user) if user else "未命名联系人", 90)
 
 
 def format_admin_dashboard(admin_id: int) -> str:
     counts = get_queue_counts()
-    role = "负责人" if is_owner(admin_id) else "管理员"
-    target_chat_id = get_admin_state(admin_id)
-    reply_state = (
-        f"\n\n<b>正在回复</b>\n用户 <code>{target_chat_id}</code>"
-        if target_chat_id is not None
-        else ""
-    )
-    return (
-        "<b>留言工作台</b>\n"
-        f"<code>{admin_id}</code> · {role}\n"
-        f"显示时区：<code>{escape_html_limited(DISPLAY_TIMEZONE_NAME, 64)}</code>\n\n"
-        f"待处理：<b>{counts['inbox']}</b>\n"
-        f"其中超时：<b>{counts['pending']}</b>\n"
-        f"已处理：<b>{counts['closed']}</b>"
-        f"{reply_state}"
-    )
+    target = get_admin_state(admin_id)
+    state = f"\n正在回复：{chat_label_html(target)}" if target is not None else ""
+    return f"<b>聊天中转</b>\n\n未读聊天：{counts['inbox']}{state}"
 
 
 def format_conversation_queue(
-    queue_name: str,
-    rows: list[sqlite3.Row],
-    page: int = 1,
-    total_pages: int = 1,
-    total_count: int | None = None,
-) -> str:
-    titles = {
-        "inbox": "待处理",
-        "pending": f"超时待处理（超过 {PENDING_REMINDER_MINUTES} 分钟）",
-        "closed": "已处理",
-    }
-    total = len(rows) if total_count is None else total_count
-    lines = [
-        f"<b>{titles[queue_name]}</b>",
-        f"共 {total} 个会话 · 第 {page}/{total_pages} 页\n"
-        f"显示时区：<code>{escape_html_limited(DISPLAY_TIMEZONE_NAME, 64)}</code>",
-    ]
-    if not rows:
-        empty_messages = {
-            "inbox": "当前没有待处理消息。",
-            "pending": "当前没有超时消息。",
-            "closed": "当前没有已处理会话。",
-        }
-        lines.append(empty_messages[queue_name])
-        return "\n\n".join(lines)
-
-    start_index = (page - 1) * ADMIN_PAGE_SIZE
-    for index, row in enumerate(rows, start=start_index + 1):
-        name = escape_html_limited(row_user_label(row), 80)
-        owner_admin_id = row["owner_admin_id"]
-        owner = (
-            f"管理员 <code>{owner_admin_id}</code>"
-            if owner_admin_id is not None
-            else "未接管"
-        )
-        unread = int(row["unread_count"] or 0)
-        timestamp = (
-            row["closed_at"]
-            if queue_name == "closed"
-            else row["last_user_message_at"]
-        )
-        if queue_name == "closed":
-            state_line = f"已处理 · {compact_timestamp(timestamp)}"
-        else:
-            state_line = (
-                f"{unread} 条待处理 · {owner} · {compact_timestamp(timestamp)}"
-            )
-        lines.append(
-            f"<b>{index}. {name}</b>\n"
-            f"<code>{row['chat_id']}</code> · {state_line}\n"
-            f"{escape_html_limited(row['last_message'] or '无内容摘要', 160)}"
-        )
-    return "\n\n".join(lines)
-
-
-def count_recent_users() -> int:
-    return user_repository.count(DB_PATH)
-
-
-def get_recent_users(
-    limit: int = ADMIN_PAGE_SIZE,
-    offset: int = 0,
-) -> list[sqlite3.Row]:
-    return user_repository.list_recent(DB_PATH, limit, offset)
-
-
-def format_recent_users(
-    rows: list[sqlite3.Row],
-    page: int = 1,
-    total_pages: int = 1,
-    total_count: int | None = None,
+    queue_name: str, rows: list[sqlite3.Row], page: int = 1,
+    total_pages: int = 1, total_count: int | None = None,
 ) -> str:
     total = len(rows) if total_count is None else total_count
-    lines = [
-        "<b>最近用户</b>",
-        f"共 {total} 位用户 · 第 {page}/{total_pages} 页\n"
-        f"显示时区：<code>{escape_html_limited(DISPLAY_TIMEZONE_NAME, 64)}</code>",
-    ]
+    lines = [f"<b>聊天 · {QUEUE_LABELS[queue_name]}</b>", f"共 {total} 个聊天 · 第 {page}/{total_pages} 页"]
     if not rows:
-        lines.append("暂无用户记录。")
-        return "\n\n".join(lines)
-
-    start_index = (page - 1) * ADMIN_PAGE_SIZE
-    for index, row in enumerate(rows, start=start_index + 1):
+        lines.append("没有未读消息。" if queue_name == "inbox" else "还没有聊天记录。")
+    for index, row in enumerate(rows, start=(page - 1) * ADMIN_PAGE_SIZE + 1):
         unread = int(row["unread_count"] or 0)
-        if row["blocked"]:
-            state = "黑名单"
-        elif unread > 0:
-            state = f"待处理 {unread}"
-        elif row["conversation_status"] == "closed":
-            state = "已处理"
-        else:
-            state = "暂无待处理"
+        state = "已拉黑" if is_blacklisted(int(row["chat_id"])) else (f"未读 {unread}" if unread else "已读")
         lines.append(
-            f"<b>{index}. {escape_html_limited(row_user_label(row), 80)}</b>\n"
-            f"<code>{row['chat_id']}</code> · {state} · "
-            f"{compact_timestamp(row['updated_at'])}\n"
-            f"{escape_html_limited(row['last_message'] or '无内容摘要', 140)}"
+            f"<b>{index}. {escape_html_limited(row_user_label(row), 70)}</b>\n"
+            f"{state} · {compact_timestamp(row['last_user_message_at'])}\n"
+            f"{escape_html_limited(row['last_message'] or '无文字内容', 150)}"
         )
     return "\n\n".join(lines)
 
@@ -1188,143 +970,23 @@ def format_recent_users(
 def format_user_detail(chat_id: int) -> str:
     user = user_repository.get(DB_PATH, chat_id)
     if not user:
-        return f"<b>用户详情</b>\n\n未找到用户 <code>{chat_id}</code>。"
-
-    conversation = get_conversation(chat_id)
-    unread = int(conversation["unread_count"] or 0) if conversation else 0
-    owner_admin_id = conversation["owner_admin_id"] if conversation else None
-    if is_blacklisted(chat_id):
-        state = "黑名单"
-    elif conversation and conversation["status"] == "closed":
-        state = "已处理"
-    elif unread > 0:
-        state = f"待处理 {unread}"
-    else:
-        state = "暂无待处理"
-    owner = (
-        f"<code>{owner_admin_id}</code>" if owner_admin_id is not None else "未接管"
-    )
-    last_user_message_at = (
-        compact_timestamp(conversation["last_user_message_at"])
-        if conversation
-        else "-"
-    )
-    last_admin_reply_at = (
-        compact_timestamp(conversation["last_admin_reply_at"])
-        if conversation
-        else "-"
-    )
-    username = (
-        f"@{escape_html_limited(str(user['username']), 80)}"
-        if user["username"]
-        else "-"
-    )
-    name = " ".join(
-        str(value)
-        for value in (user["first_name"], user["last_name"])
-        if value
-    ).strip()
+        return "<b>用户详情</b>\n\n未找到该联系人。"
+    username = f"@{escape_html_limited(str(user['username']), 80)}" if user["username"] else "未设置"
     return (
-        "<b>用户详情</b>\n\n"
-        f"<b>{escape_html_limited(row_user_label(user), 100)}</b>\n"
-        f"ID：<code>{chat_id}</code>\n"
-        f"Username：{username}\n"
-        f"Name：{escape_html_limited(name, 100) if name else '-'}\n"
-        f"状态：{state}\n"
-        f"接管：{owner}\n"
-        f"最后留言：{last_user_message_at}\n"
-        f"最后回复：{last_admin_reply_at}\n\n"
-        "<b>最近记录</b>\n"
-        f"{format_history(chat_id, limit=10)}"
+        f"<b>{chat_label_html(chat_id)}</b>\n"
+        f"ID：<code>{chat_id}</code>\n用户名：{username}\n"
+        f"状态：{'已拉黑' if is_blacklisted(chat_id) else '正常'}\n\n"
+        f"<b>聊天记录</b>\n{format_history(chat_id, limit=10, max_chars=2400)}"
     )
 
 
-def create_pending_broadcast(admin_id: int, content: str) -> str:
-    return broadcast_repository.create(DB_PATH, admin_id, content)
-
-
-def queue_broadcast(broadcast_id: str, admin_id: int) -> tuple[str, int]:
-    return broadcast_repository.queue(DB_PATH, broadcast_id, admin_id)
-
-
-def cancel_pending_broadcast(broadcast_id: str, admin_id: int) -> str:
-    return broadcast_repository.cancel(DB_PATH, broadcast_id, admin_id)
-
-
-def retry_failed_broadcast(broadcast_id: str) -> tuple[str, int]:
-    return broadcast_repository.retry_failed(DB_PATH, broadcast_id)
-
-
-def claim_next_broadcast_job() -> sqlite3.Row | None:
-    return broadcast_repository.claim_next_job(DB_PATH)
-
-
-def claim_next_broadcast_recipient(broadcast_id: str) -> int | None:
-    return broadcast_repository.claim_next_recipient(DB_PATH, broadcast_id)
-
-
-def finish_broadcast_recipient(
-    broadcast_id: str,
-    chat_id: int,
-    sent: bool,
-    error: str = "",
-    unknown: bool = False,
-) -> None:
-    broadcast_repository.finish_recipient(
-        DB_PATH,
-        broadcast_id,
-        chat_id,
-        sent,
-        error,
-        unknown,
-    )
-
-
-def complete_broadcast(broadcast_id: str) -> sqlite3.Row | None:
-    return broadcast_repository.complete(DB_PATH, broadcast_id)
-
-
-def recover_broadcast_job(broadcast_id: str, error: str) -> None:
-    broadcast_repository.recover(DB_PATH, broadcast_id, error)
-
-
-def active_user_count() -> int:
-    return broadcast_repository.active_user_count(DB_PATH)
-
-
-async def process_broadcast_job(job: sqlite3.Row) -> None:
-    await broadcast_service.process_job(
-        job,
-        claim_next_broadcast_recipient,
-        complete_broadcast,
-        is_blacklisted,
-        finish_broadcast_recipient,
-        send_message,
-        BROADCAST_RATE_LIMIT_RETRIES,
-        BROADCAST_SEND_DELAY_SECONDS,
-    )
-
-
-async def periodic_broadcast_worker() -> None:
-    await broadcast_service.run_worker(
-        broadcast_wakeup,
-        claim_next_broadcast_job,
-        process_broadcast_job,
-        recover_broadcast_job,
-        logger,
-    )
-
-
-def admin_user_keyboard(chat_id: int, viewer_admin_id: int | None = None) -> dict[str, Any]:
+def admin_user_keyboard(chat_id: int, viewer_admin_id: int | None = None, *, read_through_seq: int | None = None) -> dict[str, Any]:
     conversation = get_conversation(chat_id)
-    is_closed = bool(conversation and conversation["status"] == "closed")
-    owner_admin_id = get_conversation_owner(chat_id)
     return keyboards.admin_user_keyboard(
-        chat_id,
-        blacklisted=is_blacklisted(chat_id),
-        closed=is_closed,
-        owner_admin_id=owner_admin_id,
-        viewer_admin_id=viewer_admin_id,
+        chat_id, blacklisted=is_blacklisted(chat_id),
+        active_reply=viewer_admin_id is not None and get_admin_state(viewer_admin_id) == chat_id,
+        read_through_seq=(read_through_seq if read_through_seq is not None
+                          else int(conversation["last_inbound_seq"]) if conversation else 0),
     )
 
 
@@ -1332,61 +994,20 @@ def admin_dashboard_keyboard(admin_id: int | None = None) -> dict[str, Any]:
     counts = get_queue_counts()
     row = db_fetchone("SELECT COUNT(*) AS count FROM moderation_jobs WHERE status='held'")
     counts["moderation"] = int(row["count"]) if row else 0
-    return keyboards.admin_dashboard_keyboard(
-        counts,
-        show_ai_settings=admin_id is not None and is_owner(admin_id),
-    )
+    return keyboards.admin_dashboard_keyboard(counts)
 
 
-def pagination_navigation_row(
-    callback_prefix: str,
-    page: int,
-    total_pages: int,
-) -> list[ButtonSpec]:
+def pagination_navigation_row(callback_prefix: str, page: int, total_pages: int) -> list[ButtonSpec]:
     return keyboards.pagination_navigation_row(callback_prefix, page, total_pages)
 
 
-def queue_navigation_rows(
-    queue_name: str,
-    page: int,
-    total_pages: int,
-) -> list[list[ButtonSpec]]:
-    return keyboards.queue_navigation_rows(
-        queue_name,
-        page,
-        total_pages,
-        get_queue_counts(),
-    )
-
-
-def recent_users_keyboard(
-    rows: list[sqlite3.Row],
-    page: int = 1,
-    total_pages: int = 1,
-) -> dict[str, Any]:
-    return keyboards.recent_users_keyboard(
-        rows,
-        page=page,
-        total_pages=total_pages,
-        page_size=ADMIN_PAGE_SIZE,
-    )
-
-
 def conversation_queue_keyboard(
-    rows: list[sqlite3.Row],
-    queue_name: str,
-    viewer_admin_id: int | None = None,
-    page: int = 1,
-    total_pages: int = 1,
+    rows: list[sqlite3.Row], queue_name: str, viewer_admin_id: int | None = None,
+    page: int = 1, total_pages: int = 1,
 ) -> dict[str, Any]:
     return keyboards.conversation_queue_keyboard(
-        rows,
-        queue_name,
-        viewer_admin_id=viewer_admin_id,
-        page=page,
-        total_pages=total_pages,
-        page_size=ADMIN_PAGE_SIZE,
-        counts=get_queue_counts(),
+        rows, queue_name, viewer_admin_id=viewer_admin_id,
+        page=page, total_pages=total_pages, page_size=ADMIN_PAGE_SIZE, counts=get_queue_counts(),
     )
 
 
@@ -1399,99 +1020,92 @@ def welcome_keyboard() -> dict[str, Any]:
 
 
 async def present_admin_view(
-    admin_id: int,
-    text: str,
-    reply_markup: dict[str, Any],
+    admin_id: int, text: str, reply_markup: dict[str, Any],
     callback: dict[str, Any] | None = None,
-) -> None:
+) -> bool:
     if callback:
-        callback_message = callback.get("message") or {}
-        callback_chat = callback_message.get("chat") or {}
-        callback_chat_id = callback_chat.get("id")
-        callback_message_id = callback_message.get("message_id")
-        # Keep original message-to-user links intact: never turn a replyable notification into a menu.
-        if (callback_chat_id == admin_id and isinstance(callback_message_id, int)
-                and get_message_link(admin_id, callback_message_id) is None):
-            if await edit_message_text(
-                callback_chat_id,
-                callback_message_id,
-                text,
-                reply_markup=reply_markup,
-            ):
-                return
-    await send_message(admin_id, text, reply_markup=reply_markup)
+        message = callback.get("message") or {}
+        if (message.get("chat", {}).get("id") == admin_id and isinstance(message.get("message_id"), int)
+                and get_message_link(admin_id, message["message_id"]) is None):
+            if await edit_message_text(admin_id, message["message_id"], text, reply_markup=reply_markup):
+                return True
+    return bool(await send_message(admin_id, text, reply_markup=reply_markup))
 
 
-async def show_admin_dashboard(
-    admin_id: int,
-    callback: dict[str, Any] | None = None,
-) -> None:
+async def show_admin_dashboard(admin_id: int, callback: dict[str, Any] | None = None) -> None:
     clear_admin_state(admin_id)
     moderation_repository.cancel_config_input(DB_PATH, admin_id)
-    await present_admin_view(
-        admin_id,
-        format_admin_dashboard(admin_id),
-        admin_dashboard_keyboard(admin_id),
-        callback,
-    )
+    await present_admin_view(admin_id, format_admin_dashboard(admin_id), admin_dashboard_keyboard(admin_id), callback)
 
 
 async def show_conversation_queue(
-    admin_id: int,
-    queue_name: str,
-    page: int = 1,
-    callback: dict[str, Any] | None = None,
+    admin_id: int, queue_name: str, page: int = 1, callback: dict[str, Any] | None = None,
 ) -> None:
     clear_admin_state(admin_id)
     moderation_repository.cancel_config_input(DB_PATH, admin_id)
-    total_count = count_conversation_queue(queue_name)
-    page, total_pages, offset = paginate(page, total_count)
-    rows = get_conversation_queue(
-        queue_name,
-        limit=ADMIN_PAGE_SIZE,
-        offset=offset,
-    )
+    total = count_conversation_queue(queue_name)
+    page, pages, offset = paginate(page, total)
+    rows = get_conversation_queue(queue_name, limit=ADMIN_PAGE_SIZE, offset=offset)
     await present_admin_view(
-        admin_id,
-        format_conversation_queue(
-            queue_name,
-            rows,
-            page=page,
-            total_pages=total_pages,
-            total_count=total_count,
-        ),
-        conversation_queue_keyboard(
-            rows,
-            queue_name,
-            viewer_admin_id=admin_id,
-            page=page,
-            total_pages=total_pages,
-        ),
-        callback,
+        admin_id, format_conversation_queue(queue_name, rows, page, pages, total),
+        conversation_queue_keyboard(rows, queue_name, admin_id, page, pages), callback,
     )
 
 
-async def show_recent_users(
-    admin_id: int,
-    page: int = 1,
-    callback: dict[str, Any] | None = None,
+async def show_contact(
+    admin_id: int, chat_id: int, callback: dict[str, Any] | None = None,
+    *, queue_name: str = "all", page: int = 1, activate_reply: bool = False,
 ) -> None:
-    clear_admin_state(admin_id)
-    moderation_repository.cancel_config_input(DB_PATH, admin_id)
-    total_count = count_recent_users()
-    page, total_pages, offset = paginate(page, total_count)
-    rows = get_recent_users(limit=ADMIN_PAGE_SIZE, offset=offset)
-    await present_admin_view(
-        admin_id,
-        format_recent_users(
-            rows,
-            page=page,
-            total_pages=total_pages,
-            total_count=total_count,
-        ),
-        recent_users_keyboard(rows, page=page, total_pages=total_pages),
-        callback,
+    if not user_repository.get(DB_PATH, chat_id):
+        await send_message(admin_id, "未找到该联系人。")
+        return
+    previous_target = get_admin_state(admin_id)
+    active = not is_blacklisted(chat_id) and (activate_reply or previous_target == chat_id)
+    if previous_target not in {None, chat_id}:
+        clear_admin_state(admin_id)
+    row = get_conversation(chat_id)
+    through = int(row["last_inbound_seq"]) if row else 0
+    markup = keyboards.admin_user_keyboard(
+        chat_id, blacklisted=is_blacklisted(chat_id), active_reply=active, read_through_seq=through,
     )
+    markup["inline_keyboard"][-1] = [{"text": "返回聊天", "callback_data": f"queue:{queue_name}:{page}"}]
+    text = format_user_detail(chat_id)
+    if active:
+        text = "<b>正在回复该联系人</b>\n\n" + text
+    if await present_admin_view(admin_id, text, markup, callback):
+        if active:
+            set_admin_state(admin_id, chat_id)
+        conversation_repository.mark_read(DB_PATH, chat_id, through)
+
+
+async def show_settings(admin_id: int, callback: dict[str, Any] | None = None) -> None:
+    clear_admin_state(admin_id)
+    rows: list[list[ButtonSpec]] = []
+    if is_owner(admin_id):
+        rows.append([("防广告", "ai:panel")])
+    rows.extend([[("已拉黑联系人", "settings:blocked:1")], [("返回首页", "admin:dashboard")]])
+    await present_admin_view(admin_id, "<b>设置</b>", inline_keyboard(rows), callback)
+
+
+async def show_blocked_contacts(admin_id: int, page: int, callback=None) -> None:
+    total = int(db_fetchone("SELECT COUNT(*) AS n FROM blacklists")["n"])
+    page, pages, offset = paginate(page, total)
+    rows = db_fetchall(
+        "SELECT b.chat_id, u.username, u.first_name, u.last_name FROM blacklists b "
+        "LEFT JOIN users u ON u.chat_id=b.chat_id ORDER BY b.created_at DESC, b.chat_id LIMIT ? OFFSET ?",
+        (ADMIN_PAGE_SIZE, offset),
+    )
+    lines = ["<b>已拉黑联系人</b>"]
+    buttons: list[list[ButtonSpec]] = []
+    for index, row in enumerate(rows, start=(page - 1) * ADMIN_PAGE_SIZE + 1):
+        lines.append(f"{index}. {escape_html_limited(row_user_label(row), 80)}")
+        buttons.append([(f"{index} 用户详情", f"detail:{row['chat_id']}")])
+    if not rows:
+        lines.append("没有已拉黑联系人。")
+    if pages > 1:
+        buttons.append(pagination_navigation_row("settings:blocked", page, pages))
+    buttons.append([("返回设置", "settings:panel")])
+    await present_admin_view(admin_id, "\n\n".join(lines), inline_keyboard(buttons), callback)
 
 
 # =========================
@@ -1530,38 +1144,14 @@ def persist_user_event(
 
 def format_admin_delivery_message(delivery: sqlite3.Row) -> str:
     chat_id = int(delivery["user_chat_id"])
-    user_row = user_repository.get(DB_PATH, chat_id)
-    if not user_row:
+    user = user_repository.get(DB_PATH, chat_id)
+    if not user:
         raise RuntimeError("administrator delivery user record is missing")
-    user = {
-        "id": int(user_row["chat_id"]),
-        "username": user_row["username"],
-        "first_name": user_row["first_name"],
-        "last_name": user_row["last_name"],
-    }
-    history = format_history(
-        chat_id,
-        limit=6,
-        exclude_message_id=int(delivery["source_message_id"]),
-        max_chars=1800,
-    )
-    conversation = get_conversation(chat_id)
-    owner_admin_id = get_conversation_owner(chat_id)
-    unread_count = int(conversation["unread_count"]) if conversation else 0
-    owner_state = (
-        f"管理员 <code>{owner_admin_id}</code> 接管"
-        if owner_admin_id
-        else "未接管"
-    )
+    history = format_history(chat_id, limit=3, exclude_message_id=int(delivery["source_message_id"]), max_chars=1000)
     return (
-        f"<b>{html.escape(str(delivery['title']))}</b>\n"
-        f"{unread_count} 条待处理 · {owner_state}\n\n"
-        "<b>用户</b>\n"
-        f"{user_identity_html(user)}\n\n"
-        "<b>本条内容</b>\n"
-        f"{escape_html_limited(str(delivery['content_summary']), 1200)}\n\n"
-        "<b>最近记录</b>\n"
-        f"{history}"
+        f"<b>{escape_html_limited(row_user_label(user), 100)}</b>\n\n"
+        f"{escape_html_limited(str(delivery['content_summary']), 1700)}\n\n"
+        f"<b>最近聊天</b>\n{history}"
     )
 
 
@@ -1617,6 +1207,8 @@ async def alert_admin_delivery_failure(delivery: sqlite3.Row) -> bool:
 
 
 async def process_admin_delivery(delivery: sqlite3.Row) -> None:
+    event = db_fetchone("SELECT conversation_seq FROM inbound_events WHERE update_id=?", (delivery["update_id"],))
+    read_through = int(event["conversation_seq"]) if event else 0
     reviewed = moderation_repository.get(DB_PATH, int(delivery["update_id"]))
     if reviewed and not moderation_repository.is_current(DB_PATH, int(delivery["update_id"])):
         db_execute("UPDATE admin_deliveries SET status='canceled' WHERE id=?", (delivery["id"],))
@@ -1639,6 +1231,7 @@ async def process_admin_delivery(delivery: sqlite3.Row) -> None:
         lambda chat_id, viewer_admin_id: admin_user_keyboard(
             chat_id,
             viewer_admin_id=viewer_admin_id,
+            read_through_seq=read_through,
         ),
         complete_admin_delivery,
         mark_admin_delivery_unknown,
@@ -1703,18 +1296,18 @@ async def enqueue_moderation(message: dict[str, Any], update_id: int, text: str,
 
 
 async def notify_moderation_pending() -> None:
-    count = moderation_repository.claim_notice(DB_PATH)
-    if not count:
-        return
-    for admin_id in sorted(ADMIN_IDS):
-        await send_message(admin_id, f"暂存箱：{count} 条留言待处理。",
-                           reply_markup=inline_keyboard([[("打开暂存箱", "moderation:1")]]))
+    if moderation_repository.claim_error_notice(DB_PATH):
+        for admin_id in sorted(ADMIN_IDS):
+            await send_message(
+                admin_id, "防广告检测出现故障，部分留言已暂存，请检查设置。",
+                reply_markup=inline_keyboard([[("查看暂存", "moderation:1:error")]]),
+            )
 
 
 def moderation_inbox() -> ModerationInbox:
     return ModerationInbox(DB_PATH, ADMIN_IDS, present_admin_view, send_message, tg,
                            answer_callback_query, admin_delivery_wakeup, moderation_wakeup,
-                           AI_MODERATION_ENABLED)
+                           AI_MODERATION_ENABLED or SETTINGS.spam_rules_enabled)
 
 
 async def show_moderation_queue(admin_id: int, page: int = 1,
@@ -1762,7 +1355,7 @@ async def handle_user_message(message: dict[str, Any], update_id: int) -> None:
             )
         return
 
-    upsert_user(user, "[待广告审核]" if AI_MODERATION_ENABLED else text)
+    upsert_user(user, "[待接收]" if AI_MODERATION_ENABLED or SETTINGS.spam_rules_enabled else text)
 
     command_text = normalize_command_text(message.get("text") or "")
     if command_text == "/start" or command_text.startswith("/start "):
@@ -1786,7 +1379,7 @@ async def handle_user_message(message: dict[str, Any], update_id: int) -> None:
             )
         return
 
-    if AI_MODERATION_ENABLED:
+    if AI_MODERATION_ENABLED or SETTINGS.spam_rules_enabled:
         await enqueue_moderation(message, update_id, text, edited=False)
         return
 
@@ -1811,7 +1404,7 @@ async def handle_user_edited_message(message: dict[str, Any], update_id: int) ->
 
     if is_blacklisted(chat_id) or text == "/start":
         return
-    upsert_user(user, "[待广告审核]" if AI_MODERATION_ENABLED else text)
+    upsert_user(user, "[待接收]" if AI_MODERATION_ENABLED or SETTINGS.spam_rules_enabled else text)
 
     allowed, should_notify, retry_after = check_user_rate_limit(chat_id)
     if not allowed:
@@ -1823,7 +1416,7 @@ async def handle_user_edited_message(message: dict[str, Any], update_id: int) ->
             )
         return
 
-    if AI_MODERATION_ENABLED:
+    if AI_MODERATION_ENABLED or SETTINGS.spam_rules_enabled:
         await enqueue_moderation(message, update_id, text, edited=True)
         return
 
@@ -1847,6 +1440,7 @@ def prepare_admin_reply_delivery(
     admin_message_id: int,
     user_chat_id: int,
     route: str,
+    read_through_seq: int = 0,
 ) -> str:
     return delivery_repository.prepare_reply(
         DB_PATH,
@@ -1856,6 +1450,7 @@ def prepare_admin_reply_delivery(
         admin_message_id,
         user_chat_id,
         route,
+        read_through_seq,
     )
 
 
@@ -1919,413 +1514,68 @@ def complete_admin_reply_delivery(
 
 
 async def send_admin_reply_status(
-    admin_id: int,
-    target_chat_id: int,
-    route: str,
-    *,
-    duplicate: bool = False,
+    admin_id: int, target_chat_id: int, route: str, *, duplicate: bool = False,
+    message_id: int | None = None,
 ) -> None:
-    if route == "state":
-        state_line = "持续回复模式仍然开启。"
-        markup = exit_reply_keyboard(target_chat_id)
-    else:
-        state_line = "本次为一次性回复，持续回复模式未开启。"
-        markup = admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id)
-    duplicate_line = "\n已忽略 Telegram 的重复投递。" if duplicate else ""
-    await send_message(
-        admin_id,
-        "<b>消息已发送</b>\n\n"
-        f"目标用户：<code>{target_chat_id}</code>\n"
-        f"{state_line}{duplicate_line}",
-        reply_markup=markup,
-    )
+    if duplicate:
+        return
+    if message_id is not None:
+        try:
+            result = await tg("setMessageReaction", {
+                "chat_id": admin_id, "message_id": message_id,
+                "reaction": [{"type": "emoji", "emoji": "\U0001f44d"}],
+            })
+            if result.get("ok"):
+                return
+        except Exception:
+            pass
+    await send_message(admin_id, f"已发送给 {chat_label_html(target_chat_id)}。")
 
 
 async def send_admin_reply_uncertain(admin_id: int, target_chat_id: int) -> None:
     await send_message(
         admin_id,
         "<b>投递结果不确定</b>\n\n"
-        f"目标用户：<code>{target_chat_id}</code>\n"
+        f"联系人：{chat_label_html(target_chat_id)}\n"
         "为避免重复发送，Bot 没有自动重放。请先确认用户侧，再重新发送一条新消息。",
         reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
     )
 
 
 async def handle_admin_command(
-    admin_id: int,
-    text: str,
-    message: dict[str, Any] | None = None,
-    update_id: int | None = None,
+    admin_id: int, text: str, message: dict[str, Any] | None = None, update_id: int | None = None,
 ) -> bool:
     if not is_admin(admin_id):
         return False
-
+    command = text.split(maxsplit=1)[0] if text else ""
     if text == "/ai":
         await get_ai_settings_controller().panel(admin_id)
-        return True
-
-    owner_only_command = (
-        text == "/broadcast"
-        or text.startswith("/broadcast ")
-        or text == "/broadcast_status"
-        or text == "/broadcast_retry"
-        or text.startswith("/broadcast_retry ")
-        or text == "/audit"
-    )
-    if owner_only_command and not is_owner(admin_id):
-        await send_message(admin_id, "该指令仅限 OWNER_IDS 中的负责人使用。")
-        return True
-
-    if text == "/start" or text.startswith("/start "):
+    elif command == "/start":
         await show_admin_dashboard(admin_id)
-        return True
-
-    if text == "/myid":
-        role = "负责人" if is_owner(admin_id) else "管理员"
+    elif text == "/myid":
+        await send_message(admin_id, f"你的 Telegram ID：<code>{admin_id}</code>")
+    elif text == "/cancel":
+        target = clear_admin_state(admin_id)
         await send_message(
-            admin_id,
-            f"你的 Telegram 数字 ID：<code>{admin_id}</code>\n角色：{role}",
+            admin_id, "已退出持续回复。" if target is not None else "当前没有正在回复的联系人。",
+            reply_markup=admin_dashboard_keyboard(admin_id),
         )
-        return True
-
-    if text == "/cancel":
-        target_chat_id = clear_admin_state(admin_id)
-        if target_chat_id:
-            add_admin_audit(admin_id, "reply_mode_exit", target_chat_id)
-            await send_message(
-                admin_id,
-                "已退出持续回复模式。",
-                reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
-            )
-        else:
-            await send_message(admin_id, "你当前不在持续回复模式。")
-        return True
-
-    if text in {"/inbox", "/pending", "/closed"}:
-        await show_conversation_queue(admin_id, text[1:])
-        return True
-
-    if text == "/moderation":
+    elif text == "/settings":
+        await show_settings(admin_id)
+    elif text == "/moderation":
         await show_moderation_queue(admin_id)
-        return True
-
-    if text == "/users":
-        await show_recent_users(admin_id)
-        return True
-
-    if (
-        text in {"/reply", "/send"}
-        or text.startswith("/reply ")
-        or text.startswith("/send ")
-    ):
-        parts = text.split(maxsplit=2)
-        if len(parts) < 3 or not parts[1].lstrip("-").isdigit():
-            await send_message(admin_id, f"格式：{parts[0]} 用户ID 内容")
-            return True
-        target_chat_id = int(parts[1])
-        content = parts[2]
-        if is_blacklisted(target_chat_id):
-            await send_message(admin_id, "这个用户在黑名单中，请先解除黑名单。")
-            return True
-        claim_result = claim_conversation(
-            target_chat_id,
-            admin_id,
-            reopen=parts[0] == "/send",
-        )
-        if claim_result.status == "conflict":
-            await send_message(
-                admin_id,
-                f"这个会话当前由 <code>{claim_result.owner_admin_id}</code> 接管。"
-                "请先接管后再发送。",
-                reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
-            )
-            return True
-        if claim_result.status == "closed":
-            await send_message(admin_id, "这个会话已经关闭，请先重新打开。")
-            return True
-        admin_chat_id = (
-            int(message["chat"]["id"]) if message is not None else admin_id
-        )
-        admin_message_id = (
-            int(message["message_id"])
-            if message is not None
-            else -int(time.time_ns())
-        )
-        route = parts[0].lstrip("/")
-        delivery_status = prepare_admin_reply_delivery(
-            update_id,
-            admin_id,
-            admin_chat_id,
-            admin_message_id,
-            target_chat_id,
-            route,
-        )
-        if delivery_status == "sent":
-            await send_admin_reply_status(
-                admin_id, target_chat_id, route, duplicate=True
-            )
-            return True
-        if delivery_status == "unknown":
-            await send_admin_reply_uncertain(admin_id, target_chat_id)
-            return True
-        if delivery_status == "failed":
-            await send_message(
-                admin_id,
-                "上一轮发送已经明确失败。请检查原因后发送一条新的回复指令。",
-            )
-            return True
-        if not mark_admin_reply_sending(admin_chat_id, admin_message_id):
-            await send_admin_reply_uncertain(admin_id, target_chat_id)
-            return True
-        delivery_result = await send_message(target_chat_id, content, parse_mode=None)
-        if not delivery_result:
-            fail_admin_reply_delivery(
-                admin_chat_id, admin_message_id, delivery_result
-            )
-            await send_message(admin_id, delivery_failure_message(delivery_result))
-            return True
-        try:
-            complete_admin_reply_delivery(
-                admin_chat_id,
-                admin_message_id,
-                target_chat_id,
-                admin_id,
-                route,
-                content,
-                "text",
-                delivery_result,
-            )
-        except Exception as exc:
-            with contextlib.suppress(Exception):
-                mark_admin_reply_unknown(admin_chat_id, admin_message_id, str(exc))
-            await send_admin_reply_uncertain(admin_id, target_chat_id)
-            return True
-        await send_admin_reply_status(
-            admin_id,
-            target_chat_id,
-            route,
-        )
-        return True
-
-    if text == "/broadcast" or text.startswith("/broadcast "):
-        content = text[len("/broadcast") :].strip()
-        if not content:
-            await send_message(admin_id, "格式：/broadcast 内容")
-            return True
-        if len(content) > TELEGRAM_TEXT_LIMIT:
-            await send_message(admin_id, "群发内容不能超过 4096 个字符。")
-            return True
-        broadcast_id = create_pending_broadcast(admin_id, content)
-        add_admin_audit(
-            admin_id,
-            "broadcast_created",
-            details=f"id={broadcast_id} length={len(content)}",
-        )
-        total = active_user_count()
-        await send_message(
-            admin_id,
-            "<b>确认群发</b>\n\n"
-            f"接收用户：<b>{total}</b>\n\n"
-            "<b>发送内容</b>\n"
-            f"{html.escape(content[:800])}",
-            reply_markup=inline_keyboard(
-                [
-                    [
-                        (
-                            "确认群发",
-                            f"broadcast_confirm:{broadcast_id}",
-                            "primary",
-                        ),
-                        (
-                            "取消群发",
-                            f"broadcast_cancel:{broadcast_id}",
-                            "danger",
-                        ),
-                    ],
-                ]
-            ),
-        )
-        return True
-
-    if text == "/broadcast_status":
-        rows = broadcast_repository.list_recent_jobs(DB_PATH, admin_id)
-        if not rows:
-            await send_message(admin_id, "暂无群发记录。")
-            return True
-        lines = ["<b>最近群发</b>"]
-        for index, row in enumerate(rows, start=1):
-            status_label = BROADCAST_STATUS_LABELS.get(
-                str(row["status"]),
-                str(row["status"]),
-            )
-            lines.append(
-                f"<b>{index}. {html.escape(status_label)}</b>\n"
-                f"任务：<code>{row['id']}</code>\n"
-                f"进度：{row['sent_count']}/{row['total_count']} · "
-                f"失败 {row['failed_count']} · 不确定 {row['unknown_count']}\n"
-                f"创建：{compact_timestamp(row['created_at'])}"
-            )
-        await send_message(admin_id, "\n\n".join(lines))
-        return True
-
-    if text == "/broadcast_retry" or text.startswith("/broadcast_retry "):
-        parts = text.split(maxsplit=1)
-        broadcast_id = parts[1].strip() if len(parts) == 2 else ""
-        if not broadcast_id:
-            await send_message(admin_id, "格式：/broadcast_retry 任务ID")
-            return True
-        status, retry_count = retry_failed_broadcast(broadcast_id)
-        if status == "queued":
-            if broadcast_wakeup:
-                broadcast_wakeup.set()
-            add_admin_audit(
-                admin_id,
-                "broadcast_retry",
-                details=f"id={broadcast_id} recipients={retry_count}",
-            )
-            await send_message(
-                admin_id,
-                f"已重新排队失败用户：{retry_count} 人。",
-            )
-        elif status == "missing":
-            await send_message(admin_id, "群发任务不存在。")
-        elif status == "nothing":
-            await send_message(admin_id, "这个群发任务没有可重试的失败用户。")
-        else:
-            await send_message(admin_id, f"任务当前状态为 {status}，暂时不能重试。")
-        return True
-
-    if text == "/audit":
-        rows = user_repository.list_admin_audits(DB_PATH, limit=15)
-        if not rows:
-            await send_message(admin_id, "暂无管理员操作记录。")
-            return True
-        lines = ["<b>最近管理员操作</b>"]
-        for index, row in enumerate(rows, start=1):
-            target = (
-                f" · 用户 <code>{row['target_chat_id']}</code>"
-                if row["target_chat_id"] is not None
-                else ""
-            )
-            details = (
-                f"\n{escape_html_limited(row['details'], 120)}"
-                if row["details"]
-                else ""
-            )
-            action_label = AUDIT_ACTION_LABELS.get(
-                str(row["action"]),
-                str(row["action"]),
-            )
-            lines.append(
-                f"<b>{index}. {html.escape(action_label)}</b> · "
-                f"{compact_timestamp(row['created_at'])}\n"
-                f"管理员 <code>{row['admin_id']}</code>{target}{details}"
-            )
-        await send_message(admin_id, "\n\n".join(lines))
-        return True
-
-    if text == "/takeover" or text.startswith("/takeover "):
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
-            await send_message(admin_id, "格式：/takeover 用户ID")
-            return True
-        target_chat_id = int(parts[1])
-        if is_blacklisted(target_chat_id):
-            await send_message(admin_id, "这个用户在黑名单中，请先解除黑名单。")
-            return True
-        claim_conversation(
-            target_chat_id,
-            admin_id,
-            force=True,
-            reopen=True,
-            activate_reply=True,
-        )
-        add_admin_audit(admin_id, "conversation_takeover", target_chat_id)
-        await send_message(
-            admin_id,
-            "<b>会话已接管</b>\n\n"
-            f"目标用户：<code>{target_chat_id}</code>\n"
-            "接下来发送的消息会转发给该用户。",
-            reply_markup=exit_reply_keyboard(target_chat_id),
-        )
-        return True
-
-    if text == "/close" or text.startswith("/close "):
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
-            await send_message(admin_id, "格式：/close 用户ID")
-            return True
-        target_chat_id = int(parts[1])
-        close_conversation(target_chat_id)
-        add_admin_audit(admin_id, "conversation_resolved", target_chat_id)
-        await send_message(
-            admin_id,
-            "<b>已标记处理</b>\n\n"
-            f"用户：<code>{target_chat_id}</code>",
-            reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
-        )
-        return True
-
-    if text == "/blacklist" or text.startswith("/blacklist "):
-        parts = text.split(maxsplit=2)
-        if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
-            await send_message(admin_id, "格式：/blacklist 用户ID 可选原因")
-            return True
-        reason = parts[2] if len(parts) >= 3 else ""
-        target_chat_id = int(parts[1])
-        blacklist_user(target_chat_id, admin_id, reason)
-        close_conversation(target_chat_id)
-        add_admin_audit(
-            admin_id,
-            "blacklist_add",
-            target_chat_id,
-            f"reason={reason}" if reason else "",
-        )
-        await send_message(
-            admin_id,
-            "<b>已加入黑名单</b>\n\n"
-            f"用户：<code>{target_chat_id}</code>",
-            reply_markup=admin_user_keyboard(
-                target_chat_id,
-                viewer_admin_id=admin_id,
-            ),
-        )
-        return True
-
-    if text == "/unblacklist" or text.startswith("/unblacklist "):
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
-            await send_message(admin_id, "格式：/unblacklist 用户ID")
-            return True
-        target_chat_id = int(parts[1])
-        unblacklist_user(target_chat_id)
-        add_admin_audit(admin_id, "blacklist_remove", target_chat_id)
-        await send_message(
-            admin_id,
-            "<b>已解除黑名单</b>\n\n"
-            f"用户：<code>{target_chat_id}</code>",
-            reply_markup=admin_user_keyboard(
-                target_chat_id,
-                viewer_admin_id=admin_id,
-            ),
-        )
-        return True
-
-    if text == "/blacklist_list":
-        rows = access_repository.list_blacklist(DB_PATH)
-        if not rows:
-            await send_message(admin_id, "黑名单为空。")
-            return True
-        lines = ["黑名单："]
-        for row in rows:
-            lines.append(
-                f"<code>{row['chat_id']}</code> "
-                f"{html.escape(truncate_text(row['reason'] or '', 80))} {row['created_at']}"
-            )
-        await send_message(admin_id, "\n".join(lines))
-        return True
-
-    return False
+    elif text == "/inbox":
+        await show_conversation_queue(admin_id, "inbox")
+    elif text == "/users":
+        await show_conversation_queue(admin_id, "all")
+    elif command in {
+        "/broadcast", "/broadcast_status", "/broadcast_retry", "/audit", "/reply", "/send",
+        "/takeover", "/close", "/pending", "/closed", "/blacklist", "/unblacklist", "/blacklist_list",
+    }:
+        await send_message(admin_id, "该旧指令已移除，请从聊天列表选择联系人。", reply_markup=admin_dashboard_keyboard(admin_id))
+    else:
+        return False
+    return True
 
 
 async def handle_admin_message(message: dict[str, Any], update_id: int | None = None) -> None:
@@ -2347,7 +1597,7 @@ async def handle_admin_message(message: dict[str, Any], update_id: int | None = 
     if text.startswith("/"):
         await send_message(
             admin_id,
-            "<b>未知管理员指令</b>\n\n请从命令菜单选择，或返回工作台。",
+            "<b>未知管理员指令</b>\n\n请从命令菜单选择，或返回首页。",
             reply_markup=admin_dashboard_keyboard(admin_id),
         )
         return
@@ -2372,7 +1622,7 @@ async def handle_admin_message(message: dict[str, Any], update_id: int | None = 
         )
         return
 
-    if target_source == "reply":
+    if target_source == "reply" and get_admin_state(admin_id) != target_chat_id:
         clear_admin_state(admin_id)
 
     if is_blacklisted(target_chat_id):
@@ -2383,29 +1633,19 @@ async def handle_admin_message(message: dict[str, Any], update_id: int | None = 
         )
         return
 
-    claim_result = claim_conversation(
-        target_chat_id,
-        admin_id,
-        activate_reply=False,
-    )
-    if claim_result.status == "closed":
-        await send_message(
-            admin_id,
-            "这个会话已经关闭。如需继续，请先重新打开。",
-            reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
-        )
-        return
-    if claim_result.status == "conflict":
-        await send_message(
-            admin_id,
-            f"这个会话当前由 <code>{claim_result.owner_admin_id}</code> 接管。"
-            "点击接管后再回复。",
-            reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
-        )
-        return
-
     admin_chat_id = int(message["chat"]["id"])
     admin_message_id = int(message["message_id"])
+    conversation = get_conversation(target_chat_id)
+    read_through = int(conversation["last_read_seq"]) if conversation else 0
+    if target_source == "reply":
+        source_id = message["reply_to_message"]["message_id"]
+        event = db_fetchone(
+            "SELECT e.conversation_seq FROM admin_deliveries d JOIN inbound_events e ON e.update_id=d.update_id "
+            "WHERE d.admin_chat_id=? AND d.admin_message_id=? AND d.user_chat_id=?",
+            (admin_chat_id, source_id, target_chat_id),
+        )
+        if event:
+            read_through = int(event["conversation_seq"])
     delivery_status = prepare_admin_reply_delivery(
         update_id,
         admin_id,
@@ -2413,6 +1653,7 @@ async def handle_admin_message(message: dict[str, Any], update_id: int | None = 
         admin_message_id,
         target_chat_id,
         target_source,
+        read_through,
     )
     if delivery_status == "sent":
         await send_admin_reply_status(
@@ -2460,373 +1701,170 @@ async def handle_admin_message(message: dict[str, Any], update_id: int | None = 
             mark_admin_reply_unknown(admin_chat_id, admin_message_id, str(exc))
         await send_admin_reply_uncertain(admin_id, target_chat_id)
         return
-    await send_admin_reply_status(admin_id, target_chat_id, target_source)
+    await send_admin_reply_status(admin_id, target_chat_id, target_source, message_id=admin_message_id)
 
 
 async def handle_callback(callback: dict[str, Any]) -> None:
-    callback_id = callback["id"]
-    from_user = callback["from"]
-    admin_id = int(from_user["id"])
-    data = callback.get("data", "")
+    admin_id = int(callback.get("from", {}).get("id", 0))
+    if is_admin(admin_id) and is_private_callback(callback):
+        async with admin_ui_locks.setdefault(admin_id, asyncio.Lock()):
+            await dispatch_callback(callback)
+    else:
+        await dispatch_callback(callback)
 
+
+async def dispatch_callback(callback: dict[str, Any]) -> None:
+    callback_id = callback["id"]
+    admin_id = int(callback["from"]["id"])
+    data = callback.get("data", "")
     if not is_private_callback(callback):
         await answer_callback_query(callback_id, "请在私聊中使用")
         return
-
     if data in {"user_help", "user_guide"}:
         chat_id = int(callback["message"]["chat"]["id"])
         if is_blacklisted(chat_id):
             await answer_callback_query(callback_id, "当前不可用")
             return
         await answer_callback_query(callback_id)
-        if data == "user_help":
-            text = "直接在当前对话发送消息即可。消息会通过 Bot 转交，无需私聊其他账号。"
-        else:
-            text = "支持文字、图片、文件、语音和视频。发送后请等待回复，避免短时间重复发送。"
+        text = ("直接在当前对话发送消息即可。消息会通过 Bot 转交，无需私聊其他账号。" if data == "user_help"
+                else "支持文字、图片、文件、语音和视频。发送后请等待回复，避免短时间重复发送。")
         await send_message(chat_id, text)
         return
-
     if not is_admin(admin_id):
         await answer_callback_query(callback_id, "无权限")
         return
-
     if ":" not in data:
-        await answer_callback_query(callback_id)
+        await answer_callback_query(callback_id, "该按钮已失效，请打开首页")
         return
-
-    action, raw_chat_id = data.split(":", 1)
+    action, value = data.split(":", 1)
     if action == "ai":
         if not is_owner(admin_id):
-            await answer_callback_query(callback_id, "仅负责人可管理 AI 配置")
+            await answer_callback_query(callback_id, "仅负责人可管理防广告")
             return
         await answer_callback_query(callback_id)
-        await get_ai_settings_controller().callback(admin_id, raw_chat_id, callback)
+        await get_ai_settings_controller().callback(admin_id, value, callback)
         return
     moderation_repository.cancel_config_input(DB_PATH, admin_id)
-    if action == "user":
-        parts = raw_chat_id.split(":")
-        if (len(parts) != 3 or not parts[0].isascii() or not parts[0].isdigit() or len(parts[0]) > 18
-                or parts[1] not in QUEUE_LABELS or parse_callback_page(parts[2]) is None):
-            await answer_callback_query(callback_id, "页面无效")
-            return
-        target_chat_id = int(parts[0])
-        clear_admin_state(admin_id)
-        markup = admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id)
-        markup["inline_keyboard"].insert(-1, [{"text": "返回列表", "callback_data": f"queue:{parts[1]}:{parts[2]}"}])
-        await answer_callback_query(callback_id)
-        await present_admin_view(admin_id, format_user_detail(target_chat_id), markup, callback)
+    if action.startswith("broadcast") or action in {"takeover", "close", "resolve", "reopen"}:
+        await answer_callback_query(callback_id, "该功能已移除，请使用聊天列表")
         return
     if action.startswith("moderation"):
-        await handle_moderation_callback(callback, action, raw_chat_id)
+        await handle_moderation_callback(callback, action, value)
+        return
+    if action == "settings":
+        parts = value.split(":")
+        if parts == ["panel"]:
+            await answer_callback_query(callback_id)
+            await show_settings(admin_id, callback)
+        elif len(parts) == 2 and parts[0] == "blocked" and parse_callback_page(parts[1]) is not None:
+            clear_admin_state(admin_id)
+            await answer_callback_query(callback_id)
+            await show_blocked_contacts(admin_id, int(parts[1]), callback)
+        else:
+            await answer_callback_query(callback_id, "页面无效")
         return
     if action == "admin":
-        view_name, separator, raw_page = raw_chat_id.partition(":")
-        if view_name == "dashboard" and not separator:
+        if value == "dashboard":
             await answer_callback_query(callback_id)
             await show_admin_dashboard(admin_id, callback)
-        elif view_name == "users":
-            page = parse_callback_page(raw_page if separator else None)
+        elif value == "users" or value.startswith("users:"):
+            page = parse_callback_page(value.partition(":")[2] or None)
             if page is None:
                 await answer_callback_query(callback_id, "页码无效")
                 return
             await answer_callback_query(callback_id)
-            await show_recent_users(admin_id, page=page, callback=callback)
+            await show_conversation_queue(admin_id, "all", page, callback)
         else:
-            await answer_callback_query(callback_id, "未知页面")
+            await answer_callback_query(callback_id, "页面无效")
         return
-
     if action == "queue":
-        queue_name, separator, raw_page = raw_chat_id.partition(":")
-        if queue_name not in QUEUE_LABELS:
-            await answer_callback_query(callback_id, "未知队列")
-            return
-        page = parse_callback_page(raw_page if separator else None)
+        queue_name, _, raw_page = value.partition(":")
+        page = parse_callback_page(raw_page or None)
         if page is None:
             await answer_callback_query(callback_id, "页码无效")
             return
+        if queue_name not in QUEUE_LABELS:
+            await answer_callback_query(callback_id, "该列表已更新，请返回首页")
+            return
         await answer_callback_query(callback_id)
-        await show_conversation_queue(
-            admin_id,
-            queue_name,
-            page=page,
-            callback=callback,
-        )
+        await show_conversation_queue(admin_id, queue_name, page, callback)
         return
-
+    if action == "user":
+        parts = value.split(":")
+        if (len(parts) != 3 or not parts[0].isascii() or not parts[0].isdigit() or len(parts[0]) > 18
+                or parts[1] not in QUEUE_LABELS or parse_callback_page(parts[2]) is None):
+            await answer_callback_query(callback_id, "页面无效")
+            return
+        await answer_callback_query(callback_id)
+        await show_contact(admin_id, int(parts[0]), callback, queue_name=parts[1], page=int(parts[2]), activate_reply=True)
+        return
+    if action == "read":
+        parts = value.split(":")
+        if len(parts) != 2 or any(not part.isascii() or not part.isdigit() or len(part) > 18 for part in parts):
+            await answer_callback_query(callback_id, "参数无效")
+            return
+        conversation_repository.mark_read(DB_PATH, int(parts[0]), int(parts[1]))
+        await answer_callback_query(callback_id, "已标记所显示的消息为已读")
+        return
     if action == "delivery_retry":
-        if not is_owner(admin_id):
-            await answer_callback_query(callback_id, "仅负责人可重试投递")
+        if not is_owner(admin_id) or not value.isascii() or not value.isdigit() or len(value) > 18:
+            await answer_callback_query(callback_id, "无权限或参数无效")
             return
-        if not raw_chat_id.isascii() or not raw_chat_id.isdigit():
-            await answer_callback_query(callback_id, "投递任务无效")
-            return
-        status = retry_admin_delivery(int(raw_chat_id))
-        if status == "pending":
-            if admin_delivery_wakeup:
-                admin_delivery_wakeup.set()
-            await answer_callback_query(callback_id, "已重新排队")
-            await send_message(
-                admin_id,
-                "投递已重新排队。若此前状态不确定，Telegram 中可能出现重复消息。",
-            )
-        elif status == "missing":
-            await answer_callback_query(callback_id, "投递任务不存在")
-        else:
-            await answer_callback_query(callback_id, f"任务当前状态：{status}")
+        status = retry_admin_delivery(int(value))
+        if status == "pending" and admin_delivery_wakeup:
+            admin_delivery_wakeup.set()
+        await answer_callback_query(callback_id, "已重新排队" if status == "pending" else "当前不能重试")
         return
-
-    if action in {"broadcast_confirm", "broadcast_cancel", "broadcast_retry"}:
-        if not is_owner(admin_id):
-            await answer_callback_query(callback_id, "仅负责人可操作群发")
-            return
-        if action == "broadcast_retry":
-            status, retry_count = retry_failed_broadcast(raw_chat_id)
-            if status == "queued":
-                if broadcast_wakeup:
-                    broadcast_wakeup.set()
-                add_admin_audit(
-                    admin_id,
-                    "broadcast_retry",
-                    details=f"id={raw_chat_id} recipients={retry_count}",
-                )
-                await answer_callback_query(callback_id, "失败用户已重新排队")
-                await send_message(
-                    admin_id,
-                    f"已重新排队失败用户：{retry_count} 人。",
-                )
-            elif status == "nothing":
-                await answer_callback_query(callback_id, "没有可重试用户")
-            elif status == "missing":
-                await answer_callback_query(callback_id, "群发不存在")
-            else:
-                await answer_callback_query(callback_id, "任务暂时不能重试")
-            return
-
-        if action == "broadcast_cancel":
-            status = cancel_pending_broadcast(raw_chat_id, admin_id)
-            if status == "canceled":
-                add_admin_audit(
-                    admin_id,
-                    "broadcast_canceled",
-                    details=f"id={raw_chat_id}",
-                )
-                await answer_callback_query(callback_id, "已取消")
-                await send_message(admin_id, "已取消群发。")
-            elif status == "forbidden":
-                await answer_callback_query(callback_id, "只能由创建者取消")
-            elif status == "missing":
-                await answer_callback_query(callback_id, "群发不存在")
-            else:
-                await answer_callback_query(callback_id, "群发已开始，无法取消")
-            return
-
-        status, total = queue_broadcast(raw_chat_id, admin_id)
-        if status == "queued":
-            if broadcast_wakeup:
-                broadcast_wakeup.set()
-            add_admin_audit(
-                admin_id,
-                "broadcast_confirmed",
-                details=f"id={raw_chat_id} recipients={total}",
-            )
-            await answer_callback_query(callback_id, "已加入发送队列")
-            await send_message(
-                admin_id,
-                f"群发任务已加入队列，接收用户 {total}。\n"
-                "完成后会自动通知；可用 /broadcast_status 查看进度。",
-            )
-        elif status == "forbidden":
-            await answer_callback_query(callback_id, "只能由创建者确认")
-        elif status == "missing":
-            await answer_callback_query(callback_id, "群发不存在")
-        else:
-            await answer_callback_query(callback_id, "群发已处理")
+    if not value.isascii() or not value.isdigit() or len(value) > 18:
+        await answer_callback_query(callback_id, "参数无效")
         return
-
-    if not raw_chat_id.lstrip("-").isdigit():
+    chat_id = int(value)
+    if not user_repository.get(DB_PATH, chat_id) and not is_blacklisted(chat_id):
+        await answer_callback_query(callback_id, "联系人不存在")
+        return
+    if action in {"reply", "detail"}:
+        if action == "reply" and is_blacklisted(chat_id):
+            await answer_callback_query(callback_id, "请先解除拉黑")
+            return
         await answer_callback_query(callback_id)
-        return
-
-    target_chat_id = int(raw_chat_id)
-
-    if action in {"reply", "takeover", "reopen"} and is_blacklisted(
-        target_chat_id
-    ):
-        await answer_callback_query(callback_id, "用户在黑名单中")
-        await send_message(
-            admin_id,
-            "这个用户在黑名单中，请先解除黑名单。",
-            reply_markup=admin_user_keyboard(
-                target_chat_id,
-                viewer_admin_id=admin_id,
-            ),
-        )
-        return
-
-    if action == "reply":
-        claim_result = claim_conversation(
-            target_chat_id,
-            admin_id,
-            activate_reply=True,
-        )
-        if claim_result.status == "conflict":
-            await answer_callback_query(callback_id, "会话已被其他管理员接管")
-            await send_message(
-                admin_id,
-                f"这个会话当前由 <code>{claim_result.owner_admin_id}</code> 接管。"
-                "需要回复的话请先接管。",
-                reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
-            )
-            return
-        if claim_result.status == "closed":
-            await answer_callback_query(callback_id, "会话已关闭")
-            await send_message(
-                admin_id,
-                "这个会话已经关闭，请先重新打开。",
-                reply_markup=admin_user_keyboard(
-                    target_chat_id,
-                    viewer_admin_id=admin_id,
-                ),
-            )
-            return
-        add_admin_audit(admin_id, "reply_mode_enter", target_chat_id)
-        await answer_callback_query(callback_id, "已进入回复模式")
-        await present_admin_view(
-            admin_id,
-            "<b>回复模式已开启</b>\n\n"
-            f"目标用户：<code>{target_chat_id}</code>\n"
-            "接下来发送的消息会转发给该用户。",
-            exit_reply_keyboard(target_chat_id), callback,
-        )
-        return
-
-    if action == "cancel":
-        cleared_target = clear_admin_state(
-            admin_id, expected_target_chat_id=target_chat_id
-        )
-        if cleared_target is None:
-            await answer_callback_query(callback_id, "这不是当前回复会话")
-        else:
-            add_admin_audit(admin_id, "reply_mode_exit", target_chat_id)
-            await answer_callback_query(callback_id, "已退出")
-            await present_admin_view(
-                admin_id,
-                "已退出持续回复模式。",
-                admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id), callback,
-            )
-        return
-
-    if action == "takeover":
-        claim_conversation(
-            target_chat_id,
-            admin_id,
-            force=True,
-            reopen=True,
-            activate_reply=True,
-        )
-        add_admin_audit(admin_id, "conversation_takeover", target_chat_id)
-        await answer_callback_query(callback_id, "已接管")
-        await present_admin_view(
-            admin_id,
-            "<b>会话已接管</b>\n\n"
-            f"目标用户：<code>{target_chat_id}</code>\n"
-            "接下来发送的消息会转发给该用户。",
-            exit_reply_keyboard(target_chat_id), callback,
-        )
-        return
-
-    if action in {"close", "resolve"}:
-        close_conversation(target_chat_id)
-        add_admin_audit(admin_id, "conversation_resolved", target_chat_id)
-        await answer_callback_query(callback_id, "已标记处理")
-        await present_admin_view(
-            admin_id,
-            "<b>已标记处理</b>\n\n"
-            f"用户：<code>{target_chat_id}</code>",
-            admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id), callback,
-        )
-        return
-
-    if action == "reopen":
-        reopen_conversation(target_chat_id)
-        add_admin_audit(admin_id, "conversation_reopened", target_chat_id)
-        await answer_callback_query(callback_id, "已重新打开")
-        await present_admin_view(
-            admin_id,
-            "<b>会话已重新打开</b>\n\n"
-            f"用户：<code>{target_chat_id}</code>",
-            admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id), callback,
-        )
-        return
-
-    if action == "detail":
-        clear_admin_state(admin_id)
+        await show_contact(admin_id, chat_id, callback, activate_reply=action == "reply")
+    elif action == "cancel":
+        cleared = clear_admin_state(admin_id, expected_target_chat_id=chat_id)
+        await answer_callback_query(callback_id, "已退出回复" if cleared is not None else "这不是当前回复会话")
+        if cleared is not None:
+            await present_admin_view(admin_id, "已退出持续回复。", admin_user_keyboard(chat_id, admin_id), callback)
+    elif action == "more":
+        if get_admin_state(admin_id) not in {None, chat_id}:
+            clear_admin_state(admin_id)
+        button: ButtonSpec = (("解除拉黑", f"unblacklist:{chat_id}", "success") if is_blacklisted(chat_id)
+                              else ("拉黑联系人", f"blacklist:{chat_id}", "danger"))
+        await answer_callback_query(callback_id)
+        await present_admin_view(admin_id, f"<b>{chat_label_html(chat_id)}</b>", inline_keyboard([
+            [button], [("用户详情 / 聊天记录", f"detail:{chat_id}")], [("返回聊天", "queue:all:1")],
+        ]), callback)
+    elif action == "blacklist":
         await answer_callback_query(callback_id)
         await present_admin_view(
-            admin_id,
-            format_user_detail(target_chat_id),
-            admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
-            callback,
+            admin_id, f"拉黑 {chat_label_html(chat_id)}？\n后续消息将被拦截。",
+            inline_keyboard([[("确认拉黑", f"blacklist_confirm:{chat_id}", "danger"),
+                              ("取消", f"blacklist_cancel:{chat_id}")]]), callback,
         )
-        return
-
-    if action == "blacklist":
-        await answer_callback_query(callback_id)
-        await send_message(
-            admin_id,
-            "<b>确认加入黑名单</b>\n\n"
-            f"用户：<code>{target_chat_id}</code>\n"
-            "该用户的新留言将被拦截，不再通知管理员。",
-            reply_markup=inline_keyboard(
-                [
-                    [
-                        (
-                            "确认加入",
-                            f"blacklist_confirm:{target_chat_id}",
-                            "danger",
-                        ),
-                        ("取消", f"blacklist_cancel:{target_chat_id}"),
-                    ]
-                ]
-            ),
-        )
-        return
-
-    if action == "blacklist_cancel":
+    elif action == "blacklist_cancel":
         await answer_callback_query(callback_id, "已取消")
-        return
-
-    if action == "blacklist_confirm":
-        blacklist_user(target_chat_id, admin_id, "管理员按钮添加")
-        close_conversation(target_chat_id)
-        add_admin_audit(
-            admin_id,
-            "blacklist_add",
-            target_chat_id,
-            "reason=button",
-        )
-        await answer_callback_query(callback_id, "已加入黑名单")
-        await send_message(
-            admin_id,
-            "<b>已加入黑名单</b>\n\n"
-            f"用户：<code>{target_chat_id}</code>",
-            reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
-        )
-        return
-
-    if action == "unblacklist":
-        unblacklist_user(target_chat_id)
-        add_admin_audit(admin_id, "blacklist_remove", target_chat_id)
-        await answer_callback_query(callback_id, "已解除黑名单")
-        await send_message(
-            admin_id,
-            "<b>已解除黑名单</b>\n\n"
-            f"用户：<code>{target_chat_id}</code>",
-            reply_markup=admin_user_keyboard(target_chat_id, viewer_admin_id=admin_id),
-        )
-        return
-
-    await answer_callback_query(callback_id)
+        await show_contact(admin_id, chat_id, callback)
+    elif action == "blacklist_confirm":
+        blacklist_user(chat_id, admin_id, "管理员确认")
+        clear_admin_states_for_target(chat_id)
+        add_admin_audit(admin_id, "blacklist_add", chat_id)
+        await answer_callback_query(callback_id, "已拉黑")
+        await present_admin_view(admin_id, f"已拉黑 {chat_label_html(chat_id)}。", admin_user_keyboard(chat_id, admin_id), callback)
+    elif action == "unblacklist":
+        unblacklist_user(chat_id)
+        add_admin_audit(admin_id, "blacklist_remove", chat_id)
+        await answer_callback_query(callback_id, "已解除拉黑")
+        await show_contact(admin_id, chat_id, callback)
+    else:
+        await answer_callback_query(callback_id, "该按钮已失效，请打开首页")
 
 
 async def read_limited_request_body(request: Request, max_bytes: int) -> bytes:
@@ -2858,8 +1896,6 @@ async def healthz() -> dict[str, str | bool]:
         db_fetchone("SELECT 1 AS ok")
     except Exception as exc:
         raise HTTPException(status_code=503, detail="db unavailable") from exc
-    if broadcast_worker_task is None or broadcast_worker_task.done():
-        raise HTTPException(status_code=503, detail="broadcast worker unavailable")
     if admin_delivery_worker_task is None or admin_delivery_worker_task.done():
         raise HTTPException(
             status_code=503,
@@ -2872,7 +1908,6 @@ async def healthz() -> dict[str, str | bool]:
         "version": APP_VERSION,
         "moderation_worker": "ok",
         "db": "ok",
-        "broadcast_worker": "ok",
         "admin_delivery_worker": "ok",
     }
 
@@ -2920,7 +1955,8 @@ async def telegram_webhook(
         else:
             edited = "edited_message" in update
             message = update.get("edited_message") if edited else update.get("message")
-            if message and "from" in message and is_private_chat_message(message):
+            if (message and "from" in message and not message["from"].get("is_bot")
+                    and is_private_chat_message(message)):
                 from_id = int(message["from"]["id"])
                 if is_admin(from_id):
                     if edited:

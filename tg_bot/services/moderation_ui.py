@@ -8,7 +8,7 @@ from tg_bot.services.moderation import delivery_payload
 from tg_bot.text import escape_html_limited
 
 
-LABELS = {"all": "全部", "spam": "疑似广告", "error": "检测故障", "other": "待确认"}
+LABELS = {"all": "全部", "spam": "疑似广告", "error": "检测故障", "other": "待确认", "pending": "待确认"}
 
 
 def escaped(text: str, limit: int) -> str:
@@ -30,17 +30,15 @@ class ModerationInbox:
         self.delivery_wakeup, self.moderation_wakeup = delivery_wakeup, moderation_wakeup
         self.enabled = enabled
 
-    async def show(self, admin_id: int, page: int = 1, callback=None, category: str = "all") -> None:
+    async def show(self, admin_id: int, page: int = 1, callback=None, category: str = "spam") -> None:
         jobs, page, pages = moderation.pending_page(self.db, page, category=category)
-        lines = [f"<b>暂存箱 · {LABELS[category]}</b>", ""]
+        lines = [f"<b>垃圾箱 · {LABELS[category]}</b>", ""]
         buttons = [[(LABELS[key] + (" · 当前" if key == category else ""), f"moderation:1:{key}")
-                    for key in ("all", "spam")],
-                   [(LABELS[key] + (" · 当前" if key == category else ""), f"moderation:1:{key}")
-                    for key in ("error", "other")]]
+                    for key in ("spam", "pending")]]
         for index, job in enumerate(jobs, start=(page - 1) * 5 + 1):
             user = json.loads(job["snapshot"]).get("from", {})
-            name = user.get("first_name") or user.get("username") or str(job["chat_id"])
-            lines.append(f"<b>{index}. {escaped(name, 40)}</b> · <code>{job['chat_id']}</code>\n"
+            name = user.get("first_name") or user.get("username") or "未命名联系人"
+            lines.append(f"<b>{index}. {escaped(name, 40)}</b>\n"
                          f"{escaped(job['reason'], 80)}\n{escaped(job['summary'], 150)}\n")
             buttons.append([(f"{index}. 查看并处理", f"moderation_detail:{job['update_id']}:{page}:{category}")])
         if not jobs:
@@ -48,7 +46,7 @@ class ModerationInbox:
         if pages > 1:
             navigation = pagination_navigation_row("moderation", page, pages)
             buttons.append([(item[0], f"{item[1]}:{category}") for item in navigation])
-        buttons.append([("刷新", f"moderation:{page}:{category}"), ("返回工作台", "admin:dashboard")])
+        buttons.append([("刷新", f"moderation:{page}:{category}"), ("返回首页", "admin:dashboard")])
         await self.present(admin_id, "\n".join(lines), inline_keyboard(buttons), callback)
 
     async def detail(self, admin_id: int, job, page: int, category: str, callback) -> None:
@@ -64,7 +62,7 @@ class ModerationInbox:
         await self.present(admin_id, text, inline_keyboard([
             [("放行本条", f"moderation_allow:{suffix}", "success"), ("忽略本条", f"moderation_dismiss:{suffix}")],
             [("查看原消息", f"moderation_preview:{suffix}"), ("重新检测", f"moderation_retry:{suffix}")],
-            [("封禁该用户", f"moderation_block:{suffix}", "danger")],
+            [("拉黑联系人", f"moderation_block:{suffix}", "danger")],
             [("返回列表", f"moderation:{page}:{category}")],
         ]), callback)
 
@@ -81,7 +79,7 @@ class ModerationInbox:
                 await self.answer(callback_id, "分类无效")
                 return
             await self.answer(callback_id)
-            await self.show(admin_id, number, callback, parts[1] if len(parts) == 2 else "all")
+            await self.show(admin_id, number, callback, parts[1] if len(parts) == 2 else "spam")
             return
         if len(parts) not in {1, 3} or (len(parts) == 3 and (
                 not parts[1].isascii() or not parts[1].isdigit() or len(parts[1]) > 9 or parts[2] not in LABELS)):
@@ -99,8 +97,8 @@ class ModerationInbox:
             return
         if action == "moderation_block":
             await self.answer(callback_id)
-            await self.present(admin_id, f"<b>封禁用户</b>\n\n用户 <code>{job['chat_id']}</code> 的所有待处理留言和后续消息将被拦截。",
-                               inline_keyboard([[("确认封禁", f"moderation_confirm:{number}:{page}:{category}", "danger")],
+            await self.present(admin_id, f"<b>拉黑联系人</b>\n\n用户 <code>{job['chat_id']}</code> 的所有待处理留言和后续消息将被拦截。",
+                               inline_keyboard([[("确认拉黑", f"moderation_confirm:{number}:{page}:{category}", "danger")],
                                                 [("取消", f"moderation_detail:{number}:{page}:{category}")]]), callback)
             return
         if action == "moderation_preview":
@@ -120,7 +118,7 @@ class ModerationInbox:
             notice = "已放入收件箱"
         elif action == "moderation_confirm":
             changed = moderation.block(self.db, number, admin_id)
-            notice = "已封禁用户"
+            notice = "已拉黑联系人"
         elif action in {"moderation_dismiss", "moderation_retry"}:
             retry = action == "moderation_retry"
             if retry and not self.enabled:
@@ -129,7 +127,7 @@ class ModerationInbox:
             changed = moderation.decide(self.db, number, admin_id, retry=retry)
             if changed and retry and self.moderation_wakeup:
                 self.moderation_wakeup.set()
-            notice = "已重新排队" if retry else "已忽略本条，未封禁用户"
+            notice = "已重新排队" if retry else "已忽略本条，未拉黑联系人"
         else:
             await self.answer(callback_id, "未知操作")
             return

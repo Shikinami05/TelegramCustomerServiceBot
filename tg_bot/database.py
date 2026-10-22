@@ -47,6 +47,7 @@ def ensure_column(
 def initialize(db_path: Path) -> None:
     with connect(db_path) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -116,6 +117,8 @@ def initialize(db_path: Path) -> None:
                 owner_admin_id INTEGER,
                 status TEXT NOT NULL DEFAULT 'open',
                 unread_count INTEGER NOT NULL DEFAULT 0,
+                last_inbound_seq INTEGER NOT NULL DEFAULT 0,
+                last_read_seq INTEGER NOT NULL DEFAULT 0,
                 last_user_message_at DATETIME,
                 last_admin_reply_at DATETIME,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -132,39 +135,6 @@ def initialize(db_path: Path) -> None:
                 target_chat_id INTEGER,
                 details TEXT NOT NULL DEFAULT '',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS pending_broadcasts (
-                id TEXT PRIMARY KEY,
-                admin_id INTEGER NOT NULL,
-                content TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                total_count INTEGER NOT NULL DEFAULT 0,
-                sent_count INTEGER NOT NULL DEFAULT 0,
-                failed_count INTEGER NOT NULL DEFAULT 0,
-                unknown_count INTEGER NOT NULL DEFAULT 0,
-                confirmed_at DATETIME,
-                started_at DATETIME,
-                completed_at DATETIME,
-                last_error TEXT NOT NULL DEFAULT '',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS broadcast_recipients (
-                broadcast_id TEXT NOT NULL,
-                chat_id INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                attempts INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT NOT NULL DEFAULT '',
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (broadcast_id, chat_id),
-                FOREIGN KEY (broadcast_id) REFERENCES pending_broadcasts(id)
             )
             """
         )
@@ -187,6 +157,7 @@ def initialize(db_path: Path) -> None:
                 chat_id INTEGER NOT NULL,
                 message_id INTEGER NOT NULL,
                 event_type TEXT NOT NULL,
+                conversation_seq INTEGER NOT NULL DEFAULT 0,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
             """
@@ -228,6 +199,7 @@ def initialize(db_path: Path) -> None:
                 admin_id INTEGER NOT NULL,
                 user_chat_id INTEGER NOT NULL,
                 route TEXT NOT NULL,
+                read_through_seq INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'pending',
                 user_message_id INTEGER,
                 last_error TEXT NOT NULL DEFAULT '',
@@ -282,45 +254,13 @@ def initialize(db_path: Path) -> None:
         )
         ensure_column(conn, "conversations", "last_user_message_at", "DATETIME")
         ensure_column(conn, "conversations", "last_admin_reply_at", "DATETIME")
-        ensure_column(
-            conn,
-            "pending_broadcasts",
-            "status",
-            "TEXT NOT NULL DEFAULT 'pending'",
-        )
-        ensure_column(
-            conn,
-            "pending_broadcasts",
-            "total_count",
-            "INTEGER NOT NULL DEFAULT 0",
-        )
-        ensure_column(
-            conn,
-            "pending_broadcasts",
-            "sent_count",
-            "INTEGER NOT NULL DEFAULT 0",
-        )
-        ensure_column(
-            conn,
-            "pending_broadcasts",
-            "failed_count",
-            "INTEGER NOT NULL DEFAULT 0",
-        )
-        ensure_column(
-            conn,
-            "pending_broadcasts",
-            "unknown_count",
-            "INTEGER NOT NULL DEFAULT 0",
-        )
-        ensure_column(conn, "pending_broadcasts", "confirmed_at", "DATETIME")
-        ensure_column(conn, "pending_broadcasts", "started_at", "DATETIME")
-        ensure_column(conn, "pending_broadcasts", "completed_at", "DATETIME")
-        ensure_column(
-            conn,
-            "pending_broadcasts",
-            "last_error",
-            "TEXT NOT NULL DEFAULT ''",
-        )
+        conversation_columns = {row["name"] for row in conn.execute("PRAGMA table_info(conversations)")}
+        ensure_column(conn, "conversations", "last_inbound_seq", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "conversations", "last_read_seq", "INTEGER NOT NULL DEFAULT 0")
+        if "last_inbound_seq" not in conversation_columns:
+            conn.execute("UPDATE conversations SET last_inbound_seq = MAX(unread_count, 0)")
+        ensure_column(conn, "inbound_events", "conversation_seq", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "admin_reply_deliveries", "read_through_seq", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(
             conn,
             "processed_updates",
@@ -356,19 +296,16 @@ def initialize(db_path: Path) -> None:
             "UPDATE processed_updates SET updated_at = processed_at "
             "WHERE updated_at IS NULL"
         )
-        conn.execute(
-            """
-            UPDATE broadcast_recipients
-            SET status = 'unknown',
-                last_error = 'service restarted during Telegram delivery',
-                updated_at = CURRENT_TIMESTAMP
-            WHERE status = 'sending'
-            """
-        )
-        conn.execute(
-            "UPDATE pending_broadcasts SET status = 'queued' "
-            "WHERE status = 'running'"
-        )
+        # Retain old records, but retire every unfinished broadcast on upgrade.
+        legacy_tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "pending_broadcasts" in legacy_tables:
+            ensure_column(conn, "pending_broadcasts", "status", "TEXT NOT NULL DEFAULT 'pending'")
+            conn.execute(
+                "UPDATE pending_broadcasts SET status='canceled' WHERE status IN ('pending','queued','running')"
+            )
+        if "broadcast_recipients" in legacy_tables:
+            conn.execute("UPDATE broadcast_recipients SET status='unknown' WHERE status='sending'")
+            conn.execute("UPDATE broadcast_recipients SET status='canceled' WHERE status='pending'")
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_message_logs_chat_id_id "
@@ -377,14 +314,6 @@ def initialize(db_path: Path) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_message_links_user_message "
             "ON message_links(user_chat_id, user_message_id)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_broadcast_recipients_status "
-            "ON broadcast_recipients(broadcast_id, status)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_pending_broadcasts_status "
-            "ON pending_broadcasts(status, created_at)"
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_conversations_inbox "
@@ -409,6 +338,11 @@ def initialize(db_path: Path) -> None:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS moderation_notices ("
             "id INTEGER PRIMARY KEY CHECK(id=1), sent_at DATETIME)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS moderation_rules ("
+            "kind TEXT NOT NULL CHECK(kind IN ('phrase','domain')), "
+            "value TEXT NOT NULL, PRIMARY KEY(kind,value))"
         )
         conn.execute(
             "CREATE TABLE IF NOT EXISTS admin_config_inputs ("

@@ -12,30 +12,12 @@ USER_COMMANDS = [
 ]
 
 ADMIN_COMMANDS = [
-    {"command": "moderation", "description": "暂存箱：放行、忽略或重新检测"},
-    {"command": "start", "description": "打开留言工作台"},
-    {"command": "inbox", "description": "查看待处理消息"},
-    {"command": "pending", "description": "查看超时待处理消息"},
-    {"command": "closed", "description": "查看最近已处理会话"},
-    {"command": "users", "description": "查看最近联系用户"},
-    {"command": "cancel", "description": "退出当前回复模式"},
-    {"command": "reply", "description": "回复指定用户：用户ID 内容"},
-    {"command": "send", "description": "主动发送消息：用户ID 内容"},
-    {"command": "takeover", "description": "接管会话：用户ID"},
-    {"command": "close", "description": "标记会话已处理：用户ID"},
-    {"command": "blacklist", "description": "加入黑名单：用户ID 原因"},
-    {"command": "unblacklist", "description": "解除黑名单：用户ID"},
-    {"command": "blacklist_list", "description": "查看最近黑名单"},
+    {"command": "start", "description": "打开聊天首页"},
+    {"command": "cancel", "description": "退出持续回复或取消输入"},
     {"command": "myid", "description": "查看自己的 Telegram ID"},
+    {"command": "settings", "description": "打开设置"},
 ]
-
-OWNER_COMMANDS = ADMIN_COMMANDS + [
-    {"command": "ai", "description": "防广告：服务商、模型、密钥与开关"},
-    {"command": "broadcast", "description": "创建群发任务：内容"},
-    {"command": "broadcast_status", "description": "查看最近群发进度"},
-    {"command": "broadcast_retry", "description": "重试群发失败用户：任务ID"},
-    {"command": "audit", "description": "查看管理员操作记录"},
-]
+OWNER_COMMANDS = list(ADMIN_COMMANDS)
 
 
 def parse_api_response(method: str, response: httpx.Response) -> dict:

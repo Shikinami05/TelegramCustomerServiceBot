@@ -91,18 +91,23 @@ def blacklist(
     admin_id: int,
     reason: str = "",
 ) -> None:
-    database.execute(
-        db_path,
-        """
-        INSERT INTO blacklists (chat_id, reason, created_by)
-        VALUES (?, ?, ?)
-        ON CONFLICT(chat_id) DO UPDATE SET
-            reason = excluded.reason,
-            created_by = excluded.created_by,
-            created_at = CURRENT_TIMESTAMP
-        """,
-        (chat_id, reason, admin_id),
-    )
+    with database.connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            INSERT INTO blacklists (chat_id, reason, created_by)
+            VALUES (?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                reason = excluded.reason,
+                created_by = excluded.created_by,
+                created_at = CURRENT_TIMESTAMP
+            """,
+            (chat_id, reason, admin_id),
+        )
+        conn.execute("UPDATE admin_deliveries SET status='canceled' WHERE user_chat_id=? AND status IN ('pending','failed')", (chat_id,))
+        conn.execute("UPDATE moderation_jobs SET status='blocked' WHERE chat_id=? AND status IN ('queued','running','held')", (chat_id,))
+        conn.execute("DELETE FROM admin_states WHERE target_chat_id=?", (chat_id,))
+        conn.commit()
 
 
 def unblacklist(db_path: Path, chat_id: int) -> None:
@@ -124,4 +129,3 @@ def list_blacklist(db_path: Path, limit: int = 20) -> list[sqlite3.Row]:
         """,
         (limit,),
     )
-

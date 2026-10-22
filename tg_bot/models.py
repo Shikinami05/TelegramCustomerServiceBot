@@ -12,12 +12,3 @@ class TelegramSendResult:
 
     def __bool__(self) -> bool:
         return self.ok
-
-
-@dataclass(frozen=True, slots=True)
-class ConversationClaimResult:
-    status: str
-    owner_admin_id: int | None
-
-    def __bool__(self) -> bool:
-        return self.status == "acquired"

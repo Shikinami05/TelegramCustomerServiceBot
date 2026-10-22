@@ -18,7 +18,9 @@ def format_status(values: dict[str, str | None]) -> str:
     provider = values.get("AI_PROVIDER") or "deepseek"
     model = values.get("AI_MODEL") or (values.get("DEEPSEEK_MODEL") if provider == "deepseek" else "") or ""
     key = values.get("AI_API_KEY") or (values.get("DEEPSEEK_API_KEY") if provider == "deepseek" else "")
-    return "\n".join((f"AI moderation: {'enabled' if enabled else 'disabled'}",
+    rules = (values.get("SPAM_RULES_ENABLED") or "true").lower() in {"true", "1", "yes", "on"}
+    return "\n".join((f"Local spam rules: {'enabled' if rules else 'disabled'}",
+                       f"AI moderation: {'enabled' if enabled else 'disabled'}",
                        f"Provider: {provider}",
                        f"Model: {normalize_model(provider, model)}",
                        f"API key: {'configured' if key else 'not configured'}",
