@@ -152,8 +152,7 @@ def mark_all_read(db_path: Path) -> int:
         conn.execute("BEGIN IMMEDIATE")
         cursor = conn.execute(
             "UPDATE conversations SET last_read_seq=last_inbound_seq, unread_count=0 "
-            "WHERE archived_at IS NULL AND unread_count>0 "
-            "AND NOT EXISTS (SELECT 1 FROM blacklists b WHERE b.chat_id=conversations.chat_id)"
+            "WHERE unread_count>0"
         )
         conn.commit()
         return cursor.rowcount
@@ -251,6 +250,9 @@ def queue_counts(db_path: Path) -> dict[str, int]:
             SUM(CASE WHEN unread_count > 0 AND NOT EXISTS (
                 SELECT 1 FROM blacklists b WHERE b.chat_id=c.chat_id)
                 THEN 1 ELSE 0 END) AS inbox,
+            SUM(CASE WHEN NOT EXISTS (
+                SELECT 1 FROM blacklists b WHERE b.chat_id=c.chat_id)
+                THEN unread_count ELSE 0 END) AS unread_messages,
             COUNT(*) AS "all"
         FROM conversations c
         WHERE c.archived_at IS NULL
@@ -258,5 +260,5 @@ def queue_counts(db_path: Path) -> dict[str, int]:
     )
     return {
         queue_name: int(row[queue_name] or 0) if row else 0
-        for queue_name in QUEUE_NAMES
+        for queue_name in (*QUEUE_NAMES, "unread_messages")
     }

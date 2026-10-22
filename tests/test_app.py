@@ -244,7 +244,7 @@ class BotDatabaseTests(unittest.TestCase):
         self.assertIn("first", previous_history)
         self.assertNotIn("new text", previous_history)
         self.assertIn("new text", full_history)
-        self.assertIn("已编辑", full_history)
+        self.assertIn("已編輯", full_history)
 
 
     def test_expired_persistent_reply_state_is_deleted_before_routing(self) -> None:
@@ -415,7 +415,7 @@ class BotDatabaseTests(unittest.TestCase):
 
         copy.assert_not_awaited()
         self.assertIsNone(app.get_admin_state(1))
-        self.assertIn("无法识别回复对象", send.await_args.args[1])
+        self.assertIn("無法辨識回覆對象", send.await_args.args[1])
 
     def test_uncertain_admin_reply_is_not_automatically_replayed(self) -> None:
         app.add_message_link(
@@ -458,7 +458,7 @@ class BotDatabaseTests(unittest.TestCase):
         )
         self.assertEqual(delivery["status"], "unknown")
         self.assertIn("network result unknown", delivery["last_error"])
-        self.assertIn("投递结果不确定", send.await_args.args[1])
+        self.assertIn("投遞結果不確定", send.await_args.args[1])
 
     def test_inbound_event_and_admin_outbox_are_idempotent(self) -> None:
         user = {"id": 207, "username": "once", "first_name": "Once"}
@@ -607,26 +607,26 @@ class BotDatabaseTests(unittest.TestCase):
     def test_requested_media_types_have_explicit_summaries(self) -> None:
         cases = (
             ({"text": "hello"}, "text", "hello"),
-            ({"photo": [{}], "caption": "photo"}, "photo", "[图片] photo"),
-            ({"video": {}, "caption": "video"}, "video", "[视频] video"),
+            ({"photo": [{}], "caption": "photo"}, "photo", "[圖片] photo"),
+            ({"video": {}, "caption": "video"}, "video", "[影片] video"),
             (
                 {"document": {"file_name": "a.txt"}, "caption": "doc"},
                 "document",
-                "[文件] a.txt doc",
+                "[檔案] a.txt doc",
             ),
-            ({"audio": {}, "caption": "audio"}, "audio", "[音频] audio"),
-            ({"voice": {}, "caption": "voice"}, "voice", "[语音] voice"),
+            ({"audio": {}, "caption": "audio"}, "audio", "[音訊] audio"),
+            ({"voice": {}, "caption": "voice"}, "voice", "[語音] voice"),
             (
                 {"animation": {}, "caption": "animation"},
                 "animation",
-                "[动图] animation",
+                "[動畫] animation",
             ),
-            ({"sticker": {"emoji": "ok"}}, "sticker", "[贴纸] ok"),
+            ({"sticker": {"emoji": "ok"}}, "sticker", "[貼圖] ok"),
             ({"location": {"latitude": 1, "longitude": 2}}, "location", "[位置]"),
             (
                 {"contact": {"first_name": "Example", "last_name": "User"}},
                 "contact",
-                "[联系人] Example User",
+                "[聯絡人] Example User",
             ),
         )
 
@@ -727,7 +727,7 @@ class BotDatabaseTests(unittest.TestCase):
 
         answer.assert_awaited_once_with("queue-callback")
         edit.assert_awaited_once()
-        self.assertIn("<b>聊天 · 未读</b>", edit.await_args.args[2])
+        self.assertIn("<b>聊天 · 未讀留言</b>", edit.await_args.args[2])
         send.assert_not_awaited()
 
     def test_paginated_callbacks_require_admin_and_validate_ascii_page(self) -> None:
@@ -745,7 +745,7 @@ class BotDatabaseTests(unittest.TestCase):
         ):
             asyncio.run(app.handle_callback(callback))
 
-        answer.assert_awaited_once_with("queue-page-denied", "无权限")
+        answer.assert_awaited_once_with("queue-page-denied", "無權限")
         show_queue.assert_not_awaited()
 
         answer.reset_mock()
@@ -763,7 +763,7 @@ class BotDatabaseTests(unittest.TestCase):
         ):
             asyncio.run(app.handle_callback(callback))
 
-        answer.assert_awaited_once_with("queue-page-invalid", "页码无效")
+        answer.assert_awaited_once_with("queue-page-invalid", "頁碼無效")
         show_queue.assert_not_awaited()
 
     def test_admin_ui_views_fit_telegram_limits(self) -> None:
@@ -819,7 +819,7 @@ class BotDatabaseTests(unittest.TestCase):
         confirmation_markup = send.await_args.kwargs["reply_markup"]
         self.assertEqual(
             confirmation_markup["inline_keyboard"][0][0]["callback_data"],
-            "blacklist_confirm:55",
+            "blacklist_confirm:55:all:1",
         )
         self.assertEqual(
             confirmation_markup["inline_keyboard"][0][0]["style"],
@@ -847,7 +847,7 @@ class BotDatabaseTests(unittest.TestCase):
         self.assertNotIn("style", welcome_buttons[1])
 
         reply_buttons = app.exit_reply_keyboard(123)["inline_keyboard"][0]
-        self.assertEqual(reply_buttons[0]["text"], "退出回复")
+        self.assertEqual(reply_buttons[0]["text"], "退出回覆")
         continue_button = app.admin_user_keyboard(
             123,
             viewer_admin_id=1,
@@ -867,9 +867,9 @@ class BotDatabaseTests(unittest.TestCase):
             app.normalize_command_text("/reply@ExampleBot 123 hello"),
             "/reply 123 hello",
         )
-        self.assertTrue(app.WELCOME_TEXT.startswith("<b>统一留言聊天入口</b>\n\n"))
-        self.assertIn("无需另行私聊", app.WELCOME_TEXT)
-        self.assertNotIn("审核", app.WELCOME_TEXT)
+        self.assertTrue(app.WELCOME_TEXT.startswith("<b>統一留言聊天入口</b>\n\n"))
+        self.assertIn("不必另行私聊", app.WELCOME_TEXT)
+        self.assertNotIn("審核", app.WELCOME_TEXT)
         self.assertNotIn("模型", app.WELCOME_TEXT)
 
     def test_telegram_http_errors_do_not_expose_bot_token(self) -> None:
@@ -956,7 +956,7 @@ class BotDatabaseTests(unittest.TestCase):
         self.assertEqual(copied.message_id, 302)
         self.assertFalse(rejected)
         self.assertEqual(rejected.status_code, 403)
-        self.assertIn("屏蔽", app.delivery_failure_message(rejected))
+        self.assertIn("封鎖", app.delivery_failure_message(rejected))
 
     def test_refreshing_unchanged_admin_view_is_not_an_error(self) -> None:
         tg_mock = AsyncMock(
@@ -996,7 +996,7 @@ class BotDatabaseTests(unittest.TestCase):
         self.assertFalse(
             asyncio.run(app.handle_admin_command(999, "/blacklist 55 forged"))
         )
-        answer.assert_awaited_once_with("callback-1", "无权限")
+        answer.assert_awaited_once_with("callback-1", "無權限")
 
     @unittest.skipUnless(os.name == "posix", "POSIX permission modes required")
     def test_database_and_backups_are_private(self) -> None:

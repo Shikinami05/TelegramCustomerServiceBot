@@ -95,7 +95,7 @@ class AISettingsTests(unittest.IsolatedAsyncioTestCase):
             await self.controller.message(self.message())
         probe.assert_not_awaited()
         self.assertEqual(self.settings.deepseek_api_key, "")
-        self.assertIn("未能自动删除", str(self.send.await_args_list))
+        self.assertIn("未能自動刪除", str(self.send.await_args_list))
 
     async def test_invalid_key_and_failed_probe_preserve_previous_key(self):
         self.settings = replace(self.settings, deepseek_api_key="sk-old-test-private")
@@ -214,7 +214,7 @@ class AISettingsTests(unittest.IsolatedAsyncioTestCase):
         buttons = {button["callback_data"] for row in self.send.await_args.kwargs["reply_markup"]["inline_keyboard"] for button in row}
         self.assertTrue({"ai:mode:rules", "ai:mode:ai", "ai:mode:off", "ai:setup", "ai:rules", "ai:advanced"} <= buttons)
         self.assertFalse({"ai:rules_on", "ai:rules_off", "ai:enable", "ai:disable"} & buttons)
-        self.assertIn("不会自动拉黑", self.send.await_args.args[1])
+        self.assertIn("不會自動封鎖", self.send.await_args.args[1])
         self.assertLess(len(self.send.await_args.args[1]), 2000)
 
     async def test_original_rules_page_escapes_custom_text_and_fits_telegram(self):
@@ -223,7 +223,7 @@ class AISettingsTests(unittest.IsolatedAsyncioTestCase):
         spam_rules.replace_rules(self.db, "\n".join(f"词语：{index}" + "\U0001f600<&" * 25 for index in range(30)))
         await self.controller.callback(1, "rules")
         text = self.send.await_args.args[1]
-        self.assertIn("本项目独立编写", text)
+        self.assertIn("本專案獨立編寫", text)
         self.assertIn("幸运哈希开桌", text)
         self.assertNotIn("\U0001f600<&", text)
         self.assertLessEqual(len(text.encode("utf-16-le")) // 2, 4096)
@@ -234,8 +234,8 @@ class AISettingsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_quick_setup_requires_notice_and_checks_model_before_enabling(self):
         await self.controller.callback(1, "mode:ai")
-        self.assertIn("可能产生 API 费用", self.send.await_args.args[1])
-        self.assertIn("无法保证清除", self.send.await_args.args[1])
+        self.assertIn("可能產生 API 費用", self.send.await_args.args[1])
+        self.assertIn("無法保證清除", self.send.await_args.args[1])
         self.assertIsNone(moderation.pending_config_input(self.db, 1))
         await self.controller.callback(1, "setup_input")
         with patch.object(ai_settings, "probe_key", AsyncMock(return_value=True)) as probe:
@@ -270,7 +270,7 @@ class AISettingsTests(unittest.IsolatedAsyncioTestCase):
             probe.assert_not_awaited()
             self.assertFalse(self.settings.ai_moderation_enabled)
             await self.controller.callback(1, "mode_ai_confirm:deepseek")
-        self.assertEqual(self.settings.moderation_mode_label, "规则 + AI")
+        self.assertEqual(self.settings.moderation_mode_label, "規則 + AI")
         await self.controller.callback(1, "mode:rules")
         self.assertFalse(self.settings.ai_moderation_enabled)
         self.assertTrue(self.settings.spam_rules_enabled)

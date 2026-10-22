@@ -14,7 +14,7 @@ os.environ.setdefault("ADMIN_IDS", "1,2")
 
 import app
 from scripts import manage_webhook
-from tg_bot import database, keyboards
+from tg_bot import database, keyboards, ui
 from tg_bot.models import TelegramSendResult
 from tg_bot.repositories import conversations, deliveries, inbound, moderation
 from tg_bot.services import spam_rules
@@ -90,7 +90,7 @@ class PersonalChatTests(unittest.IsolatedAsyncioTestCase):
             await app.handle_admin_message(self.message(user=1, message_id=701,
                                                         reply_to_message={"message_id": 700}), 200)
         self.assertEqual(conversations.get(self.db, 50)["unread_count"], 1)
-        self.assertIn("屏蔽", self.send.await_args.args[1])
+        self.assertIn("封鎖", self.send.await_args.args[1])
 
     async def test_old_mark_read_button_cannot_clear_a_new_arrival(self):
         self.receive()
@@ -128,15 +128,17 @@ class PersonalChatTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ID：<code>50</code>", self.edit.await_args.args[2])
         self.assertEqual(conversations.get(self.db, 50)["unread_count"], 0)
         button = self.edit.await_args.kwargs["reply_markup"]["inline_keyboard"][0][0]
-        self.assertEqual((button["callback_data"], button["style"]), ("cancel:50", "danger"))
+        self.assertEqual((button["callback_data"], button["style"]), ("reply_end:50:all:1", "danger"))
 
-    async def test_opening_a_different_contact_has_an_explicit_new_target(self):
+    async def test_viewing_a_different_contact_does_not_select_a_reply_target(self):
         self.receive(user=50)
         self.receive(user=60, update=101)
         app.set_admin_state(1, 50)
         await app.handle_callback(self.callback("user:60:all:1"))
-        self.assertEqual(app.get_admin_state(1), 60)
+        self.assertIsNone(app.get_admin_state(1))
         self.assertIn("User 60", self.edit.await_args.args[2])
+        await app.handle_callback(self.callback("reply_start:60:all:1"))
+        self.assertEqual(app.get_admin_state(1), 60)
 
     async def test_two_administrators_keep_independent_reply_targets(self):
         for user, admin in ((50, 1), (60, 2)):
@@ -188,7 +190,7 @@ class PersonalChatTests(unittest.IsolatedAsyncioTestCase):
         for data in ("read:50:1", "read_all:all:1", "delete:50", "delete_confirm:50:1",
                      "blacklist_confirm:50", "ai:rules_off", "settings:panel"):
             await app.handle_callback(self.callback(data, admin=99))
-            self.assertEqual(self.answer.await_args.args[1], "无权限")
+            self.assertEqual(self.answer.await_args.args[1], "無權限")
         self.assertEqual(conversations.get(self.db, 50)["unread_count"], 1)
         self.assertFalse(app.is_blacklisted(50))
 
@@ -203,7 +205,7 @@ class PersonalChatTests(unittest.IsolatedAsyncioTestCase):
 
         self.answer.side_effect = answer
         await app.handle_callback(self.callback("read_all:all:2"))
-        self.assertIn("25 个聊天", self.answer.await_args.args[1])
+        self.assertIn("25 個會話", self.answer.await_args.args[1])
         self.assertEqual(conversations.queue_counts(self.db)["inbox"], 2)
         self.assertEqual(conversations.get(self.db, 500)["unread_count"], 1)
         self.assertEqual(conversations.get(self.db, 600)["unread_count"], 1)
@@ -211,14 +213,260 @@ class PersonalChatTests(unittest.IsolatedAsyncioTestCase):
         database.initialize(self.db)
         self.assertEqual(conversations.queue_counts(self.db)["inbox"], 2)
 
-    async def test_mark_all_read_skips_hidden_and_blocked_contacts(self):
+    async def test_mark_all_read_also_clears_old_unread_on_blocked_contacts(self):
         self.receive()
         self.receive(user=60, update=101)
         app.blacklist_user(60, 1, "test")
         await app.handle_callback(self.callback("read_all:inbox:1"))
         self.assertEqual(conversations.get(self.db, 50)["unread_count"], 0)
-        self.assertEqual(conversations.get(self.db, 60)["unread_count"], 1)
+        self.assertEqual(conversations.get(self.db, 60)["unread_count"], 0)
+        self.assertTrue(app.is_blacklisted(60))
         self.assertEqual(conversations.mark_all_read(self.db), 0)
+
+    async def test_home_and_lists_always_offer_one_click_read_and_refresh(self):
+        for populated in (False, True):
+            if populated:
+                self.receive()
+                self.receive(update=101, message_id=11)
+            await app.show_admin_dashboard(1)
+            text = self.send.await_args.args[1]
+            self.assertIn("未讀會話：1 個" if populated else "未讀會話：0 個", text)
+            self.assertIn("未讀訊息：2 則" if populated else "未讀訊息：0 則", text)
+            self.assertNotIn("防廣告", text)
+            home = {button["callback_data"]: button["text"] for row in self.send.await_args.kwargs["reply_markup"]["inline_keyboard"] for button in row}
+            self.assertEqual(home["read_all:dashboard:1"], "全部標為已讀")
+            self.assertEqual(home["admin:dashboard"], "重新整理")
+            for queue in ("inbox", "all"):
+                await app.show_conversation_queue(1, queue)
+                rows = self.send.await_args.kwargs["reply_markup"]["inline_keyboard"]
+                self.assertEqual(rows[1][0]["callback_data"], f"read_all:{queue}:1")
+                self.assertEqual(rows[1][1]["text"], "重新整理")
+
+    async def test_home_all_read_preserves_explicit_reply_and_new_messages(self):
+        self.receive()
+        app.set_admin_state(1, 50)
+
+        async def answer(*args):
+            self.receive(update=101, message_id=11)
+            return True
+
+        self.answer.side_effect = answer
+        await app.handle_callback(self.callback("read_all:dashboard:1"))
+        self.assertEqual(app.get_admin_state(1), 50)
+        self.assertEqual(conversations.get(self.db, 50)["unread_count"], 1)
+        text = self.edit.await_args.args[2]
+        self.assertIn("未讀訊息：1 則", text)
+        self.assertIn("正在回覆：User 50", text)
+        self.assertIn("操作結果", text)
+        buttons = {button["callback_data"]: button for row in self.edit.await_args.kwargs["reply_markup"]["inline_keyboard"] for button in row}
+        self.assertEqual(buttons["cancel:50"]["style"], "danger")
+
+    async def test_empty_all_read_is_idempotent_and_keeps_the_control_visible(self):
+        for _ in range(2):
+            await app.handle_callback(self.callback("read_all:dashboard:1"))
+            self.assertIn("目前沒有未讀留言", self.answer.await_args.args[1])
+            data = {button["callback_data"] for row in self.edit.await_args.kwargs["reply_markup"]["inline_keyboard"] for button in row}
+            self.assertIn("read_all:dashboard:1", data)
+            self.assertEqual(conversations.queue_counts(self.db)["unread_messages"], 0)
+
+    async def test_viewing_without_reply_mode_never_forwards_typed_messages(self):
+        self.receive()
+        await app.handle_callback(self.callback("user:50:inbox:3"))
+        self.assertIsNone(app.get_admin_state(1))
+        self.assertIn("僅查看會話", self.edit.await_args.args[2])
+        buttons = {button["callback_data"] for row in self.edit.await_args.kwargs["reply_markup"]["inline_keyboard"] for button in row}
+        self.assertIn("reply_start:50:inbox:3", buttons)
+        self.assertIn("queue:inbox:3", buttons)
+        with patch.object(app, "copy_message", new_callable=AsyncMock) as copy:
+            await app.handle_admin_message(self.message(user=1, message_id=702, text="not a reply"), 200)
+        copy.assert_not_awaited()
+        self.assertIn("尚未選擇回覆對象", self.send.await_args.args[1])
+
+    async def test_explicit_reply_start_end_and_refresh_preserve_list_context(self):
+        self.receive()
+        await app.handle_callback(self.callback("reply_start:50:inbox:3"))
+        self.assertEqual(app.get_admin_state(1), 50)
+        self.assertIn("持續回覆中", self.edit.await_args.args[2])
+        buttons = {button["callback_data"]: button for row in self.edit.await_args.kwargs["reply_markup"]["inline_keyboard"] for button in row}
+        self.assertEqual(buttons["reply_end:50:inbox:3"]["style"], "danger")
+        await app.handle_callback(self.callback("contact:50:inbox:3"))
+        self.assertEqual(app.get_admin_state(1), 50)
+        await app.handle_callback(self.callback("reply_end:50:inbox:3"))
+        self.assertIsNone(app.get_admin_state(1))
+        self.assertIn("僅查看會話", self.edit.await_args.args[2])
+        buttons = {button["callback_data"] for row in self.edit.await_args.kwargs["reply_markup"]["inline_keyboard"] for button in row}
+        self.assertIn("queue:inbox:3", buttons)
+        self.assertIn("reply_start:50:inbox:3", buttons)
+
+    async def test_stale_exit_button_cannot_end_another_contacts_reply(self):
+        self.receive()
+        self.receive(user=60, update=101)
+        app.set_admin_state(1, 60)
+        await app.handle_callback(self.callback("reply_end:50:all:1"))
+        self.assertEqual(app.get_admin_state(1), 60)
+        self.assertIn("未變更其他會話", self.answer.await_args.args[1])
+        self.edit.assert_not_awaited()
+
+    async def test_failed_explicit_reply_panel_never_saves_a_new_target(self):
+        self.receive()
+        self.edit.return_value = False
+        self.send.return_value = TelegramSendResult(False, status_code=403)
+        await app.handle_callback(self.callback("reply_start:50:all:1"))
+        self.assertIsNone(app.get_admin_state(1))
+        self.assertEqual(conversations.get(self.db, 50)["unread_count"], 1)
+
+    async def test_reading_a_mapped_notification_updates_only_its_buttons(self):
+        self.receive()
+        delivery = deliveries.claim_next_admin(self.db)
+        deliveries.complete_admin(self.db, delivery, TelegramSendResult(True, message_id=700))
+        self.receive(update=101, message_id=11)
+        await app.handle_callback(self.callback("read:50:1"))
+        self.assertEqual(conversations.get(self.db, 50)["unread_count"], 1)
+        self.assertEqual(self.telegram.await_args.args[0], "editMessageReplyMarkup")
+        payload = self.telegram.await_args.args[1]
+        self.assertNotIn("text", payload)
+        self.assertEqual(payload["message_id"], 700)
+        buttons = {button["callback_data"]: button["text"] for row in payload["reply_markup"]["inline_keyboard"] for button in row}
+        self.assertEqual(buttons["read:50:1"], "此則已讀")
+        self.edit.assert_not_awaited()
+        self.send.assert_not_awaited()
+        self.assertEqual(app.get_message_link(1, 700)["user_chat_id"], 50)
+
+    async def test_failed_read_button_refresh_is_visible_and_never_drops_mapping(self):
+        self.receive()
+        delivery = deliveries.claim_next_admin(self.db)
+        deliveries.complete_admin(self.db, delivery, TelegramSendResult(True, message_id=700))
+        self.telegram.return_value = {"ok": False}
+        await app.handle_callback(self.callback("read:50:1"))
+        self.assertEqual(conversations.get(self.db, 50)["unread_count"], 0)
+        self.assertEqual(app.get_message_link(1, 700)["user_chat_id"], 50)
+        self.assertIn("原按鈕暫時無法更新", self.send.await_args.args[1])
+        self.edit.assert_not_awaited()
+
+    async def test_read_refresh_does_not_consume_new_arrivals_during_callback_ack(self):
+        self.receive()
+
+        async def answer(*args):
+            self.receive(update=101, message_id=11)
+            return True
+
+        self.answer.side_effect = answer
+        await app.handle_callback(self.callback("read:50:1:inbox:3"))
+        self.assertEqual(conversations.get(self.db, 50)["unread_count"], 1)
+        self.assertIn("未讀訊息：1 則", self.edit.await_args.args[2])
+        buttons = {button["callback_data"] for row in self.edit.await_args.kwargs["reply_markup"]["inline_keyboard"] for button in row}
+        self.assertIn("read:50:2:inbox:3", buttons)
+        self.assertIn("queue:inbox:3", buttons)
+        self.assertIsNone(app.get_admin_state(1))
+
+    async def test_marking_an_old_panel_read_does_not_switch_another_reply_target(self):
+        self.receive()
+        self.receive(user=60, update=101)
+        app.set_admin_state(1, 60)
+        await app.handle_callback(self.callback("read:50:1:all:1"))
+        self.assertEqual(app.get_admin_state(1), 60)
+        self.assertEqual(conversations.get(self.db, 50)["unread_count"], 0)
+        self.assertEqual(conversations.get(self.db, 60)["unread_count"], 1)
+        self.assertIn("正在回覆：User 60", self.edit.await_args.args[2])
+
+    async def test_read_button_mapping_mismatch_and_invalid_context_cannot_mutate(self):
+        self.receive()
+        self.receive(user=60, update=101)
+        delivery = deliveries.claim_next_admin(self.db)
+        deliveries.complete_admin(self.db, delivery, TelegramSendResult(True, message_id=700))
+        for data in ("read:60:1", "read:50:9", "read:50:1:all:０", "read_all:dashboard:2",
+                     "reply_start:50:all:0", "reply_start:50:closed:1", "reply_start:0:all:1",
+                     "reply_start:50:all:" + "9" * 10, "reply_start:５０:all:1"):
+            await app.handle_callback(self.callback(data))
+        self.assertEqual(conversations.get(self.db, 50)["unread_count"], 1)
+        self.assertEqual(conversations.get(self.db, 60)["unread_count"], 1)
+        self.assertIsNone(app.get_admin_state(1))
+        self.telegram.assert_not_awaited()
+
+    async def test_navigation_ends_reply_before_awaiting_telegram(self):
+        self.receive()
+
+        async def answer(*args):
+            self.assertIsNone(app.get_admin_state(1))
+            return True
+
+        self.answer.side_effect = answer
+        for action in ("queue:all:1", "read_all:all:1", "admin:dashboard", "settings:panel", "more:50:all:1", "delete:50:all:1"):
+            app.set_admin_state(1, 50)
+            await app.handle_callback(self.callback(action))
+            self.assertIsNone(app.get_admin_state(1))
+
+    async def test_more_and_cancel_block_keep_the_source_list_page(self):
+        self.receive()
+        app.set_admin_state(1, 50)
+        await app.handle_callback(self.callback("more:50:inbox:3"))
+        self.assertIsNone(app.get_admin_state(1))
+        buttons = {button["callback_data"] for row in self.edit.await_args.kwargs["reply_markup"]["inline_keyboard"] for button in row}
+        self.assertIn("contact:50:inbox:3", buttons)
+        self.assertIn("queue:inbox:3", buttons)
+        await app.handle_callback(self.callback("blacklist:50:inbox:3"))
+        buttons = {button["callback_data"] for row in self.edit.await_args.kwargs["reply_markup"]["inline_keyboard"] for button in row}
+        self.assertIn("blacklist_cancel:50:inbox:3", buttons)
+        await app.handle_callback(self.callback("blacklist_cancel:50:inbox:3"))
+        self.assertFalse(app.is_blacklisted(50))
+        self.assertIsNone(app.get_admin_state(1))
+
+    async def test_blocked_contact_details_return_to_the_blocked_list(self):
+        self.receive()
+        app.blacklist_user(50, 1, "test")
+        await app.show_blocked_contacts(1, 1)
+        buttons = {button["callback_data"] for row in self.send.await_args.kwargs["reply_markup"]["inline_keyboard"] for button in row}
+        self.assertIn("detail:50:blocked:1", buttons)
+        await app.handle_callback(self.callback("detail:50:blocked:1"))
+        buttons = {button["callback_data"] for row in self.edit.await_args.kwargs["reply_markup"]["inline_keyboard"] for button in row}
+        self.assertIn("settings:blocked:1", buttons)
+        self.assertFalse(any(value.startswith("reply_start:") for value in buttons))
+        await app.handle_callback(self.callback("more:50:blocked:1"))
+        await app.handle_callback(self.callback("unblacklist:50:blocked:1"))
+        self.assertFalse(app.is_blacklisted(50))
+        self.assertIsNone(app.get_admin_state(1))
+        buttons = {button["callback_data"] for row in self.edit.await_args.kwargs["reply_markup"]["inline_keyboard"] for button in row}
+        self.assertIn("settings:blocked:1", buttons)
+
+    async def test_traditional_interface_does_not_translate_or_inject_user_content(self):
+        text = "请回复我，我在这边。<b>消息原文</b>"
+        message = self.message(text=text)
+        inbound.persist_event(self.db, 100, message["from"], text, 50, 10, event_type="message",
+                              title="message", edited=False, admin_ids={1, 2}, include_content_delivery=False)
+        await app.handle_callback(self.callback("user:50:all:1"))
+        shown = self.edit.await_args.args[2]
+        self.assertIn("使用者詳情", shown)
+        self.assertIn("请回复我，我在这边。&lt;b&gt;消息原文&lt;/b&gt;", shown)
+        self.assertEqual(database.fetchone(self.db, "SELECT text FROM message_logs")[0], text)
+        self.assertNotIn("<b>消息原文</b>", shown)
+
+    async def test_cross_private_chat_callback_is_rejected_before_reading(self):
+        self.receive()
+        callback = self.callback("read_all:dashboard:1")
+        callback["message"]["chat"]["id"] = 2
+        await app.handle_callback(callback)
+        self.assertEqual(conversations.get(self.db, 50)["unread_count"], 1)
+        self.assertIn("私聊", self.answer.await_args.args[1])
+
+    async def test_long_contact_callbacks_and_core_copy_are_bounded_and_traditional(self):
+        markup = keyboards.contact_keyboard(999999999999999999, queue_name="inbox", page=999999999,
+                                            active_reply=True, blacklisted=False,
+                                            read_through_seq=999999999999999999, read_done=False)
+        for row in markup["inline_keyboard"]:
+            for button in row:
+                self.assertLessEqual(len(button["callback_data"].encode()), 64)
+        texts = [ui.WELCOME_TEXT, ui.USER_HELP, ui.USER_GUIDE,
+                 ui.dashboard({"inbox": 2, "all": 3, "unread_messages": 5})]
+        for text in texts:
+            for simplified in "这复设读讯页户语图传删关选数":
+                self.assertNotIn(simplified, text)
+            self.assertLessEqual(len(text.encode("utf-16-le")) // 2, 4096)
+
+    async def test_original_and_traditional_rule_prefixes_preserve_the_rule_value(self):
+        for prefix in ("词语", "詞語"):
+            spam_rules.replace_rules(self.db, f"{prefix}：出售成品号")
+            self.assertEqual(spam_rules.read_rules(self.db), [("phrase", "出售成品号")])
+            self.assertEqual(spam_rules.format_rules(self.db), "詞語：出售成品号")
 
     async def test_delete_requires_confirmation_and_keeps_history_and_reply_mapping_after_restart(self):
         self.receive()
@@ -229,7 +477,7 @@ class PersonalChatTests(unittest.IsolatedAsyncioTestCase):
         app.set_admin_state(3, 60)
         before = database.fetchone(self.db, "SELECT COUNT(*) FROM message_logs")[0]
         await app.handle_callback(self.callback("more:50", message_id=701))
-        self.assertIn("删除会话", str(self.edit.await_args))
+        self.assertIn("刪除會話", str(self.edit.await_args))
         await app.handle_callback(self.callback("delete:50", message_id=701))
         self.assertIsNone(conversations.get(self.db, 50)["archived_at"])
         buttons = self.edit.await_args.kwargs["reply_markup"]["inline_keyboard"]
@@ -237,7 +485,7 @@ class PersonalChatTests(unittest.IsolatedAsyncioTestCase):
         await app.handle_callback(self.callback("delete_confirm:50:1", message_id=701))
         database.initialize(self.db)
         self.assertIsNotNone(conversations.get(self.db, 50)["archived_at"])
-        self.assertEqual(conversations.queue_counts(self.db), {"inbox": 0, "all": 0})
+        self.assertEqual(conversations.queue_counts(self.db), {"inbox": 0, "all": 0, "unread_messages": 0})
         self.assertEqual(database.fetchone(self.db, "SELECT COUNT(*) FROM message_logs")[0], before)
         self.assertEqual(app.get_message_link(1, 700)["user_chat_id"], 50)
         self.assertIsNone(app.get_admin_state(1))
@@ -255,7 +503,7 @@ class PersonalChatTests(unittest.IsolatedAsyncioTestCase):
         await app.handle_callback(self.callback("delete_confirm:50:1"))
         self.receive(update=101, message_id=11)
         self.assertIsNone(conversations.get(self.db, 50)["archived_at"])
-        self.assertEqual(conversations.queue_counts(self.db), {"inbox": 1, "all": 1})
+        self.assertEqual(conversations.queue_counts(self.db), {"inbox": 1, "all": 1, "unread_messages": 1})
         await app.handle_callback(self.callback("delete_confirm:50:1"))
         self.assertIn("有新留言", self.answer.await_args.args[1])
         self.assertEqual(conversations.get(self.db, 50)["unread_count"], 1)
@@ -302,7 +550,7 @@ class PersonalChatTests(unittest.IsolatedAsyncioTestCase):
         await app.show_conversation_queue(1, "all")
         buttons = {button["callback_data"] for row in self.send.await_args.kwargs["reply_markup"]["inline_keyboard"] for button in row}
         self.assertIn("read_all:all:1", buttons)
-        self.assertIn("时间：", self.send.await_args.args[1])
+        self.assertIn("顯示時區：", self.send.await_args.args[1])
 
     async def test_long_emoji_names_and_histories_fit_telegram_utf16_budget(self):
         for index in range(10):
@@ -497,8 +745,8 @@ class PersonalChatTests(unittest.IsolatedAsyncioTestCase):
             return True
 
         self.edit.side_effect = edit
-        await asyncio.gather(app.handle_callback(self.callback("user:50:all:1")),
-                             app.handle_callback(self.callback("user:60:all:1")))
+        await asyncio.gather(app.handle_callback(self.callback("reply_start:50:all:1")),
+                             app.handle_callback(self.callback("reply_start:60:all:1")))
         self.assertEqual(app.get_admin_state(1), 60)
         self.assertIn("User 50", displayed[0])
         self.assertIn("User 60", displayed[1])

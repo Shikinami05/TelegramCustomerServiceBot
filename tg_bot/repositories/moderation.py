@@ -43,7 +43,7 @@ def enqueue(db_path: Path, update_id: int, chat_id: int, message_id: int,
 
 
 def recover(db_path: Path) -> None:
-    database.execute(db_path, "UPDATE moderation_jobs SET status='held', verdict='error', reason='服务重启，等待人工确认' "
+    database.execute(db_path, "UPDATE moderation_jobs SET status='held', verdict='error', reason='服務重新啟動，等待人工確認' "
                      "WHERE status='running'")
 
 
@@ -138,7 +138,7 @@ def approve(db_path: Path, update_id: int, admin_ids: set[int], admin_id: int | 
                           "sticker", "video_note", "location", "contact"}.intersection(message))
         inbound.persist_event(
             db_path, update_id, message["from"], row["summary"], row["chat_id"], row["message_id"],
-            event_type="edited_message" if edited else "message", title="用户修改了消息" if edited else "收到用户消息",
+            event_type="edited_message" if edited else "message", title="使用者修改了訊息" if edited else "收到使用者訊息",
             edited=edited, admin_ids=admin_ids,
             include_content_delivery=has_media and not bool(message.get("text")), connection=conn,
         )
@@ -158,7 +158,7 @@ def block(db_path: Path, update_id: int, admin_id: int) -> bool:
         if not row:
             return False
         chat_id = row["chat_id"]
-        conn.execute("INSERT INTO blacklists(chat_id,reason,created_by) VALUES(?,'广告审核确认',?) "
+        conn.execute("INSERT INTO blacklists(chat_id,reason,created_by) VALUES(?,'廣告審核確認',?) "
                      "ON CONFLICT(chat_id) DO UPDATE SET reason=excluded.reason,created_by=excluded.created_by",
                      (chat_id, admin_id))
         conn.execute("UPDATE moderation_jobs SET status='blocked',decided_by=?,updated_at=CURRENT_TIMESTAMP "
