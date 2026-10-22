@@ -8,14 +8,14 @@ from dotenv import load_dotenv
 
 
 USER_COMMANDS = [
-    {"command": "start", "description": "打开留言入口"},
+    {"command": "start", "description": "打開留言入口"},
 ]
 
 ADMIN_COMMANDS = [
-    {"command": "start", "description": "打开聊天首页"},
-    {"command": "cancel", "description": "退出持续回复或取消输入"},
+    {"command": "start", "description": "打開聊天首頁"},
+    {"command": "cancel", "description": "退出持續回覆或取消輸入"},
     {"command": "myid", "description": "查看自己的 Telegram ID"},
-    {"command": "settings", "description": "打开设置"},
+    {"command": "settings", "description": "打開設定"},
 ]
 OWNER_COMMANDS = list(ADMIN_COMMANDS)
 

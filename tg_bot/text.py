@@ -26,9 +26,15 @@ def truncate_text(value: str, limit: int) -> str:
     return value[: limit - 1] + "…"
 
 
+def utf16_length(value: str) -> int:
+    return len(value.encode("utf-16-le", errors="surrogatepass")) // 2
+
+
 def escape_html_limited(value: str, limit: int) -> str:
+    if limit <= 0:
+        return ""
     escaped = html.escape(value)
-    if len(escaped) <= limit:
+    if utf16_length(escaped) <= limit:
         return escaped
 
     low = 0
@@ -36,7 +42,7 @@ def escape_html_limited(value: str, limit: int) -> str:
     while low < high:
         middle = (low + high + 1) // 2
         candidate = html.escape(value[:middle]) + "…"
-        if len(candidate) <= limit:
+        if utf16_length(candidate) <= limit:
             low = middle
         else:
             high = middle - 1

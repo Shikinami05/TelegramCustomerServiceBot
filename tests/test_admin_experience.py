@@ -78,7 +78,7 @@ class AdminExperienceTests(unittest.IsolatedAsyncioTestCase):
             await app.handle_user_message(self.message(), 100)
         for call in self.send.await_args_list:
             self.assertEqual(call.args[0], 50)
-            for word in ("DeepSeek", "广告", "审核", "模型", "疑似"):
+            for word in ("DeepSeek", "SiliconFlow", "广告", "廣告", "审核", "審核", "模型", "疑似"):
                 self.assertNotIn(word, call.args[1])
         self.assertIn("留言已收到", self.send.await_args.args[1])
 
@@ -254,14 +254,14 @@ class AdminExperienceTests(unittest.IsolatedAsyncioTestCase):
         callbacks = [button["callback_data"] for row in markup["inline_keyboard"] for button in row]
         self.assertIn("moderation:2:spam", callbacks)
         await self.inbox.callback(self.callback(), "moderation_allow", "105:2:spam")
-        self.assertIn("已处理", self.answer.await_args.args[1])
+        self.assertIn("已處理", self.answer.await_args.args[1])
         self.assertEqual(len(database.fetchall(self.db, "SELECT * FROM inbound_events")), 1)
 
     async def test_preview_failure_is_visible_and_cannot_be_used_as_reply_target(self):
         self.held()
         self.telegram.return_value = {"ok": False}
         await self.inbox.callback(self.callback(), "moderation_preview", "100:1:all")
-        self.assertIn("无法显示", self.send.await_args.args[1])
+        self.assertIn("無法顯示", self.send.await_args.args[1])
         self.assertEqual(database.fetchall(self.db, "SELECT * FROM message_links"), [])
 
     async def test_unchanged_held_queue_does_not_keep_notifying(self):

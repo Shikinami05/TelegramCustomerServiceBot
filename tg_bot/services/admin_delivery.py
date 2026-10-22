@@ -21,22 +21,22 @@ async def alert_failure(
     send_message: SendMessage,
 ) -> bool:
     uncertain = delivery["status"] == "unknown"
-    state_text = "投递结果不确定" if uncertain else "投递失败"
+    state_text = "投遞結果不確定" if uncertain else "投遞失敗"
     warning = (
-        "Telegram 可能已经收到过该消息，手动重试可能产生重复。"
+        "Telegram 可能已經收到過該訊息，手動重試可能產生重複。"
         if uncertain
-        else "可以确认后手动重试。"
+        else "可以確認後手動重試。"
     )
     text = (
-        f"<b>管理员消息{state_text}</b>\n\n"
-        f"用户：<code>{delivery['user_chat_id']}</code>\n"
-        f"管理员：<code>{delivery['admin_chat_id']}</code>\n"
-        f"类型：<code>{html.escape(str(delivery['delivery_kind']))}</code>\n"
+        f"<b>管理員訊息{state_text}</b>\n\n"
+        f"使用者：<code>{delivery['user_chat_id']}</code>\n"
+        f"管理員：<code>{delivery['admin_chat_id']}</code>\n"
+        f"類型：<code>{html.escape(str(delivery['delivery_kind']))}</code>\n"
         f"原因：{escape_html_limited(str(delivery['last_error']), 300)}\n\n"
         f"{warning}"
     )
     markup = inline_keyboard(
-        [[("重试投递", f"delivery_retry:{delivery['id']}", "danger")]]
+        [[("重試投遞", f"delivery_retry:{delivery['id']}", "danger")]]
     )
     delivered = False
     for owner_id in sorted(owner_ids):

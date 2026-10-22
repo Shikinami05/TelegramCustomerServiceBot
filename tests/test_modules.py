@@ -20,7 +20,7 @@ from tg_bot.repositories import (
 )
 from tg_bot.repositories import updates
 from tg_bot.telegram import TelegramAPIError, request
-from tg_bot.text import escape_html_limited, html_to_plain_text, truncate_text
+from tg_bot.text import escape_html_limited, html_to_plain_text, truncate_text, utf16_length
 
 
 class SettingsTests(unittest.TestCase):
@@ -266,14 +266,20 @@ class KeyboardModuleTests(unittest.TestCase):
         self.assertEqual(
             navigation,
             [
-                ("上一页", "queue:inbox:1"),
-                ("第 2/3 页", "queue:inbox:2"),
-                ("下一页", "queue:inbox:3"),
+                ("上一頁", "queue:inbox:1"),
+                ("第 2/3 頁", "queue:inbox:2"),
+                ("下一頁", "queue:inbox:3"),
             ],
         )
     def test_unknown_button_style_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "unsupported inline button style"):
             keyboards.inline_keyboard([[('测试', 'test:1', 'neon')]])
+
+    def test_callback_data_enforces_telegram_utf8_limit(self):
+        for value in ("", "x" * 65, "字" * 22):
+            with self.assertRaisesRegex(ValueError, "64 UTF-8 bytes"):
+                keyboards.inline_keyboard([[("test", value)]])
+        self.assertEqual(keyboards.inline_keyboard([[("test", "x" * 64)]])["inline_keyboard"][0][0]["callback_data"], "x" * 64)
 
 
 class TelegramTransportTests(unittest.IsolatedAsyncioTestCase):
@@ -328,6 +334,15 @@ class TextModuleTests(unittest.TestCase):
         escaped = escape_html_limited("<&abcdef", 8)
         self.assertLessEqual(len(escaped), 8)
         self.assertTrue(escaped.endswith("…"))
+
+    def test_html_truncation_budgets_utf16_without_cutting_emoji_or_entities(self):
+        self.assertEqual(utf16_length("\U0001f600"), 2)
+        for text in ("\U0001f600" * 300, "<&" * 300, "\U0001f600<&" * 300):
+            for limit in (0, 1, 2, 3, 10, 70, 300):
+                escaped = escape_html_limited(text, limit)
+                self.assertLessEqual(utf16_length(escaped), limit)
+                self.assertNotIn("<", escaped)
+                self.assertNotIn("&", escaped.replace("&amp;", "").replace("&lt;", "").replace("&gt;", ""))
 
 
 if __name__ == "__main__":

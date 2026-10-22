@@ -19,9 +19,9 @@ class Provider:
 PROVIDERS = {
     "deepseek": Provider("DeepSeek", "https://api.deepseek.com", "deepseek-flash",
                          ("deepseek-flash", "deepseek-v4-pro")),
-    "siliconflow": Provider("硅基流动（中国站）", "https://api.siliconflow.cn/v1", "Qwen/Qwen3-32B",
+    "siliconflow": Provider("SiliconFlow（中國站）", "https://api.siliconflow.cn/v1", "Qwen/Qwen3-32B",
                             ("Qwen/Qwen3-32B", "Qwen/Qwen2.5-7B-Instruct")),
-    "siliconflow-intl": Provider("SiliconFlow（国际站）", "https://api.siliconflow.com/v1", "Qwen/Qwen3-32B",
+    "siliconflow-intl": Provider("SiliconFlow（國際站）", "https://api.siliconflow.com/v1", "Qwen/Qwen3-32B",
                                  ("Qwen/Qwen3-32B", "Qwen/Qwen2.5-7B-Instruct")),
 }
 

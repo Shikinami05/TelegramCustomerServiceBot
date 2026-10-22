@@ -31,7 +31,7 @@ commission recruitment, and promotional channel invitations even with spaced
 characters or zero-width characters. Discussing or reporting these topics is
 not itself promotion. Evaluate the entire intent.
 """
-REASONS = {"allow": "未发现明显广告", "spam": "疑似推广或广告", "uncertain": "内容需要人工确认"}
+REASONS = {"allow": "未發現明顯廣告", "spam": "疑似推廣或廣告", "uncertain": "內容需要人工確認"}
 MEDIA_METHODS = {
     "photo": "sendPhoto", "video": "sendVideo", "document": "sendDocument",
     "audio": "sendAudio", "voice": "sendVoice", "animation": "sendAnimation",
@@ -68,9 +68,9 @@ def review_text(message: dict[str, Any]) -> str:
 async def classify(client: httpx.AsyncClient, api_key: str, model: str,
                    text: str, timeout: int, provider: str = "deepseek") -> Verdict:
     if not text.strip():
-        return Verdict("uncertain", "无可审核文字的媒体，请人工确认")
+        return Verdict("uncertain", "無可審核文字的媒體，請人工確認")
     if len(text) > 8000:
-        return Verdict("uncertain", "文字过长，请人工确认")
+        return Verdict("uncertain", "文字過長，請人工確認")
     payload = {
         "model": model,
         "messages": [{"role": "system", "content": SYSTEM_PROMPT},
@@ -94,21 +94,21 @@ async def classify(client: httpx.AsyncClient, api_key: str, model: str,
         # Bound the whole response, including trickling bytes; compatible with Python 3.10.
         status, body = await asyncio.wait_for(read_response(), timeout=timeout)
         if status != 200:
-            hints = {401: "密钥无效或已失效", 402: "余额不足", 403: "无访问权限", 404: "模型不可用", 429: "服务限流，请稍后重试"}
-            return Verdict("uncertain", hints.get(status, f"服务异常（HTTP {status}）"), True)
+            hints = {401: "密鑰無效或已失效", 402: "餘額不足", 403: "無訪問權限", 404: "模型不可用", 429: "服務限流，請稍後重試"}
+            return Verdict("uncertain", hints.get(status, f"服務異常（HTTP {status}）"), True)
         choice = json.loads(body)["choices"][0]
         if choice.get("finish_reason") != "stop":
-            return Verdict("uncertain", "审核响应未完整结束", True)
+            return Verdict("uncertain", "審核響應未完整結束", True)
         data = json.loads(choice["message"]["content"])
         if not isinstance(data, dict) or set(data) != {"verdict"}:
-            return Verdict("uncertain", "审核响应格式异常", True)
+            return Verdict("uncertain", "審核響應格式異常", True)
         verdict = data["verdict"]
         if not isinstance(verdict, str) or verdict not in REASONS:
-            return Verdict("uncertain", "审核响应分类无效", True)
+            return Verdict("uncertain", "審核響應分類無效", True)
         return Verdict(verdict, REASONS[verdict])
     except (httpx.HTTPError, asyncio.TimeoutError, ValueError, KeyError, IndexError, TypeError, AttributeError):
         # Never log the request, credentials, response body, or private message.
-        return Verdict("uncertain", "服务超时、网络或响应异常，可稍后重新检测", True)
+        return Verdict("uncertain", "服務超時、網路或響應異常，可稍後重新檢測", True)
 
 
 def delivery_payload(message: dict[str, Any], chat_id: int) -> tuple[str, dict[str, Any]]:
@@ -142,7 +142,7 @@ async def process_job(db_path: Path, job: sqlite3.Row, client: httpx.AsyncClient
                       settings: Settings, admin_ids: set[int]) -> bool:
     update_id = int(job["update_id"])
     if access.is_blacklisted(db_path, int(job["chat_id"])):
-        moderation.hold(db_path, update_id, "用户已在黑名单中")
+        moderation.hold(db_path, update_id, "使用者已在封鎖名單中")
         return False
     text = review_text(json.loads(job["snapshot"]))
     provider = ""
@@ -151,16 +151,16 @@ async def process_job(db_path: Path, job: sqlite3.Row, client: httpx.AsyncClient
     if local_reason:
         result = Verdict("spam", local_reason)
     elif not settings.ai_moderation_enabled:
-        result = Verdict("allow", "本地规则未命中；AI 审核未开启")
+        result = Verdict("allow", "本地規則未命中；AI 審核未啟用")
     elif not text.strip() and settings.moderation_media_policy == "allow":
-        result = Verdict("allow", "按无文字媒体策略接收；未进行图像或语音识别")
+        result = Verdict("allow", "按無文字媒體策略接收；未進行圖像或語音辨識")
     elif not text.strip() or len(text) > 8000:
-        result = Verdict("uncertain", "无可审核文字或文字过长，请人工确认")
+        result = Verdict("uncertain", "無可審核文字或文字過長，請人工確認")
     elif not moderation.reserve_request(db_path, update_id, settings.moderation_daily_limit):
-        result = Verdict("uncertain", "已达到每日审核调用上限", True)
+        result = Verdict("uncertain", "已達到每日審核呼叫上限", True)
     else:
         provider, model = settings.ai_provider, settings.moderation_model
-        moderation.record_result(db_path, update_id, provider, model, "", "检测中")
+        moderation.record_result(db_path, update_id, provider, model, "", "檢測中")
         result = await classify(client, settings.moderation_key, model,
                                 text, settings.moderation_timeout_seconds, provider=provider)
     verdict = "error" if result.failed else result.verdict
@@ -195,5 +195,5 @@ async def run_worker(db_path: Path, get_settings: Callable[[], Settings], admin_
                 logger.error("Moderation worker failed update_id=%s", job["update_id"] if job else None)
                 if job:
                     with contextlib.suppress(Exception):
-                        moderation.hold(db_path, int(job["update_id"]), "审核异常，请人工确认")
+                        moderation.hold(db_path, int(job["update_id"]), "審核異常，請人工確認")
                 await asyncio.sleep(2)
