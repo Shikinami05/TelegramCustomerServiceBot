@@ -28,86 +28,36 @@ def inline_keyboard(rows: list[list[ButtonSpec]]) -> dict[str, Any]:
 
 
 def admin_user_keyboard(
-    chat_id: int,
-    *,
-    blacklisted: bool,
-    closed: bool,
-    owner_admin_id: int | None,
-    viewer_admin_id: int | None,
+    chat_id: int, *, blacklisted: bool = False, active_reply: bool = False,
+    read_through_seq: int = 0,
 ) -> dict[str, Any]:
     if blacklisted:
-        return inline_keyboard(
-            [
-                [
-                    ("用户详情", f"detail:{chat_id}"),
-                    ("解除黑名单", f"unblacklist:{chat_id}", "success"),
-                ],
-                [("返回工作台", "admin:dashboard")],
-            ]
-        )
-
-    if closed:
-        return inline_keyboard(
-            [
-                [
-                    ("重新打开", f"reopen:{chat_id}", "primary"),
-                    ("用户详情", f"detail:{chat_id}"),
-                ],
-                [("加入黑名单", f"blacklist:{chat_id}")],
-                [("返回工作台", "admin:dashboard")],
-            ]
-        )
-
-    if owner_admin_id and viewer_admin_id and owner_admin_id != viewer_admin_id:
-        reply_button: ButtonSpec = ("接管", f"takeover:{chat_id}", "primary")
-    else:
-        reply_button = (
-            "持续回复",
-            f"reply:{chat_id}",
-            REPLY_MODE_BUTTON_STYLE,
-        )
-    return inline_keyboard(
-        [
-            [
-                reply_button,
-                ("标记已处理", f"resolve:{chat_id}", "success"),
-            ],
-            [
-                ("用户详情", f"detail:{chat_id}"),
-                ("加入黑名单", f"blacklist:{chat_id}"),
-            ],
-            [("返回工作台", "admin:dashboard")],
+        rows: list[list[ButtonSpec]] = [
+            [("用户详情", f"detail:{chat_id}"), ("解除拉黑", f"unblacklist:{chat_id}", "success")],
         ]
-    )
-
-
-def admin_dashboard_keyboard(
-    counts: dict[str, int],
-    *,
-    show_ai_settings: bool = False,
-) -> dict[str, Any]:
-    rows: list[list[ButtonSpec]] = [
-            [
-                (f"待处理 {counts['inbox']}", "queue:inbox:1", "primary"),
-                (f"超时 {counts['pending']}", "queue:pending:1"),
-            ],
-            [
-                (f"已处理 {counts['closed']}", "queue:closed:1", "success"),
-                ("最近用户", "admin:users:1"),
-            ],
-            [(f"暂存箱 {counts.get('moderation', 0)}", "moderation:1")],
-    ]
-    if show_ai_settings:
-        rows.append([("防广告设置", "ai:panel")])
-    rows.append([("刷新", "admin:dashboard")])
+    else:
+        reply: ButtonSpec = (
+            ("退出回复", f"cancel:{chat_id}", "danger") if active_reply
+            else ("持续回复", f"reply:{chat_id}", REPLY_MODE_BUTTON_STYLE)
+        )
+        rows = [
+            [reply, ("标记已读", f"read:{chat_id}:{read_through_seq}")],
+            [("用户详情", f"detail:{chat_id}"), ("更多", f"more:{chat_id}")],
+        ]
+    rows.append([("返回聊天", "queue:all:1")])
     return inline_keyboard(rows)
 
 
-def pagination_navigation_row(
-    callback_prefix: str,
-    page: int,
-    total_pages: int,
-) -> list[ButtonSpec]:
+def admin_dashboard_keyboard(counts: dict[str, int], *, show_ai_settings: bool = False) -> dict[str, Any]:
+    rows: list[list[ButtonSpec]] = [
+        [(f"聊天 · 未读 {counts['inbox']}", "queue:inbox:1", "primary")],
+        [(f"垃圾箱 {counts.get('moderation', 0)}", "moderation:1")],
+        [("设置", "settings:panel")],
+    ]
+    return inline_keyboard(rows)
+
+
+def pagination_navigation_row(callback_prefix: str, page: int, total_pages: int) -> list[ButtonSpec]:
     row: list[ButtonSpec] = []
     if page > 1:
         row.append(("上一页", f"{callback_prefix}:{page - 1}"))
@@ -117,118 +67,32 @@ def pagination_navigation_row(
     return row
 
 
-def queue_navigation_rows(
-    queue_name: str,
-    page: int,
-    total_pages: int,
-    counts: dict[str, int],
-) -> list[list[ButtonSpec]]:
+def queue_navigation_rows(queue_name: str, page: int, total_pages: int,
+                          counts: dict[str, int]) -> list[list[ButtonSpec]]:
     rows: list[list[ButtonSpec]] = [
-        [
-            (f"待处理 {counts['inbox']}", "queue:inbox:1", "primary"),
-            (f"超时 {counts['pending']}", "queue:pending:1"),
-            (f"已处理 {counts['closed']}", "queue:closed:1", "success"),
-        ],
+        [(f"未读 {counts['inbox']}", "queue:inbox:1"), ("全部", "queue:all:1")],
     ]
     if total_pages > 1:
-        rows.append(
-            pagination_navigation_row(f"queue:{queue_name}", page, total_pages)
-        )
-    rows.append([("返回工作台", "admin:dashboard")])
+        rows.append(pagination_navigation_row(f"queue:{queue_name}", page, total_pages))
+    rows.append([("返回首页", "admin:dashboard")])
     return rows
 
 
-def recent_users_keyboard(
-    rows: list[Any],
-    *,
-    page: int,
-    total_pages: int,
-    page_size: int,
-) -> dict[str, Any]:
-    keyboard_rows: list[list[ButtonSpec]] = []
-    current_row: list[ButtonSpec] = []
-    start_index = (page - 1) * page_size
-    for index, row in enumerate(rows, start=start_index + 1):
-        current_row.append((f"{index} 详情", f"detail:{row['chat_id']}"))
-        if len(current_row) == 2:
-            keyboard_rows.append(current_row)
-            current_row = []
-    if current_row:
-        keyboard_rows.append(current_row)
-    if total_pages > 1:
-        keyboard_rows.append(
-            pagination_navigation_row("admin:users", page, total_pages)
-        )
-    keyboard_rows.append([("返回工作台", "admin:dashboard")])
-    return inline_keyboard(keyboard_rows)
-
-
-def conversation_queue_keyboard(
-    rows: list[Any],
-    queue_name: str,
-    *,
-    viewer_admin_id: int | None,
-    page: int,
-    total_pages: int,
-    page_size: int,
-    counts: dict[str, int],
-) -> dict[str, Any]:
-    keyboard_rows: list[list[ButtonSpec]] = []
-    start_index = (page - 1) * page_size
-    for index, row in enumerate(rows, start=start_index + 1):
-        chat_id = int(row["chat_id"])
-        if queue_name == "closed":
-            keyboard_rows.append(
-                [
-                    (f"{index} 重开", f"reopen:{chat_id}", "primary"),
-                    (f"{index} 详情", f"user:{chat_id}:{queue_name}:{page}"),
-                ]
-            )
-            continue
-
-        owner_admin_id = row["owner_admin_id"]
-        if (
-            owner_admin_id is not None
-            and viewer_admin_id is not None
-            and int(owner_admin_id) != viewer_admin_id
-        ):
-            primary_button: ButtonSpec = (
-                f"{index} 接管",
-                f"takeover:{chat_id}",
-                "primary",
-            )
-        else:
-            primary_button = (
-                f"{index} 持续回复",
-                f"reply:{chat_id}",
-                REPLY_MODE_BUTTON_STYLE,
-            )
-        keyboard_rows.append(
-            [
-                primary_button,
-                (f"{index} 详情", f"user:{chat_id}:{queue_name}:{page}"),
-            ]
-        )
-    keyboard_rows.extend(
-        queue_navigation_rows(queue_name, page, total_pages, counts)
-    )
-    return inline_keyboard(keyboard_rows)
+def conversation_queue_keyboard(rows: list[Any], queue_name: str, *, viewer_admin_id: int | None,
+                                page: int, total_pages: int, page_size: int,
+                                counts: dict[str, int]) -> dict[str, Any]:
+    buttons: list[list[ButtonSpec]] = []
+    for index, row in enumerate(rows, start=(page - 1) * page_size + 1):
+        buttons.append([(f"{index} 打开聊天", f"user:{row['chat_id']}:{queue_name}:{page}", "primary")])
+    buttons.extend(queue_navigation_rows(queue_name, page, total_pages, counts))
+    return inline_keyboard(buttons)
 
 
 def exit_reply_keyboard(chat_id: int) -> dict[str, Any]:
-    return inline_keyboard(
-        [
-            [
-                (
-                    "退出回复",
-                    f"cancel:{chat_id}",
-                    "danger",
-                ),
-                ("标记已处理", f"resolve:{chat_id}", "success"),
-            ],
-            [("用户详情", f"detail:{chat_id}")],
-        ]
-    )
+    return inline_keyboard([
+        [("退出回复", f"cancel:{chat_id}", "danger"), ("用户详情", f"detail:{chat_id}")],
+        [("更多", f"more:{chat_id}"), ("返回聊天", "queue:all:1")],
+    ])
 
 
 def welcome_keyboard() -> dict[str, Any]:

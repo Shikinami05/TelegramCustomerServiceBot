@@ -10,6 +10,7 @@ import time
 import unittest
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -40,6 +41,13 @@ class BotDatabaseTests(unittest.TestCase):
         app.USER_RATE_LIMIT_WINDOW_SECONDS = 60
         app.USER_RATE_LIMIT_COOLDOWN_SECONDS = 300
         app.init_db()
+        patches = [
+            patch.object(app, "SETTINGS", replace(app.SETTINGS, spam_rules_enabled=False)),
+            patch.object(app, "send_admin_reply_status", AsyncMock()),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -199,8 +207,9 @@ class BotDatabaseTests(unittest.TestCase):
         self.assertEqual(message["text"], "legacy message")
         self.assertEqual(update["status"], "done")
         self.assertIsNotNone(update["updated_at"])
-        self.assertIn("sent_count", broadcast_columns)
-        self.assertIn("unknown_count", broadcast_columns)
+        self.assertIn("status", broadcast_columns)
+        self.assertIn("last_inbound_seq", conversation_columns)
+        self.assertIn("last_read_seq", conversation_columns)
         self.assertIn("unread_count", conversation_columns)
         self.assertIn("last_user_message_at", conversation_columns)
         self.assertIsNotNone(
@@ -237,22 +246,6 @@ class BotDatabaseTests(unittest.TestCase):
         self.assertIn("new text", full_history)
         self.assertIn("已编辑", full_history)
 
-    def test_takeover_clears_previous_admin_reply_state(self) -> None:
-        first_claim = app.claim_conversation(30, 1, activate_reply=True)
-
-        second_claim = app.claim_conversation(
-            30,
-            2,
-            force=True,
-            reopen=True,
-            activate_reply=True,
-        )
-
-        self.assertTrue(first_claim)
-        self.assertTrue(second_claim)
-        self.assertIsNone(app.get_admin_state(1))
-        self.assertEqual(app.get_admin_state(2), 30)
-        self.assertEqual(app.get_conversation_owner(30), 2)
 
     def test_expired_persistent_reply_state_is_deleted_before_routing(self) -> None:
         app.set_admin_state(1, 31)
@@ -388,7 +381,6 @@ class BotDatabaseTests(unittest.TestCase):
         self.assertEqual(copy.await_args.args[0], 202)
         self.assertEqual(copy.await_count, 1)
         self.assertIsNone(app.get_admin_state(1))
-        self.assertEqual(app.get_conversation_owner(202), 1)
         reply_link = app.get_message_link(1, 701)
         self.assertEqual(int(reply_link["user_chat_id"]), 202)
         self.assertEqual(reply_link["direction"], "admin_to_user")
@@ -611,22 +603,6 @@ class BotDatabaseTests(unittest.TestCase):
         )
         self.assertEqual(reply["status"], "unknown")
 
-    def test_atomic_claim_allows_only_one_admin(self) -> None:
-        barrier = threading.Barrier(2)
-
-        def claim(admin_id: int) -> app.ConversationClaimResult:
-            barrier.wait()
-            return app.claim_conversation(204, admin_id, activate_reply=True)
-
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            results = list(executor.map(claim, (1, 2)))
-
-        self.assertEqual(sum(bool(result) for result in results), 1)
-        owner_admin_id = app.get_conversation_owner(204)
-        self.assertIn(owner_admin_id, {1, 2})
-        self.assertEqual(app.get_admin_state(owner_admin_id), 204)
-        losing_admin_id = 1 if owner_admin_id == 2 else 2
-        self.assertIsNone(app.get_admin_state(losing_admin_id))
 
     def test_requested_media_types_have_explicit_summaries(self) -> None:
         cases = (
@@ -660,7 +636,7 @@ class BotDatabaseTests(unittest.TestCase):
                 self.assertEqual(app.message_content(message), expected_content)
 
     def test_requested_admin_media_types_are_copied_to_the_selected_user(self) -> None:
-        app.claim_conversation(205, 1, activate_reply=True)
+        app.set_admin_state(1, 205)
         payloads = (
             {"text": "text"},
             {"photo": [{}], "caption": "photo"},
@@ -704,108 +680,7 @@ class BotDatabaseTests(unittest.TestCase):
             link = app.get_message_link(1, 900 + index)
             self.assertEqual(int(link["user_chat_id"]), 205)
 
-    def test_conversation_inbox_pending_and_reopen_workflow(self) -> None:
-        app.db_execute(
-            "INSERT INTO users (chat_id, first_name, last_message) VALUES (?, ?, ?)",
-            (31, "Inbox", "hello"),
-        )
-        app.record_user_activity(31)
-        app.record_user_activity(31)
 
-        conversation = app.get_conversation(31)
-        self.assertEqual(int(conversation["unread_count"]), 2)
-        self.assertEqual(len(app.get_conversation_queue("inbox")), 1)
-
-        app.mark_conversation_replied(31)
-        self.assertEqual(app.get_conversation_queue("inbox"), [])
-
-        app.record_user_activity(31, increment_unread=False)
-        app.db_execute(
-            "UPDATE conversations "
-            "SET last_user_message_at = datetime('now', '-60 minutes') "
-            "WHERE chat_id = ?",
-            (31,),
-        )
-        self.assertEqual(len(app.get_conversation_queue("pending")), 1)
-
-        app.close_conversation(31)
-        self.assertEqual(len(app.get_conversation_queue("closed")), 1)
-        app.reopen_conversation(31)
-        reopened = app.get_conversation(31)
-        self.assertEqual(reopened["status"], "open")
-        self.assertEqual(int(reopened["unread_count"]), 0)
-
-    def test_admin_dashboard_and_numbered_queue_controls(self) -> None:
-        app.db_execute(
-            """
-            INSERT INTO users (
-                chat_id, username, first_name, last_message
-            ) VALUES (?, ?, ?, ?)
-            """,
-            (32, "queue_user", "Queue", "latest message"),
-        )
-        app.record_user_activity(32)
-        app.db_execute(
-            """
-            UPDATE conversations
-            SET last_user_message_at = datetime('now', '-60 minutes')
-            WHERE chat_id = ?
-            """,
-            (32,),
-        )
-        app.claim_conversation(32, 2)
-
-        app.db_execute(
-            "INSERT INTO users (chat_id, first_name) VALUES (?, ?)",
-            (33, "Closed"),
-        )
-        app.close_conversation(33)
-
-        counts = app.get_queue_counts()
-        self.assertEqual(counts, {"inbox": 1, "pending": 1, "closed": 1})
-        dashboard = app.format_admin_dashboard(1)
-        self.assertIn("<b>留言工作台</b>", dashboard)
-        self.assertIn("待处理：<b>1</b>", dashboard)
-
-        previous_owners = app.OWNER_IDS
-        try:
-            app.OWNER_IDS = {1}
-            owner_callbacks = {
-                button["callback_data"]
-                for row in app.admin_dashboard_keyboard(1)["inline_keyboard"]
-                for button in row
-            }
-            admin_callbacks = {
-                button["callback_data"]
-                for row in app.admin_dashboard_keyboard(2)["inline_keyboard"]
-                for button in row
-            }
-        finally:
-            app.OWNER_IDS = previous_owners
-        self.assertIn("ai:panel", owner_callbacks)
-        self.assertNotIn("ai:panel", admin_callbacks)
-
-        rows = app.get_conversation_queue("inbox")
-        queue_text = app.format_conversation_queue("inbox", rows)
-        queue_keyboard = app.conversation_queue_keyboard(
-            rows,
-            "inbox",
-            viewer_admin_id=1,
-        )
-        first_row = queue_keyboard["inline_keyboard"][0]
-
-        self.assertIn("<b>1. @queue_user</b>", queue_text)
-        self.assertIn("1 条待处理", queue_text)
-        self.assertEqual(first_row[0]["text"], "1 接管")
-        self.assertEqual(first_row[0]["callback_data"], "takeover:32")
-        self.assertEqual(first_row[0]["style"], "primary")
-        self.assertEqual(first_row[1]["text"], "1 详情")
-        self.assertEqual(len(first_row), 2)
-        self.assertEqual(first_row[1]["callback_data"], "user:32:inbox:1")
-        self.assertEqual(
-            queue_keyboard["inline_keyboard"][-1][0]["callback_data"],
-            "admin:dashboard",
-        )
 
     def test_display_timezone_converts_utc_and_rejects_invalid_names(self) -> None:
         previous_timezone = app.DISPLAY_TIMEZONE
@@ -829,79 +704,6 @@ class BotDatabaseTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             app.load_display_timezone("")
 
-    def test_queue_and_recent_users_paginate_with_global_numbering(self) -> None:
-        for index in range(25):
-            chat_id = 1000 + index
-            app.db_execute(
-                """
-                INSERT INTO users (
-                    chat_id, username, last_message, updated_at
-                ) VALUES (?, ?, ?, ?)
-                """,
-                (
-                    chat_id,
-                    f"page_user_{index}",
-                    f"message {index}",
-                    f"2026-07-26 00:{index:02d}:00",
-                ),
-            )
-            app.record_user_activity(chat_id)
-
-        self.assertEqual(app.count_conversation_queue("inbox"), 25)
-        self.assertEqual(app.count_recent_users(), 25)
-        self.assertEqual(app.paginate(999, 25), (3, 3, 20))
-
-        queue_rows = app.get_conversation_queue("inbox", limit=10, offset=10)
-        queue_text = app.format_conversation_queue(
-            "inbox",
-            queue_rows,
-            page=2,
-            total_pages=3,
-            total_count=25,
-        )
-        queue_keyboard = app.conversation_queue_keyboard(
-            queue_rows,
-            "inbox",
-            viewer_admin_id=1,
-            page=2,
-            total_pages=3,
-        )
-        self.assertEqual(len(queue_rows), 10)
-        self.assertIn("共 25 个会话 · 第 2/3 页", queue_text)
-        self.assertIn("<b>11.", queue_text)
-        self.assertEqual(
-            queue_keyboard["inline_keyboard"][0][0]["text"],
-            "11 持续回复",
-        )
-        queue_callbacks = {
-            button["callback_data"]
-            for row in queue_keyboard["inline_keyboard"]
-            for button in row
-        }
-        self.assertIn("queue:inbox:1", queue_callbacks)
-        self.assertIn("queue:inbox:3", queue_callbacks)
-
-        recent_rows = app.get_recent_users(limit=10, offset=20)
-        recent_text = app.format_recent_users(
-            recent_rows,
-            page=3,
-            total_pages=3,
-            total_count=25,
-        )
-        recent_keyboard = app.recent_users_keyboard(
-            recent_rows,
-            page=3,
-            total_pages=3,
-        )
-        self.assertEqual(len(recent_rows), 5)
-        self.assertIn("共 25 位用户 · 第 3/3 页", recent_text)
-        self.assertIn("<b>21.", recent_text)
-        recent_callbacks = {
-            button["callback_data"]
-            for row in recent_keyboard["inline_keyboard"]
-            for button in row
-        }
-        self.assertIn("admin:users:2", recent_callbacks)
 
     def test_queue_callback_reuses_the_current_message(self) -> None:
         callback = {
@@ -925,7 +727,7 @@ class BotDatabaseTests(unittest.TestCase):
 
         answer.assert_awaited_once_with("queue-callback")
         edit.assert_awaited_once()
-        self.assertIn("<b>待处理</b>", edit.await_args.args[2])
+        self.assertIn("<b>聊天 · 未读</b>", edit.await_args.args[2])
         send.assert_not_awaited()
 
     def test_paginated_callbacks_require_admin_and_validate_ascii_page(self) -> None:
@@ -983,7 +785,7 @@ class BotDatabaseTests(unittest.TestCase):
             "inbox",
             viewer_admin_id=1,
         )
-        recent_text = app.format_recent_users(app.get_recent_users())
+        recent_text = app.format_conversation_queue("all", app.get_conversation_queue("all"))
 
         self.assertLessEqual(len(queue_text), app.TELEGRAM_TEXT_LIMIT)
         self.assertLessEqual(len(recent_text), app.TELEGRAM_TEXT_LIMIT)
@@ -992,6 +794,10 @@ class BotDatabaseTests(unittest.TestCase):
                 self.assertLessEqual(len(button["callback_data"].encode("utf-8")), 64)
 
     def test_blacklist_button_requires_confirmation(self) -> None:
+        app.upsert_user({"id": 55, "first_name": "Alice"}, "hello")
+        edit_patcher = patch.object(app, "edit_message_text", AsyncMock(return_value=False))
+        edit_patcher.start()
+        self.addCleanup(edit_patcher.stop)
         callback = {
             "id": "blacklist-callback",
             "from": {"id": 1},
@@ -1030,41 +836,6 @@ class BotDatabaseTests(unittest.TestCase):
 
         self.assertTrue(app.is_blacklisted(55))
 
-    def test_broadcast_queue_snapshots_users_and_tracks_results(self) -> None:
-        for chat_id in (40, 41, 42):
-            app.db_execute(
-                "INSERT INTO users (chat_id, first_name) VALUES (?, ?)",
-                (chat_id, f"user-{chat_id}"),
-            )
-        app.blacklist_user(42, 1, "blocked")
-
-        broadcast_id = app.create_pending_broadcast(1, "hello")
-        status, total = app.queue_broadcast(broadcast_id, 1)
-        self.assertEqual((status, total), ("queued", 2))
-
-        job = app.claim_next_broadcast_job()
-        self.assertIsNotNone(job)
-        recipients = []
-        while True:
-            chat_id = app.claim_next_broadcast_recipient(broadcast_id)
-            if chat_id is None:
-                break
-            recipients.append(chat_id)
-            app.finish_broadcast_recipient(
-                broadcast_id, chat_id, sent=chat_id == 40, error="failed"
-            )
-
-        result = app.complete_broadcast(broadcast_id)
-        self.assertEqual(sorted(recipients), [40, 41])
-        self.assertIsNotNone(result)
-        self.assertEqual(int(result["sent_count"]), 1)
-        self.assertEqual(int(result["failed_count"]), 1)
-
-        retry_status, retry_count = app.retry_failed_broadcast(broadcast_id)
-        self.assertEqual((retry_status, retry_count), ("queued", 1))
-        retried_job = app.claim_next_broadcast_job()
-        self.assertEqual(retried_job["id"], broadcast_id)
-        self.assertEqual(app.claim_next_broadcast_recipient(broadcast_id), 41)
 
     def test_html_escape_limit_never_exceeds_budget(self) -> None:
         escaped = app.escape_html_limited("&" * 500, 100)
@@ -1082,25 +853,13 @@ class BotDatabaseTests(unittest.TestCase):
             viewer_admin_id=1,
         )["inline_keyboard"][0][0]
         self.assertEqual(reply_buttons[0]["style"], "danger")
-        self.assertEqual(reply_buttons[1]["style"], "success")
+        self.assertTrue(reply_buttons[1]["callback_data"].startswith("detail:"))
 
         with self.assertRaises(ValueError):
             app.inline_keyboard([[("Invalid", "invalid:1", "neon")]])
         with self.assertRaises(ValueError):
             app.inline_keyboard([[("Too", "many", "primary", "parts")]])
 
-    def test_broadcast_confirmation_uses_primary_and_danger_styles(self) -> None:
-        send = AsyncMock(return_value=True)
-        with patch.object(app, "send_message", send):
-            handled = asyncio.run(
-                app.handle_admin_command(1, "/broadcast planned maintenance")
-            )
-
-        self.assertTrue(handled)
-        buttons = send.await_args.kwargs["reply_markup"]["inline_keyboard"][0]
-        self.assertEqual(buttons[0]["style"], "primary")
-        self.assertEqual(buttons[1]["text"], "取消群发")
-        self.assertEqual(buttons[1]["style"], "danger")
 
     def test_command_normalization_and_welcome_positioning(self) -> None:
         self.assertEqual(app.normalize_command_text("/START@ExampleBot"), "/start")
@@ -1222,34 +981,6 @@ class BotDatabaseTests(unittest.TestCase):
 
         self.assertTrue(edited)
 
-    def test_owner_only_commands_and_audit_log(self) -> None:
-        previous_owners = app.OWNER_IDS
-        app.OWNER_IDS = {1}
-        send_mock = AsyncMock(return_value=True)
-        try:
-            with patch.object(app, "send_message", send_mock):
-                handled = asyncio.run(
-                    app.handle_admin_command(2, "/broadcast forbidden")
-                )
-            self.assertTrue(handled)
-            self.assertIn("OWNER_IDS", send_mock.await_args.args[1])
-
-            send_mock.reset_mock()
-            with patch.object(app, "send_message", send_mock):
-                handled = asyncio.run(app.handle_admin_command(1, "/broadcast"))
-            self.assertTrue(handled)
-            self.assertEqual(send_mock.await_args.args[1], "格式：/broadcast 内容")
-
-            app.add_admin_audit(1, "conversation_takeover", 55, "test")
-            row = app.db_fetchone(
-                "SELECT admin_id, action, target_chat_id "
-                "FROM admin_audit_logs ORDER BY id DESC LIMIT 1"
-            )
-            self.assertEqual(int(row["admin_id"]), 1)
-            self.assertEqual(row["action"], "conversation_takeover")
-            self.assertEqual(int(row["target_chat_id"]), 55)
-        finally:
-            app.OWNER_IDS = previous_owners
 
     def test_non_admin_cannot_execute_management_actions(self) -> None:
         callback = {

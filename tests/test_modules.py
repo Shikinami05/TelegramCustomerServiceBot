@@ -12,7 +12,6 @@ from tg_bot.config import load_settings
 from tg_bot.models import TelegramSendResult
 from tg_bot.repositories import (
     access,
-    broadcasts,
     conversations,
     deliveries,
     inbound,
@@ -20,7 +19,6 @@ from tg_bot.repositories import (
     users,
 )
 from tg_bot.repositories import updates
-from tg_bot.services import broadcast as broadcast_service
 from tg_bot.telegram import TelegramAPIError, request
 from tg_bot.text import escape_html_limited, html_to_plain_text, truncate_text
 
@@ -138,7 +136,8 @@ class DatabaseModuleTests(unittest.TestCase):
         self.assertIn(("table", "users"), objects)
         self.assertIn(("table", "message_links"), objects)
         self.assertIn(("table", "processed_updates"), objects)
-        self.assertIn(("table", "pending_broadcasts"), objects)
+        self.assertNotIn(("table", "pending_broadcasts"), objects)
+        self.assertIn(("table", "moderation_rules"), objects)
         self.assertIn(("table", "inbound_events"), objects)
         self.assertIn(("table", "admin_deliveries"), objects)
         self.assertIn(("table", "admin_reply_deliveries"), objects)
@@ -219,69 +218,15 @@ class RepositoryModuleTests(unittest.TestCase):
         )
         self.assertIsNone(deliveries.claim_next_admin(self.db_path, now=100))
 
-    def test_conversation_claim_and_clear_are_consistent(self) -> None:
+    def test_reply_selection_and_clear_are_consistent(self) -> None:
         conversations.record_user_activity(self.db_path, 10)
-        acquired = conversations.claim(
-            self.db_path,
-            10,
-            200,
-            activate_reply=True,
-        )
-        self.assertEqual(acquired.status, "acquired")
-        conflict = conversations.claim(self.db_path, 10, 201)
-        self.assertEqual((conflict.status, conflict.owner_admin_id), ("conflict", 200))
-        self.assertIsNone(
-            conversations.clear_admin_state(
-                self.db_path,
-                200,
-                1800,
-                expected_target_chat_id=11,
-            )
-        )
+        conversations.set_admin_state(self.db_path, 200, 10)
+        conversations.set_admin_state(self.db_path, 201, 11)
+        self.assertIsNone(conversations.clear_admin_state(self.db_path, 200, 1800, 11))
         self.assertEqual(conversations.get_admin_state(self.db_path, 200, 1800), 10)
-        self.assertEqual(
-            conversations.clear_admin_state(self.db_path, 200, 1800, 10),
-            10,
-        )
+        self.assertEqual(conversations.get_admin_state(self.db_path, 201, 1800), 11)
+        self.assertEqual(conversations.clear_admin_state(self.db_path, 200, 1800, 10), 10)
 
-    def test_broadcast_recipient_can_only_finish_once(self) -> None:
-        database.execute(
-            self.db_path,
-            "INSERT INTO users (chat_id, first_name) VALUES (?, ?)",
-            (10, "User"),
-        )
-        broadcast_id = broadcasts.create(self.db_path, 200, "hello")
-        self.assertEqual(
-            broadcasts.queue(self.db_path, broadcast_id, 200),
-            ("queued", 1),
-        )
-        self.assertIsNotNone(broadcasts.claim_next_job(self.db_path))
-        self.assertEqual(broadcasts.claim_next_recipient(self.db_path, broadcast_id), 10)
-        broadcasts.finish_recipient(self.db_path, broadcast_id, 10, True)
-        with self.assertRaisesRegex(RuntimeError, "no longer claimed"):
-            broadcasts.finish_recipient(self.db_path, broadcast_id, 10, True)
-        result = broadcasts.complete(self.db_path, broadcast_id)
-        self.assertEqual(int(result["sent_count"]), 1)
-
-    def test_interrupted_broadcast_recipient_is_not_replayed(self) -> None:
-        database.execute(
-            self.db_path,
-            "INSERT INTO users (chat_id, first_name) VALUES (?, ?)",
-            (10, "User"),
-        )
-        broadcast_id = broadcasts.create(self.db_path, 200, "hello")
-        broadcasts.queue(self.db_path, broadcast_id, 200)
-        broadcasts.claim_next_job(self.db_path)
-        self.assertEqual(broadcasts.claim_next_recipient(self.db_path, broadcast_id), 10)
-
-        database.initialize(self.db_path)
-
-        self.assertIsNotNone(broadcasts.claim_next_job(self.db_path))
-        self.assertIsNone(broadcasts.claim_next_recipient(self.db_path, broadcast_id))
-        result = broadcasts.complete(self.db_path, broadcast_id)
-        self.assertEqual(int(result["sent_count"]), 0)
-        self.assertEqual(int(result["failed_count"]), 0)
-        self.assertEqual(int(result["unknown_count"]), 1)
 
     def test_user_history_and_access_state_are_persistent(self) -> None:
         users.upsert(
@@ -313,125 +258,8 @@ class RepositoryModuleTests(unittest.TestCase):
         self.assertFalse(access.is_blacklisted(self.db_path, 10))
 
 
-class BroadcastServiceTests(unittest.IsolatedAsyncioTestCase):
-    async def test_unknown_network_result_is_not_retried(self) -> None:
-        recipients = iter((10, None))
-        finished: list[tuple[str, int, bool, str, bool]] = []
-        send = AsyncMock(
-            return_value=TelegramSendResult(
-                False,
-                description="connection closed before response",
-            )
-        )
-
-        await broadcast_service.process_job(
-            {"id": "job-1", "content": "hello"},
-            lambda _: next(recipients),
-            lambda _: None,
-            lambda _: False,
-            lambda *args: finished.append(args),
-            send,
-            rate_limit_retries=3,
-            send_delay_seconds=0,
-        )
-
-        send.assert_awaited_once()
-        self.assertEqual(finished[0][:3], ("job-1", 10, False))
-        self.assertTrue(finished[0][4])
-
-    async def test_server_error_is_treated_as_uncertain(self) -> None:
-        recipients = iter((10, None))
-        finished: list[tuple[str, int, bool, str, bool]] = []
-        send = AsyncMock(
-            return_value=TelegramSendResult(
-                False,
-                status_code=502,
-                description="bad gateway",
-            )
-        )
-
-        await broadcast_service.process_job(
-            {"id": "job-2", "content": "hello"},
-            lambda _: next(recipients),
-            lambda _: None,
-            lambda _: False,
-            lambda *args: finished.append(args),
-            send,
-            rate_limit_retries=3,
-            send_delay_seconds=0,
-        )
-
-        send.assert_awaited_once()
-        self.assertTrue(finished[0][4])
-
-
 class KeyboardModuleTests(unittest.TestCase):
-    def test_ai_settings_button_is_only_added_for_owner_dashboard(self) -> None:
-        counts = {"inbox": 0, "pending": 0, "closed": 0, "moderation": 0}
-        admin_markup = keyboards.admin_dashboard_keyboard(counts)
-        owner_markup = keyboards.admin_dashboard_keyboard(
-            counts,
-            show_ai_settings=True,
-        )
 
-        admin_callbacks = {
-            button["callback_data"]
-            for row in admin_markup["inline_keyboard"]
-            for button in row
-        }
-        owner_callbacks = {
-            button["callback_data"]
-            for row in owner_markup["inline_keyboard"]
-            for button in row
-        }
-        self.assertNotIn("ai:panel", admin_callbacks)
-        self.assertIn("ai:panel", owner_callbacks)
-
-    def test_reply_mode_actions_use_semantic_styles(self) -> None:
-        markup = keyboards.admin_user_keyboard(
-            123,
-            blacklisted=False,
-            closed=False,
-            owner_admin_id=8,
-            viewer_admin_id=9,
-        )
-        first_row = markup["inline_keyboard"][0]
-        self.assertEqual(first_row[0]["text"], "接管")
-        self.assertEqual(first_row[0]["callback_data"], "takeover:123")
-        self.assertEqual(first_row[0]["style"], "primary")
-        self.assertEqual(first_row[1]["style"], "success")
-
-        owned_markup = keyboards.admin_user_keyboard(
-            123,
-            blacklisted=False,
-            closed=False,
-            owner_admin_id=8,
-            viewer_admin_id=8,
-        )
-        self.assertEqual(
-            owned_markup["inline_keyboard"][0][0]["text"], "持续回复"
-        )
-        continue_button = owned_markup["inline_keyboard"][0][0]
-
-        exit_button = keyboards.exit_reply_keyboard(123)["inline_keyboard"][0][0]
-        self.assertEqual(exit_button["callback_data"], "cancel:123")
-        self.assertEqual(exit_button["style"], "danger")
-        self.assertEqual(
-            exit_button["style"],
-            "danger",
-        )
-
-        queue_markup = keyboards.conversation_queue_keyboard(
-            [{"chat_id": 123, "owner_admin_id": 8}],
-            "inbox",
-            viewer_admin_id=8,
-            page=1,
-            total_pages=1,
-            page_size=10,
-            counts={"inbox": 1, "pending": 0, "closed": 0},
-        )
-        queue_button = queue_markup["inline_keyboard"][0][0]
-        self.assertEqual(queue_button["style"], continue_button["style"])
 
     def test_pagination_buttons_are_stable(self) -> None:
         navigation = keyboards.pagination_navigation_row("queue:inbox", 2, 3)

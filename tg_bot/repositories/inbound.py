@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from tg_bot import database
+from tg_bot.repositories.conversations import record_activity_in_connection
 
 
 def persist_event(
@@ -59,23 +60,8 @@ def persist_event(
                 text,
             ),
         )
-        conn.execute(
-            """
-            INSERT INTO conversations (
-                chat_id, status, unread_count, last_user_message_at, updated_at
-            ) VALUES (?, 'open', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            ON CONFLICT(chat_id) DO UPDATE SET
-                status = 'open',
-                unread_count = CASE
-                    WHEN ? THEN conversations.unread_count + 1
-                    ELSE MAX(conversations.unread_count, 1)
-                END,
-                last_user_message_at = CURRENT_TIMESTAMP,
-                updated_at = CURRENT_TIMESTAMP,
-                closed_at = NULL
-            """,
-            (chat_id, 0 if edited else 1),
-        )
+        sequence = record_activity_in_connection(conn, chat_id, not edited)
+        conn.execute("UPDATE inbound_events SET conversation_seq=? WHERE update_id=?", (sequence, update_id))
 
         updated_log = None
         if edited:
@@ -126,4 +112,3 @@ def persist_event(
         if connection is None:
             conn.commit()
         return True
-

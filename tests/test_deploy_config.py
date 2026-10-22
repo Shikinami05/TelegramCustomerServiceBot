@@ -65,9 +65,10 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_installer_seeds_owner_and_queue_defaults(self) -> None:
         script = (PROJECT_DIR / "scripts" / "install.sh").read_text(encoding="utf-8")
         self.assertIn("OWNER_IDS=%s", script)
-        self.assertIn("PENDING_REMINDER_MINUTES=30", script)
+        self.assertIn("SPAM_RULES_ENABLED=true", script)
+        self.assertNotIn("PENDING_REMINDER_MINUTES", script)
         self.assertIn("ADMIN_REPLY_STATE_TTL_SECONDS=1800", script)
-        self.assertIn("BROADCAST_RATE_LIMIT_RETRIES=3", script)
+        self.assertNotIn("BROADCAST_RATE_LIMIT_RETRIES", script)
         self.assertIn("DISPLAY_TIMEZONE=Asia/Hong_Kong", script)
         self.assertIn("Enable AI ad review", script)
         self.assertIn("AI_MODERATION_ENABLED=false", script)

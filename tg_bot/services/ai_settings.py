@@ -15,7 +15,9 @@ from tg_bot.config import Settings
 from tg_bot.keyboards import inline_keyboard
 from tg_bot.moderation_config import configure_moderation
 from tg_bot.repositories import moderation
+from tg_bot.services import spam_rules
 from tg_bot.services.moderation import classify
+from tg_bot.text import escape_html_limited
 
 
 INPUT_MARKER = "AI 配置输入"
@@ -68,35 +70,51 @@ class AISettingsController:
 
     async def panel(self, admin_id: int, callback: dict | None = None, notice: str = "") -> None:
         if not self.is_owner(admin_id):
-            await self.send(admin_id, "仅 OWNER_IDS 中的负责人可管理 AI 配置。")
+            await self.send(admin_id, "仅负责人可管理防广告设置。")
             return
         moderation.cancel_config_input(self.db_path(), admin_id)
         self.clear_reply(admin_id)
         settings = self.settings()
         provider = PROVIDERS[settings.ai_provider]
+        text = (
+            "<b>防广告设置</b>\n\n"
+            f"本地规则：{'开启' if settings.spam_rules_enabled else '关闭'}\n"
+            f"AI 审核：{'开启' if settings.ai_moderation_enabled else '暂停'}\n"
+            f"服务商：{provider.name}\n"
+            f"密钥：{'已配置' if settings.moderation_key else '未配置'}"
+        )
+        if notice:
+            text += "\n\n" + html.escape(notice)
+        await self.view(admin_id, text, [
+            [("暂停 AI 审核" if settings.ai_moderation_enabled else "开启 AI 审核",
+              "ai:disable" if settings.ai_moderation_enabled else "ai:enable",
+              "danger" if settings.ai_moderation_enabled else "success")],
+            [("关闭本地规则" if settings.spam_rules_enabled else "开启本地规则",
+              "ai:rules_off" if settings.spam_rules_enabled else "ai:rules_on")],
+            [("连接检查", "ai:check"), ("高级设置", "ai:advanced")],
+            [("垃圾箱", "moderation:1"), ("返回设置", "settings:panel")],
+        ], callback)
+
+    async def advanced(self, admin_id: int, callback: dict | None = None) -> None:
+        settings = self.settings()
+        provider = PROVIDERS[settings.ai_provider]
         usage = database.fetchone(self.db_path(), "SELECT requests FROM moderation_usage WHERE day=date('now')")
-        enabled = settings.ai_moderation_enabled
-        await self.view(admin_id, "<b>防广告设置</b>\n\n"
-            f"状态：{'已开启' if enabled else '已暂停'}\n服务商：{provider.name}\n"
+        await self.view(admin_id,
+            f"<b>防广告 · 高级设置</b>\n\n服务商：{provider.name}\n"
             f"模型：<code>{html.escape(settings.moderation_model)}</code>\n"
-            f"密钥：{'已配置（不显示）' if settings.moderation_key else '未配置'}\n"
             f"今日调用：{usage[0] if usage else 0} / {settings.moderation_daily_limit}（UTC）\n"
-            f"无文字媒体：{'直接接收' if settings.moderation_media_policy == 'allow' else '暂存待确认'}\n"
-            "疑似广告或检测失败：暂存，由管理员决定。不会自动封禁用户。"
-            + ("\n\n" + html.escape(notice) if notice else ""), [
-                [("服务商 · " + provider.name, "ai:providers")],
-                [("API 密钥", "ai:key"), ("模型", "ai:model")],
-                [("连接检查", "ai:check"), ("测试检测", "ai:test")],
-                [("每日限额", "ai:limit"), ("无文字媒体", "ai:media")],
-                [("暂停拦截" if enabled else "开启拦截", "ai:disable" if enabled else "ai:enable",
-                  "danger" if enabled else "success")],
-                [("暂存箱", "moderation:1"), ("返回工作台", "admin:dashboard")],
+            f"无文字媒体：{'直接接收' if settings.moderation_media_policy == 'allow' else '暂存待确认'}",
+            [
+                [("服务商", "ai:providers"), ("API 密钥", "ai:key")],
+                [("模型", "ai:model"), ("测试检测", "ai:test")],
+                [("广告规则", "ai:rules"), ("每日限额", "ai:limit")],
+                [("无文字媒体", "ai:media"), ("返回设置", "ai:panel")],
             ], callback)
 
     async def prompt(self, admin_id: int, kind: str, callback: dict | None = None) -> None:
         self.clear_reply(admin_id)
         settings = self.settings()
-        labels = {"key": f"{PROVIDERS[settings.ai_provider].name} API Key", "model": "完整模型 ID", "limit": "每日调用次数（1 至 1000000）"}
+        labels = {"rules": "自定义广告规则，每行填写「词语：短语」或「域名：example.com」；发送「清空」删除自定义规则", "key": f"{PROVIDERS[settings.ai_provider].name} API Key", "model": "完整模型 ID", "limit": "每日调用次数（1 至 1000000）"}
         if callback:
             await self.view(admin_id, f"<b>等待输入</b>\n\n{labels[kind]}\n3 分钟内有效。",
                             [[("取消输入", "ai:panel")]], callback)
@@ -114,7 +132,7 @@ class AISettingsController:
         configure_moderation(self.env_path(), settings.ai_moderation_enabled,
                              api_key=settings.moderation_key, model=settings.moderation_model,
                              daily_limit=settings.moderation_daily_limit, provider=settings.ai_provider,
-                             media_policy=settings.moderation_media_policy)
+                             media_policy=settings.moderation_media_policy, rules_enabled=settings.spam_rules_enabled)
         self.apply_settings(settings)
         database.execute(self.db_path(), "INSERT INTO admin_audit_logs(admin_id,action,details) VALUES(?,'ai_settings',?)",
                          (admin_id, action))
@@ -128,6 +146,16 @@ class AISettingsController:
         settings = self.settings()
         provider = PROVIDERS[settings.ai_provider]
         back = [("返回设置", "ai:panel")]
+        if action == "advanced":
+            await self.advanced(admin_id, callback)
+            return
+        if action == "rules":
+            rules = spam_rules.format_rules(self.db_path()) or "暂无自定义规则"
+            await self.view(admin_id, "<b>广告规则</b>\n\n内置规则识别博彩、返佣、招募等组合话术。"
+                            "\n自定义词语使用短语匹配，域名同时匹配其子域名；命中后暂存，不自动拉黑。\n\n"
+                            + escape_html_limited(rules, 2400),
+                            [[("编辑自定义规则", "ai:rules_input")], back], callback)
+            return
         if action == "providers":
             await self.view(admin_id, "<b>选择 AI 服务商</b>\n\n切换服务商将暂停拦截并清空旧密钥，需重新配置。",
                             [[(item.name, f"ai:provider:{key}")] for key, item in PROVIDERS.items()] + [back], callback)
@@ -151,8 +179,8 @@ class AISettingsController:
                              for index, model in enumerate(provider.models)] +
                             [[("输入其他模型", "ai:model_input")], back], callback)
             return
-        if action in {"key_input", "model_input", "limit"}:
-            await self.prompt(admin_id, {"key_input": "key", "model_input": "model"}.get(action, action), callback)
+        if action in {"key_input", "model_input", "rules_input", "limit"}:
+            await self.prompt(admin_id, {"key_input": "key", "model_input": "model", "rules_input": "rules"}.get(action, action), callback)
             return
         if action == "media":
             await self.view(admin_id, "<b>无文字媒体</b>\n\n当前只检测文字、说明和隐藏链接，不识别图片内容或语音。"
@@ -215,9 +243,12 @@ class AISettingsController:
                     elif action.startswith("enable_confirm"):
                         self.save(admin_id, replace(settings, ai_moderation_enabled=True), "enable")
                         notice = "防广告已开启，用户只会收到普通留言回执。"
+                elif action in {"rules_on", "rules_off"}:
+                    self.save(admin_id, replace(settings, spam_rules_enabled=action == "rules_on"), "update_rules_switch")
+                    notice = "本地规则已更新。"
                 elif action == "disable":
                     self.save(admin_id, replace(settings, ai_moderation_enabled=False), "disable")
-                    notice = "已暂停。历史暂存内容仍保留，请在暂存箱处理。"
+                    notice = "AI 审核已暂停，本地规则按其独立开关生效。历史暂存仍保留在垃圾箱。"
                 elif action != "panel":
                     return
             await self.panel(admin_id, callback, notice)
@@ -272,6 +303,19 @@ class AISettingsController:
                         await self.panel(admin_id, callback, "密钥格式或鉴权检查失败，原配置未修改。")
                         return True
                     updated = replace(settings, ai_api_key=text, deepseek_api_key=text if settings.ai_provider == "deepseek" else "")
+                elif kind == "rules":
+                    if POSSIBLE_SECRET.search(text):
+                        await self.panel(admin_id, callback, "输入含有疑似 API 密钥，未保存为广告规则。请通过 API 密钥入口配置。")
+                        return True
+                    try:
+                        count = spam_rules.replace_rules(self.db_path(), text)
+                    except ValueError as exc:
+                        await self.panel(admin_id, callback, str(exc))
+                        return True
+                    database.execute(self.db_path(), "INSERT INTO admin_audit_logs(admin_id,action,details) VALUES(?,'moderation_rules',?)",
+                                     (admin_id, f"count={count}"))
+                    await self.panel(admin_id, callback, f"已保存 {count} 条自定义规则。")
+                    return True
                 elif kind == "model" and MODEL_PATTERN.fullmatch(text):
                     updated = replace(settings, ai_model=text, deepseek_model=text if settings.ai_provider == "deepseek" else settings.deepseek_model)
                 elif kind == "limit" and text.isascii() and text.isdigit() and len(text) <= 7 and 1 <= int(text) <= 1000000:

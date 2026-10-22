@@ -104,7 +104,8 @@ if [[ ! -f "$PROJECT_DIR/.env" ]]; then
         printf 'ADMIN_IDS=%s\n' "$ADMIN_IDS_INPUT"
         printf 'OWNER_IDS=%s\n' "$ADMIN_IDS_INPUT"
         printf 'WEBHOOK_URL=%s\n' "$WEBHOOK_URL_INPUT"
-        printf '\nAI_MODERATION_ENABLED=false\n'
+        printf '\nSPAM_RULES_ENABLED=true\n'
+        printf 'AI_MODERATION_ENABLED=false\n'
         printf 'DEEPSEEK_MODEL=deepseek-flash\n'
         printf 'MODERATION_TIMEOUT_SECONDS=15\n'
         printf 'MODERATION_DAILY_LIMIT=500\n'
@@ -116,10 +117,7 @@ if [[ ! -f "$PROJECT_DIR/.env" ]]; then
         printf 'USER_RATE_LIMIT_WINDOW_SECONDS=60\n'
         printf 'USER_RATE_LIMIT_COOLDOWN_SECONDS=300\n'
         printf 'MESSAGE_RETENTION_DAYS=180\n'
-        printf '\nBROADCAST_SEND_DELAY_SECONDS=0.05\n'
-        printf 'BROADCAST_RATE_LIMIT_RETRIES=3\n'
         printf 'UPDATE_PROCESSING_TIMEOUT_SECONDS=300\n'
-        printf 'PENDING_REMINDER_MINUTES=30\n'
         printf 'ADMIN_REPLY_STATE_TTL_SECONDS=1800\n'
         printf 'TELEGRAM_INLINE_RETRY_MAX_SECONDS=5\n'
         printf 'DISPLAY_TIMEZONE=Asia/Hong_Kong\n'

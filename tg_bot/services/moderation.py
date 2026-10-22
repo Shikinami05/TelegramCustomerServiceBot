@@ -13,6 +13,7 @@ import httpx
 from tg_bot.config import Settings
 from tg_bot.ai_providers import PROVIDERS, request_options
 from tg_bot.repositories import access, moderation
+from tg_bot.services import spam_rules
 
 
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
@@ -25,6 +26,10 @@ promotional invitations, gambling promotions, or scam solicitation.
 allow: ordinary personal conversation, questions, legitimate sharing of links,
 or discussing/reporting spam. A URL, username, or commercial word alone is not spam.
 uncertain: ambiguous intent. Do not invent missing context. You have no tools.
+Recognize Chinese hash gambling promotions, deposit bonuses, betting rebates,
+commission recruitment, and promotional channel invitations even with spaced
+characters or zero-width characters. Discussing or reporting these topics is
+not itself promotion. Evaluate the entire intent.
 """
 REASONS = {"allow": "未发现明显广告", "spam": "疑似推广或广告", "uncertain": "内容需要人工确认"}
 MEDIA_METHODS = {
@@ -142,8 +147,11 @@ async def process_job(db_path: Path, job: sqlite3.Row, client: httpx.AsyncClient
     text = review_text(json.loads(job["snapshot"]))
     provider = ""
     model = ""
-    if not settings.ai_moderation_enabled:
-        result = Verdict("uncertain", "自动审核已关闭，历史任务等待人工处理")
+    local_reason = spam_rules.check(db_path, text) if settings.spam_rules_enabled else None
+    if local_reason:
+        result = Verdict("spam", local_reason)
+    elif not settings.ai_moderation_enabled:
+        result = Verdict("allow", "本地规则未命中；AI 审核未开启")
     elif not text.strip() and settings.moderation_media_policy == "allow":
         result = Verdict("allow", "按无文字媒体策略接收；未进行图像或语音识别")
     elif not text.strip() or len(text) > 8000:

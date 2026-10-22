@@ -89,7 +89,7 @@ def get(db_path: Path, update_id: int) -> sqlite3.Row | None:
 
 
 FILTERS = {"all": "1=1", "spam": "verdict='spam'", "error": "verdict='error'",
-           "other": "verdict NOT IN ('spam','error')"}
+           "other": "verdict NOT IN ('spam','error')", "pending": "verdict<>'spam'"}
 
 
 def pending_page(db_path: Path, page: int, size: int = 5, category: str = "all") -> tuple[list[sqlite3.Row], int, int]:
@@ -195,6 +195,27 @@ def claim_notice(db_path: Path) -> int:
         )
         conn.commit()
         return count if cursor.rowcount else 0
+
+
+def claim_error_notice(db_path: Path) -> bool:
+    with database.connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            "SELECT DISTINCT provider,model,reason FROM moderation_jobs WHERE status='held' AND verdict='error' "
+            "ORDER BY provider,model,reason"
+        ).fetchall()
+        if not rows:
+            conn.execute("UPDATE moderation_notices SET signature='' WHERE id=1")
+            conn.commit()
+            return False
+        signature = hashlib.sha256(str([tuple(row) for row in rows]).encode()).hexdigest()
+        cursor = conn.execute(
+            "INSERT INTO moderation_notices(id,sent_at,signature) VALUES(1,CURRENT_TIMESTAMP,?) "
+            "ON CONFLICT(id) DO UPDATE SET sent_at=CURRENT_TIMESTAMP,signature=excluded.signature "
+            "WHERE signature<>excluded.signature AND sent_at<datetime('now','-10 minutes')", (signature,),
+        )
+        conn.commit()
+        return bool(cursor.rowcount)
 
 
 def begin_config_input(db_path: Path, admin_id: int, prompt_id: int, kind: str,

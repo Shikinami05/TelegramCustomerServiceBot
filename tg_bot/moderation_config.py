@@ -11,7 +11,8 @@ DEFAULT_MODEL = PROVIDERS["deepseek"].default_model
 
 def configure_moderation(env_path: Path, enabled: bool, *, api_key: str = "",
                          model: str = DEFAULT_MODEL, daily_limit: int = 500,
-                         provider: str | None = None, media_policy: str | None = None) -> None:
+                         provider: str | None = None, media_policy: str | None = None,
+                         rules_enabled: bool | None = None) -> None:
     if env_path.is_symlink() or not env_path.is_file():
         raise ValueError("A regular .env file is required")
     selected = provider or (dotenv_values(env_path, interpolate=False).get("AI_PROVIDER") or "deepseek")
@@ -41,6 +42,8 @@ def configure_moderation(env_path: Path, enabled: bool, *, api_key: str = "",
                           MODERATION_DAILY_LIMIT=str(daily_limit))
         if media_policy is not None:
             values["MODERATION_MEDIA_POLICY"] = media_policy
+        if rules_enabled is not None:
+            values["SPAM_RULES_ENABLED"] = "true" if rules_enabled else "false"
         for key, value in values.items():
             if not set_key(str(staging), key, value, quote_mode="always")[0]:
                 raise RuntimeError("Unable to save moderation configuration")

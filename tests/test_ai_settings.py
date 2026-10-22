@@ -55,7 +55,7 @@ class AISettingsTests(unittest.IsolatedAsyncioTestCase):
     async def test_owner_menu_is_not_in_regular_admin_or_user_scope(self):
         for menu in (manage_webhook.USER_COMMANDS, manage_webhook.ADMIN_COMMANDS):
             self.assertNotIn("ai", {entry["command"] for entry in menu})
-        self.assertIn("ai", {entry["command"] for entry in manage_webhook.OWNER_COMMANDS})
+        self.assertEqual({entry["command"] for entry in manage_webhook.OWNER_COMMANDS}, {"start", "cancel", "myid", "settings"})
         await self.controller.callback(2, "key_input")
         self.assertEqual(database.fetchall(self.db, "SELECT * FROM admin_config_inputs"), [])
 
@@ -69,7 +69,7 @@ class AISettingsTests(unittest.IsolatedAsyncioTestCase):
         fallback.assert_not_awaited()
         self.assertEqual(self.send.await_count, 1)
         buttons = self.send.await_args.kwargs["reply_markup"]["inline_keyboard"]
-        self.assertIn("ai:key", {button["callback_data"] for row in buttons for button in row})
+        self.assertIn("ai:advanced", {button["callback_data"] for row in buttons for button in row})
         self.telegram.assert_not_awaited()
 
     async def test_key_update_deletes_input_persists_and_takes_effect_without_restart(self):
