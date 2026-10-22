@@ -172,7 +172,7 @@ class AISettingsTests(unittest.IsolatedAsyncioTestCase):
         await self.controller.callback(1, "enable")
         self.assertFalse(self.settings.ai_moderation_enabled)
         with patch.object(ai_settings, "probe_key", AsyncMock(return_value=True)):
-            await self.controller.callback(1, "enable_confirm")
+            await self.controller.callback(1, "enable_confirm:deepseek")
         self.assertTrue(self.settings.ai_moderation_enabled)
         await self.controller.callback(1, "disable")
         self.assertFalse(self.settings.ai_moderation_enabled)
@@ -208,3 +208,91 @@ class AISettingsTests(unittest.IsolatedAsyncioTestCase):
              patch.object(ai_settings, "configure_moderation", side_effect=OSError("write failed")):
             await self.controller.message(self.message())
         self.assertEqual(self.settings.deepseek_api_key, "")
+
+    async def test_simple_panel_offers_three_modes_without_separate_switches(self):
+        await self.controller.panel(1)
+        buttons = {button["callback_data"] for row in self.send.await_args.kwargs["reply_markup"]["inline_keyboard"] for button in row}
+        self.assertTrue({"ai:mode:rules", "ai:mode:ai", "ai:mode:off", "ai:setup", "ai:rules", "ai:advanced"} <= buttons)
+        self.assertFalse({"ai:rules_on", "ai:rules_off", "ai:enable", "ai:disable"} & buttons)
+        self.assertIn("不会自动拉黑", self.send.await_args.args[1])
+        self.assertLess(len(self.send.await_args.args[1]), 2000)
+
+    async def test_original_rules_page_escapes_custom_text_and_fits_telegram(self):
+        from tg_bot.services import spam_rules
+
+        spam_rules.replace_rules(self.db, "\n".join(f"词语：{index}" + "\U0001f600<&" * 25 for index in range(30)))
+        await self.controller.callback(1, "rules")
+        text = self.send.await_args.args[1]
+        self.assertIn("本项目独立编写", text)
+        self.assertIn("幸运哈希开桌", text)
+        self.assertNotIn("\U0001f600<&", text)
+        self.assertLessEqual(len(text.encode("utf-16-le")) // 2, 4096)
+        self.assertEqual(text.count("<b>"), text.count("</b>"))
+        for row in self.send.await_args.kwargs["reply_markup"]["inline_keyboard"]:
+            for button in row:
+                self.assertLessEqual(len(button["callback_data"].encode()), 64)
+
+    async def test_quick_setup_requires_notice_and_checks_model_before_enabling(self):
+        await self.controller.callback(1, "mode:ai")
+        self.assertIn("可能产生 API 费用", self.send.await_args.args[1])
+        self.assertIn("无法保证清除", self.send.await_args.args[1])
+        self.assertIsNone(moderation.pending_config_input(self.db, 1))
+        await self.controller.callback(1, "setup_input")
+        with patch.object(ai_settings, "probe_key", AsyncMock(return_value=True)) as probe:
+            await self.controller.message(self.message())
+        probe.assert_awaited_once_with("sk-new-test-private", "deepseek", self.settings.moderation_model)
+        self.assertTrue(self.settings.ai_moderation_enabled)
+        self.assertTrue(self.settings.spam_rules_enabled)
+        self.assertEqual(dotenv_values(self.env)["AI_MODERATION_ENABLED"], "true")
+        self.assertEqual(dotenv_values(self.env)["SPAM_RULES_ENABLED"], "true")
+        self.assertNotIn("sk-new-test-private", str(self.send.await_args_list))
+        with database.connect(self.db) as conn:
+            self.assertNotIn("sk-new-test-private", "\n".join(conn.iterdump()))
+
+    async def test_failed_quick_setup_and_nonowner_input_leave_mode_and_key_unchanged(self):
+        original = self.settings
+        await self.controller.callback(2, "setup_input")
+        self.assertIsNone(moderation.pending_config_input(self.db, 2))
+        for index, key in enumerate(("invalid", "sk-new-test-private")):
+            self.send.return_value = TelegramSendResult(True, message_id=100 + index)
+            await self.controller.callback(1, "setup_input")
+            with patch.object(ai_settings, "probe_key", AsyncMock(return_value=False)):
+                await self.controller.message(self.message(text=key, reply=100 + index))
+            self.assertEqual(self.settings, original)
+
+    async def test_mode_changes_are_persistent_and_require_current_provider_for_ai(self):
+        self.settings = replace(self.settings, deepseek_api_key="sk-existing-private", spam_rules_enabled=False)
+        await self.controller.callback(1, "mode:ai")
+        self.assertFalse(self.settings.ai_moderation_enabled)
+        with patch.object(ai_settings, "probe_key", AsyncMock(return_value=True)) as probe:
+            for action in ("mode_ai_confirm:other", "enable_confirm", "mode_ai_confirm"):
+                await self.controller.callback(1, action)
+            probe.assert_not_awaited()
+            self.assertFalse(self.settings.ai_moderation_enabled)
+            await self.controller.callback(1, "mode_ai_confirm:deepseek")
+        self.assertEqual(self.settings.moderation_mode_label, "规则 + AI")
+        await self.controller.callback(1, "mode:rules")
+        self.assertFalse(self.settings.ai_moderation_enabled)
+        self.assertTrue(self.settings.spam_rules_enabled)
+        await self.controller.callback(1, "mode:off")
+        self.assertFalse(self.settings.spam_rules_enabled)
+        self.assertEqual(dotenv_values(self.env)["SPAM_RULES_ENABLED"], "false")
+        self.assertEqual(self.settings.deepseek_api_key, "sk-existing-private")
+
+    async def test_quick_setup_expiry_cancel_and_provider_change_never_save_key(self):
+        for index, state in enumerate(("expired", "canceled", "provider_changed")):
+            with self.subTest(state=state):
+                self.settings = replace(self.settings, ai_provider="deepseek", deepseek_api_key="", ai_api_key="")
+                self.send.return_value = TelegramSendResult(True, message_id=100 + index)
+                await self.controller.callback(1, "setup_input")
+                if state == "expired":
+                    database.execute(self.db, "UPDATE admin_config_inputs SET expires_at=0")
+                elif state == "canceled":
+                    await self.controller.callback(1, "panel")
+                else:
+                    await self.controller.callback(1, "provider_set:siliconflow")
+                with patch.object(ai_settings, "probe_key", AsyncMock(return_value=True)) as probe:
+                    await self.controller.message(self.message(reply=100 + index))
+                probe.assert_not_awaited()
+                self.assertEqual(self.settings.moderation_key, "")
+                self.assertFalse(self.settings.ai_moderation_enabled)

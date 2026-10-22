@@ -36,7 +36,7 @@ from tg_bot.services import moderation as moderation_service
 from tg_bot.services.ai_settings import AISettingsController
 from tg_bot.services.moderation_ui import ModerationInbox
 from tg_bot.telegram import TelegramAPIError, request as telegram_request
-from tg_bot.text import escape_html_limited, html_to_plain_text, truncate_text
+from tg_bot.text import escape_html_limited, html_to_plain_text, truncate_text, utf16_length
 
 if os.name == "posix":
     os.umask(0o077)
@@ -148,7 +148,9 @@ app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
 
 WELCOME_TEXT = (
     "<b>统一留言聊天入口</b>\n\n"
-    "请直接在这里发送消息，我看到后会通过 Bot 回复你。"
+    "你好，欢迎留言。想聊的事、想分享的内容，都可以直接发在这里。\n\n"
+    "我看到后会通过这个 Bot 回复你，无需另行私聊。文字和媒体都可以发送，"
+    "还没收到回复时，也可以继续补充。"
 )
 QUEUE_LABELS = {"inbox": "未读", "all": "全部"}
 ADMIN_PAGE_SIZE = 10
@@ -809,10 +811,11 @@ def format_history(
             f"<b>{sender}{edited}</b> · {compact_timestamp(row['created_at'])}\n"
             f"{text}"
         )
-        if lines and used_chars + len(line) + 2 > max_chars:
+        line_length = utf16_length(line)
+        if lines and used_chars + line_length + 2 > max_chars:
             break
         lines.append(line)
-        used_chars += len(line) + 2
+        used_chars += line_length + 2
     return "\n\n".join(lines)
 
 
@@ -944,8 +947,15 @@ def chat_label_html(chat_id: int) -> str:
 def format_admin_dashboard(admin_id: int) -> str:
     counts = get_queue_counts()
     target = get_admin_state(admin_id)
-    state = f"\n正在回复：{chat_label_html(target)}" if target is not None else ""
-    return f"<b>聊天中转</b>\n\n未读聊天：{counts['inbox']}{state}"
+    held = db_fetchone("SELECT COUNT(*) AS count FROM moderation_jobs WHERE status='held'")["count"]
+    state = f"正在回复：{chat_label_html(target)}" if target is not None else "当前未选择回复对象"
+    return (
+        "<b>聊天中转</b>\n统一接收留言，在这里继续聊天。\n\n"
+        f"<b>消息概览</b>\n未读聊天：{counts['inbox']}　全部聊天：{counts['all']}\n"
+        f"垃圾箱暂存：{held}\n\n"
+        f"<b>防广告</b>\n当前模式：{SETTINGS.moderation_mode_label}\n\n"
+        f"<b>回复状态</b>\n{state}"
+    )
 
 
 def format_conversation_queue(
@@ -953,7 +963,8 @@ def format_conversation_queue(
     total_pages: int = 1, total_count: int | None = None,
 ) -> str:
     total = len(rows) if total_count is None else total_count
-    lines = [f"<b>聊天 · {QUEUE_LABELS[queue_name]}</b>", f"共 {total} 个聊天 · 第 {page}/{total_pages} 页"]
+    lines = [f"<b>聊天 · {QUEUE_LABELS[queue_name]}</b>",
+             f"共 {total} 个聊天 · 第 {page}/{total_pages} 页\n时间：{DISPLAY_TIMEZONE_NAME}"]
     if not rows:
         lines.append("没有未读消息。" if queue_name == "inbox" else "还没有聊天记录。")
     for index, row in enumerate(rows, start=(page - 1) * ADMIN_PAGE_SIZE + 1):
@@ -972,10 +983,15 @@ def format_user_detail(chat_id: int) -> str:
     if not user:
         return "<b>用户详情</b>\n\n未找到该联系人。"
     username = f"@{escape_html_limited(str(user['username']), 80)}" if user["username"] else "未设置"
+    conversation = get_conversation(chat_id)
+    status = "已拉黑" if is_blacklisted(chat_id) else (
+        "已从聊天列表移除" if conversation and conversation["archived_at"] else "正常接收留言"
+    )
     return (
         f"<b>{chat_label_html(chat_id)}</b>\n"
         f"ID：<code>{chat_id}</code>\n用户名：{username}\n"
-        f"状态：{'已拉黑' if is_blacklisted(chat_id) else '正常'}\n\n"
+        f"状态：{status}\n"
+        f"最近留言：{compact_timestamp(conversation['last_user_message_at']) if conversation else '暂无'}\n\n"
         f"<b>聊天记录</b>\n{format_history(chat_id, limit=10, max_chars=2400)}"
     )
 
@@ -1084,7 +1100,13 @@ async def show_settings(admin_id: int, callback: dict[str, Any] | None = None) -
     if is_owner(admin_id):
         rows.append([("防广告", "ai:panel")])
     rows.extend([[("已拉黑联系人", "settings:blocked:1")], [("返回首页", "admin:dashboard")]])
-    await present_admin_view(admin_id, "<b>设置</b>", inline_keyboard(rows), callback)
+    blocked = db_fetchone("SELECT COUNT(*) AS count FROM blacklists")["count"]
+    await present_admin_view(
+        admin_id, "<b>聊天设置</b>\n\n"
+        f"<b>留言保护</b>\n防广告：{SETTINGS.moderation_mode_label}\n已拉黑联系人：{blocked}\n\n"
+        "广告暂存在垃圾箱，不会自动拉黑联系人；已拉黑用户的后续留言不会进入聊天列表。",
+        inline_keyboard(rows), callback,
+    )
 
 
 async def show_blocked_contacts(admin_id: int, page: int, callback=None) -> None:
@@ -1777,7 +1799,7 @@ async def dispatch_callback(callback: dict[str, Any]) -> None:
         else:
             await answer_callback_query(callback_id, "页面无效")
         return
-    if action == "queue":
+    if action in {"queue", "read_all"}:
         queue_name, _, raw_page = value.partition(":")
         page = parse_callback_page(raw_page or None)
         if page is None:
@@ -1786,7 +1808,13 @@ async def dispatch_callback(callback: dict[str, Any]) -> None:
         if queue_name not in QUEUE_LABELS:
             await answer_callback_query(callback_id, "该列表已更新，请返回首页")
             return
-        await answer_callback_query(callback_id)
+        clear_admin_state(admin_id)
+        if action == "read_all":
+            count = conversation_repository.mark_all_read(DB_PATH)
+            add_admin_audit(admin_id, "mark_all_read", details=f"conversations={count}")
+            await answer_callback_query(callback_id, f"已将 {count} 个聊天标记为已读")
+        else:
+            await answer_callback_query(callback_id)
         await show_conversation_queue(admin_id, queue_name, page, callback)
         return
     if action == "user":
@@ -1805,6 +1833,26 @@ async def dispatch_callback(callback: dict[str, Any]) -> None:
             return
         conversation_repository.mark_read(DB_PATH, int(parts[0]), int(parts[1]))
         await answer_callback_query(callback_id, "已标记所显示的消息为已读")
+        return
+    if action == "delete_confirm":
+        parts = value.split(":")
+        if len(parts) != 2 or any(not part.isascii() or not part.isdigit() or len(part) > 18 for part in parts):
+            await answer_callback_query(callback_id, "参数无效")
+            return
+        chat_id, through = map(int, parts)
+        result = conversation_repository.archive(DB_PATH, chat_id, through)
+        if result == "changed":
+            await answer_callback_query(callback_id, "有新留言，未删除会话")
+            await present_admin_view(
+                admin_id, "<b>会话已更新</b>\n\n确认期间收到了新留言，本次未删除，也未标记新留言为已读。",
+                inline_keyboard([[("查看新留言", f"detail:{chat_id}")], [("返回聊天", "queue:all:1")]]), callback,
+            )
+        elif result == "archived":
+            add_admin_audit(admin_id, "conversation_archive", chat_id)
+            await answer_callback_query(callback_id, "会话已从列表移除")
+            await show_conversation_queue(admin_id, "all", callback=callback)
+        else:
+            await answer_callback_query(callback_id, "会话不存在或已更新")
         return
     if action == "delivery_retry":
         if not is_owner(admin_id) or not value.isascii() or not value.isdigit() or len(value) > 18:
@@ -1839,9 +1887,26 @@ async def dispatch_callback(callback: dict[str, Any]) -> None:
         button: ButtonSpec = (("解除拉黑", f"unblacklist:{chat_id}", "success") if is_blacklisted(chat_id)
                               else ("拉黑联系人", f"blacklist:{chat_id}", "danger"))
         await answer_callback_query(callback_id)
-        await present_admin_view(admin_id, f"<b>{chat_label_html(chat_id)}</b>", inline_keyboard([
-            [button], [("用户详情 / 聊天记录", f"detail:{chat_id}")], [("返回聊天", "queue:all:1")],
+        await present_admin_view(admin_id, f"<b>{chat_label_html(chat_id)} · 会话操作</b>\n\n"
+                                 "<b>整理聊天</b>\n删除会话只移出列表，保留历史；对方再次留言时会重新出现。\n\n"
+                                 "<b>阻止联系</b>\n拉黑后不再接收该联系人的留言，可在设置中解除。", inline_keyboard([
+            [("删除会话", f"delete:{chat_id}", "danger")], [button],
+            [("用户详情 / 聊天记录", f"detail:{chat_id}")], [("返回聊天", "queue:all:1")],
         ]), callback)
+    elif action == "delete":
+        row = get_conversation(chat_id)
+        if not row:
+            await answer_callback_query(callback_id, "会话不存在")
+            return
+        await answer_callback_query(callback_id)
+        await present_admin_view(
+            admin_id, f"<b>删除与 {chat_label_html(chat_id)} 的会话？</b>\n\n"
+            "会从所有管理员的聊天列表移除，并退出针对该联系人的持续回复。\n\n"
+            "聊天记录与原生 Reply 对应关系仍会保留；不会删除 Telegram 消息或拉黑对方。"
+            "对方再次留言后，会话会自动重新出现。",
+            inline_keyboard([[("确认删除会话", f"delete_confirm:{chat_id}:{row['last_inbound_seq']}", "danger")],
+                             [("保留会话", f"more:{chat_id}")]]), callback,
+        )
     elif action == "blacklist":
         await answer_callback_query(callback_id)
         await present_admin_view(

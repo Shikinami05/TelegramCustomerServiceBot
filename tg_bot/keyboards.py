@@ -34,6 +34,7 @@ def admin_user_keyboard(
     if blacklisted:
         rows: list[list[ButtonSpec]] = [
             [("用户详情", f"detail:{chat_id}"), ("解除拉黑", f"unblacklist:{chat_id}", "success")],
+            [("更多", f"more:{chat_id}")],
         ]
     else:
         reply: ButtonSpec = (
@@ -50,7 +51,7 @@ def admin_user_keyboard(
 
 def admin_dashboard_keyboard(counts: dict[str, int], *, show_ai_settings: bool = False) -> dict[str, Any]:
     rows: list[list[ButtonSpec]] = [
-        [(f"聊天 · 未读 {counts['inbox']}", "queue:inbox:1", "primary")],
+        [(f"打开聊天 · 未读 {counts['inbox']}", "queue:all:1", "primary")],
         [(f"垃圾箱 {counts.get('moderation', 0)}", "moderation:1")],
         [("设置", "settings:panel")],
     ]
@@ -74,6 +75,8 @@ def queue_navigation_rows(queue_name: str, page: int, total_pages: int,
     ]
     if total_pages > 1:
         rows.append(pagination_navigation_row(f"queue:{queue_name}", page, total_pages))
+    if counts["inbox"] > 0:
+        rows.append([("全部已读", f"read_all:{queue_name}:{page}")])
     rows.append([("返回首页", "admin:dashboard")])
     return rows
 

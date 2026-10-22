@@ -125,6 +125,7 @@ def record_activity_in_connection(conn: sqlite3.Connection, chat_id: int, increm
                 WHEN ? OR conversations.unread_count = 0 THEN 1 ELSE 0 END,
             last_user_message_at = CURRENT_TIMESTAMP,
             updated_at = CURRENT_TIMESTAMP,
+            archived_at = NULL,
             closed_at = NULL
         """,
         (chat_id, int(increment_unread), int(increment_unread)),
@@ -146,11 +147,42 @@ def mark_read(db_path: Path, chat_id: int, through_seq: int) -> None:
         conn.commit()
 
 
+def mark_all_read(db_path: Path) -> int:
+    with database.connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            "UPDATE conversations SET last_read_seq=last_inbound_seq, unread_count=0 "
+            "WHERE archived_at IS NULL AND unread_count>0 "
+            "AND NOT EXISTS (SELECT 1 FROM blacklists b WHERE b.chat_id=conversations.chat_id)"
+        )
+        conn.commit()
+        return cursor.rowcount
+
+
+def archive(db_path: Path, chat_id: int, through_seq: int) -> str:
+    with database.connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT last_inbound_seq,archived_at FROM conversations WHERE chat_id=?", (chat_id,),
+        ).fetchone()
+        if not row:
+            return "missing"
+        if row["archived_at"] is not None:
+            return "archived"
+        if int(row["last_inbound_seq"]) != through_seq:
+            return "changed"
+        mark_read_in_connection(conn, chat_id, through_seq)
+        conn.execute("UPDATE conversations SET archived_at=CURRENT_TIMESTAMP WHERE chat_id=?", (chat_id,))
+        conn.execute("DELETE FROM admin_states WHERE target_chat_id=?", (chat_id,))
+        conn.commit()
+        return "archived"
+
+
 def get(db_path: Path, chat_id: int) -> sqlite3.Row | None:
     return database.fetchone(
         db_path,
         """
-        SELECT chat_id, owner_admin_id, status, unread_count, last_inbound_seq, last_read_seq,
+        SELECT chat_id, owner_admin_id, status, unread_count, last_inbound_seq, last_read_seq, archived_at,
                last_user_message_at, last_admin_reply_at,
                updated_at, closed_at
         FROM conversations
@@ -165,10 +197,10 @@ def queue_filter(
 ) -> tuple[str, str, tuple[Any, ...]]:
     params: tuple[Any, ...] = ()
     if queue_name == "inbox":
-        where_clause = "c.unread_count > 0 AND NOT EXISTS (SELECT 1 FROM blacklists b WHERE b.chat_id=c.chat_id)"
+        where_clause = "c.archived_at IS NULL AND c.unread_count > 0 AND NOT EXISTS (SELECT 1 FROM blacklists b WHERE b.chat_id=c.chat_id)"
         order_clause = "c.last_user_message_at DESC, c.chat_id DESC"
     elif queue_name == "all":
-        where_clause = "1=1"
+        where_clause = "c.archived_at IS NULL"
         order_clause = "c.updated_at DESC, c.chat_id DESC"
     else:
         raise ValueError(f"unsupported queue: {queue_name}")
@@ -221,6 +253,7 @@ def queue_counts(db_path: Path) -> dict[str, int]:
                 THEN 1 ELSE 0 END) AS inbox,
             COUNT(*) AS "all"
         FROM conversations c
+        WHERE c.archived_at IS NULL
         """,
     )
     return {

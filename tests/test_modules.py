@@ -20,7 +20,7 @@ from tg_bot.repositories import (
 )
 from tg_bot.repositories import updates
 from tg_bot.telegram import TelegramAPIError, request
-from tg_bot.text import escape_html_limited, html_to_plain_text, truncate_text
+from tg_bot.text import escape_html_limited, html_to_plain_text, truncate_text, utf16_length
 
 
 class SettingsTests(unittest.TestCase):
@@ -328,6 +328,15 @@ class TextModuleTests(unittest.TestCase):
         escaped = escape_html_limited("<&abcdef", 8)
         self.assertLessEqual(len(escaped), 8)
         self.assertTrue(escaped.endswith("…"))
+
+    def test_html_truncation_budgets_utf16_without_cutting_emoji_or_entities(self):
+        self.assertEqual(utf16_length("\U0001f600"), 2)
+        for text in ("\U0001f600" * 300, "<&" * 300, "\U0001f600<&" * 300):
+            for limit in (0, 1, 2, 3, 10, 70, 300):
+                escaped = escape_html_limited(text, limit)
+                self.assertLessEqual(utf16_length(escaped), limit)
+                self.assertNotIn("<", escaped)
+                self.assertNotIn("&", escaped.replace("&amp;", "").replace("&lt;", "").replace("&gt;", ""))
 
 
 if __name__ == "__main__":

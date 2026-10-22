@@ -6,9 +6,21 @@ from urllib.parse import urlsplit
 from tg_bot import database
 
 
-GAMBLING = ("哈希竞猜", "哈希博彩", "哈希单双", "哈希大小", "幸运哈希", "区块链彩票", "时时彩")
-SOLICITATION = ("注册送", "充值送", "首充", "返佣", "代理招募", "下注", "投注", "包赔", "返水", "秒提", "进群", "联系客服")
-SCHEMES = ("刷单返佣", "跑分招募", "出售成品号", "免押金兼职", "日结刷单")
+BUILTIN_RULES_TEXT = (
+    "<b>内置识别范围</b>\n"
+    "博彩导流：哈希竞猜、链上赌场等主题，配合充值、返佣、进群等招揽内容。\n"
+    "刷单与招募：日结刷单、跑分招募、成品号交易等话术，配合联系、领取等行动要求。\n\n"
+    "<b>这些不会单独触发</b>\n"
+    "哈希、USDT、兼职、链接等普通词语不会单独被当作广告；举报、求助和讨论优先保留。\n\n"
+    "<b>示例话术</b>\n"
+    "「幸运哈希开桌，首充有奖励，进群领取额度。」\n"
+    "「刷单日结，联系领取任务。」\n\n"
+    "上述文案与组合规则由本项目独立编写，没有导入第三方词库。"
+)
+
+GAMBLING = ("哈希竞猜", "哈希博彩", "哈希单双", "哈希大小", "幸运哈希", "区块链彩票", "时时彩", "哈希投注", "哈希下注", "链上赌场")
+SOLICITATION = ("注册送", "充值送", "首充", "返佣", "代理招募", "下注", "投注", "包赔", "返水", "秒提", "进群", "联系客服", "入群领取", "充值奖励")
+SCHEMES = ("刷单返佣", "跑分招募", "出售成品号", "免押金兼职", "日结刷单", "成品号批发", "刷单日结")
 CONTACT = ("联系", "私聊", "加群", "进群", "招募", "领取")
 DISCUSSION = ("有人发", "有人给", "收到广告", "收到的广告", "收到一条", "举报", "屏蔽", "拦截", "诈骗", "别信", "不要相信", "怎么防", "如何防", "是什么意思", "是什么", "这是广告", "骗局", "是真的吗")
 LINKS = re.compile(r"(?<![\w@.-])(?:https?://[^\s<>\"'，。！？（）]+|(?:[\w-]+\.)+[\w-]{2,63}(?:/[^\s<>\"'，。！？（）]*)?)", re.IGNORECASE)
@@ -84,7 +96,8 @@ def check(db_path: Path, text: str) -> str | None:
         return None
     if any(kind == "phrase" and normalize(value) in normalized for kind, value in rules):
         return "命中自定义广告短语"
-    if any(word in normalized for word in GAMBLING) and any(word in normalized for word in SOLICITATION):
+    if any(topic in normalized and any(word in normalized.replace(topic, "") for word in SOLICITATION)
+           for topic in GAMBLING):
         return "疑似博彩推广话术"
     if any(word in normalized for word in SCHEMES) and any(word in normalized for word in CONTACT):
         return "疑似返佣或招募推广"

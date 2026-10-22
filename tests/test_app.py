@@ -867,11 +867,10 @@ class BotDatabaseTests(unittest.TestCase):
             app.normalize_command_text("/reply@ExampleBot 123 hello"),
             "/reply 123 hello",
         )
-        self.assertEqual(
-            app.WELCOME_TEXT,
-            "<b>统一留言聊天入口</b>\n\n"
-            "请直接在这里发送消息，我看到后会通过 Bot 回复你。",
-        )
+        self.assertTrue(app.WELCOME_TEXT.startswith("<b>统一留言聊天入口</b>\n\n"))
+        self.assertIn("无需另行私聊", app.WELCOME_TEXT)
+        self.assertNotIn("审核", app.WELCOME_TEXT)
+        self.assertNotIn("模型", app.WELCOME_TEXT)
 
     def test_telegram_http_errors_do_not_expose_bot_token(self) -> None:
         response = httpx.Response(

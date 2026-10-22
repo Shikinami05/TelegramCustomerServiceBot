@@ -119,6 +119,7 @@ def initialize(db_path: Path) -> None:
                 unread_count INTEGER NOT NULL DEFAULT 0,
                 last_inbound_seq INTEGER NOT NULL DEFAULT 0,
                 last_read_seq INTEGER NOT NULL DEFAULT 0,
+                archived_at DATETIME,
                 last_user_message_at DATETIME,
                 last_admin_reply_at DATETIME,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -257,6 +258,7 @@ def initialize(db_path: Path) -> None:
         conversation_columns = {row["name"] for row in conn.execute("PRAGMA table_info(conversations)")}
         ensure_column(conn, "conversations", "last_inbound_seq", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "conversations", "last_read_seq", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "conversations", "archived_at", "DATETIME")
         if "last_inbound_seq" not in conversation_columns:
             conn.execute("UPDATE conversations SET last_inbound_seq = MAX(unread_count, 0)")
         ensure_column(conn, "inbound_events", "conversation_seq", "INTEGER NOT NULL DEFAULT 0")

@@ -89,6 +89,12 @@ class Settings:
     spam_rules_enabled: bool = True
 
     @property
+    def moderation_mode_label(self) -> str:
+        if self.ai_moderation_enabled:
+            return "规则 + AI" if self.spam_rules_enabled else "仅 AI"
+        return "仅本地规则" if self.spam_rules_enabled else "已暂停"
+
+    @property
     def moderation_key(self) -> str:
         return self.ai_api_key or (self.deepseek_api_key if self.ai_provider == "deepseek" else "")
 

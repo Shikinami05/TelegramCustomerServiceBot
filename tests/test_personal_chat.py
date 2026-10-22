@@ -185,11 +185,140 @@ class PersonalChatTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_non_admin_cannot_read_or_block_or_change_settings(self):
         self.receive()
-        for data in ("read:50:1", "blacklist_confirm:50", "ai:rules_off", "settings:panel"):
+        for data in ("read:50:1", "read_all:all:1", "delete:50", "delete_confirm:50:1",
+                     "blacklist_confirm:50", "ai:rules_off", "settings:panel"):
             await app.handle_callback(self.callback(data, admin=99))
             self.assertEqual(self.answer.await_args.args[1], "无权限")
         self.assertEqual(conversations.get(self.db, 50)["unread_count"], 1)
         self.assertFalse(app.is_blacklisted(50))
+
+    async def test_mark_all_read_covers_all_pages_and_preserves_new_arrivals(self):
+        for index in range(25):
+            self.receive(user=500 + index, update=100 + index)
+
+        async def answer(*args):
+            self.receive(user=500, update=200, message_id=11)
+            self.receive(user=600, update=201, message_id=12)
+            return True
+
+        self.answer.side_effect = answer
+        await app.handle_callback(self.callback("read_all:all:2"))
+        self.assertIn("25 个聊天", self.answer.await_args.args[1])
+        self.assertEqual(conversations.queue_counts(self.db)["inbox"], 2)
+        self.assertEqual(conversations.get(self.db, 500)["unread_count"], 1)
+        self.assertEqual(conversations.get(self.db, 600)["unread_count"], 1)
+        self.assertEqual(conversations.get(self.db, 524)["unread_count"], 0)
+        database.initialize(self.db)
+        self.assertEqual(conversations.queue_counts(self.db)["inbox"], 2)
+
+    async def test_mark_all_read_skips_hidden_and_blocked_contacts(self):
+        self.receive()
+        self.receive(user=60, update=101)
+        app.blacklist_user(60, 1, "test")
+        await app.handle_callback(self.callback("read_all:inbox:1"))
+        self.assertEqual(conversations.get(self.db, 50)["unread_count"], 0)
+        self.assertEqual(conversations.get(self.db, 60)["unread_count"], 1)
+        self.assertEqual(conversations.mark_all_read(self.db), 0)
+
+    async def test_delete_requires_confirmation_and_keeps_history_and_reply_mapping_after_restart(self):
+        self.receive()
+        delivery = deliveries.claim_next_admin(self.db)
+        deliveries.complete_admin(self.db, delivery, TelegramSendResult(True, message_id=700))
+        app.set_admin_state(1, 50)
+        app.set_admin_state(2, 50)
+        app.set_admin_state(3, 60)
+        before = database.fetchone(self.db, "SELECT COUNT(*) FROM message_logs")[0]
+        await app.handle_callback(self.callback("more:50", message_id=701))
+        self.assertIn("删除会话", str(self.edit.await_args))
+        await app.handle_callback(self.callback("delete:50", message_id=701))
+        self.assertIsNone(conversations.get(self.db, 50)["archived_at"])
+        buttons = self.edit.await_args.kwargs["reply_markup"]["inline_keyboard"]
+        self.assertEqual((buttons[0][0]["callback_data"], buttons[0][0]["style"]), ("delete_confirm:50:1", "danger"))
+        await app.handle_callback(self.callback("delete_confirm:50:1", message_id=701))
+        database.initialize(self.db)
+        self.assertIsNotNone(conversations.get(self.db, 50)["archived_at"])
+        self.assertEqual(conversations.queue_counts(self.db), {"inbox": 0, "all": 0})
+        self.assertEqual(database.fetchone(self.db, "SELECT COUNT(*) FROM message_logs")[0], before)
+        self.assertEqual(app.get_message_link(1, 700)["user_chat_id"], 50)
+        self.assertIsNone(app.get_admin_state(1))
+        self.assertIsNone(app.get_admin_state(2))
+        self.assertEqual(app.get_admin_state(3), 60)
+        with patch.object(app, "copy_message", AsyncMock(return_value=TelegramSendResult(True, message_id=800))) as copy:
+            await app.handle_admin_message(self.message(user=1, message_id=702, text="reply",
+                                                        reply_to_message={"message_id": 700}), 300)
+        self.assertEqual(copy.await_args.args[0], 50)
+        self.assertFalse(app.is_blacklisted(50))
+
+    async def test_new_message_restores_deleted_conversation_and_old_confirmation_cannot_delete_it(self):
+        self.receive()
+        await app.handle_callback(self.callback("delete_confirm:50:1"))
+        await app.handle_callback(self.callback("delete_confirm:50:1"))
+        self.receive(update=101, message_id=11)
+        self.assertIsNone(conversations.get(self.db, 50)["archived_at"])
+        self.assertEqual(conversations.queue_counts(self.db), {"inbox": 1, "all": 1})
+        await app.handle_callback(self.callback("delete_confirm:50:1"))
+        self.assertIn("有新留言", self.answer.await_args.args[1])
+        self.assertEqual(conversations.get(self.db, 50)["unread_count"], 1)
+        self.assertIsNone(conversations.get(self.db, 50)["archived_at"])
+
+    async def test_deleting_with_stale_confirmation_does_not_mark_new_messages_read(self):
+        self.receive()
+        await app.handle_callback(self.callback("delete:50"))
+        self.receive(update=101, message_id=11)
+        app.set_admin_state(1, 50)
+        await app.handle_callback(self.callback("delete_confirm:50:1"))
+        self.assertEqual(conversations.get(self.db, 50)["unread_count"], 2)
+        self.assertIsNone(conversations.get(self.db, 50)["archived_at"])
+        self.assertEqual(app.get_admin_state(1), 50)
+
+    async def test_chat_controls_reject_group_and_malformed_callbacks(self):
+        self.receive()
+        for value in ("delete_confirm:50:-1", "delete_confirm:50:１", "delete_confirm:50:1:2",
+                      "delete_confirm:50:" + "9" * 19, "read_all:closed:1", "read_all:all:0"):
+            await app.handle_callback(self.callback(value))
+        for value in ("read_all:all:1", "delete_confirm:50:1"):
+            callback = self.callback(value)
+            callback["message"]["chat"] = {"id": -100, "type": "supergroup"}
+            await app.handle_callback(callback)
+            self.assertIn("私聊", self.answer.await_args.args[1])
+        self.assertEqual(conversations.get(self.db, 50)["unread_count"], 1)
+        self.assertIsNone(conversations.get(self.db, 50)["archived_at"])
+
+    async def test_original_builtin_rules_handle_ad_examples_but_not_isolated_terms(self):
+        for text in ("幸运哈希开桌，首充有奖励，进群领取额度。", "刷单日结，联系领取任务。",
+                     "成品号批发，私聊获取清单。", "哈希下注，充值奖励，联系客服。"):
+            self.assertIsNotNone(spam_rules.check(self.db, text), text)
+        for text in ("哈希下注", "哈希投注", "哈希", "USDT", "兼职", "https://example.com",
+                     "这是举报：幸运哈希开桌，首充有奖励，进群领取额度。"):
+            self.assertIsNone(spam_rules.check(self.db, text), text)
+        self.assertEqual(spam_rules.read_rules(self.db), [])
+
+    async def test_chat_page_copy_is_structured_and_keeps_telegram_limits(self):
+        self.receive()
+        for text in (app.WELCOME_TEXT, app.format_admin_dashboard(1), app.format_user_detail(50)):
+            self.assertGreater(len(text), 60)
+            self.assertLess(len(text.encode("utf-16-le")) // 2, 4096)
+            self.assertEqual(text.count("<b>"), text.count("</b>"))
+        await app.show_conversation_queue(1, "all")
+        buttons = {button["callback_data"] for row in self.send.await_args.kwargs["reply_markup"]["inline_keyboard"] for button in row}
+        self.assertIn("read_all:all:1", buttons)
+        self.assertIn("时间：", self.send.await_args.args[1])
+
+    async def test_long_emoji_names_and_histories_fit_telegram_utf16_budget(self):
+        for index in range(10):
+            chat_id = 500 + index
+            self.receive(user=chat_id, update=100 + index)
+            database.execute(self.db, "UPDATE users SET first_name=?,last_message=? WHERE chat_id=?",
+                             ("\U0001f600" * 64, "\U0001f600" * 300, chat_id))
+            app.add_message_log(500, "user", 500, "\U0001f600" * 300, index + 50)
+        for text in (app.format_admin_dashboard(1), app.format_user_detail(500),
+                     app.format_conversation_queue("all", app.get_conversation_queue("all"))):
+            self.assertLessEqual(len(text.encode("utf-16-le")) // 2, 4096)
+            self.assertEqual(text.count("<b>"), text.count("</b>"))
+        await app.handle_callback(self.callback("delete:500"))
+        for row in self.edit.await_args.kwargs["reply_markup"]["inline_keyboard"]:
+            for button in row:
+                self.assertLessEqual(len(button["callback_data"].encode()), 64)
 
     async def test_menu_and_welcome_keep_the_requested_entries(self):
         self.assertEqual({entry["command"] for entry in manage_webhook.ADMIN_COMMANDS},
