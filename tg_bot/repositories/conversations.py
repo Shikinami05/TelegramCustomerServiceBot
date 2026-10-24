@@ -292,7 +292,8 @@ def list_queue(
         SELECT c.chat_id, c.owner_admin_id, c.status, c.unread_count, c.last_inbound_seq,
                c.last_user_message_at, c.last_admin_reply_at,
                c.updated_at, c.closed_at,
-               u.username, u.first_name, u.last_name, u.last_message
+               u.username, u.first_name, u.last_name, u.last_message,
+               EXISTS(SELECT 1 FROM blacklists b WHERE b.chat_id=c.chat_id) AS is_blocked
         FROM conversations c
         LEFT JOIN users u ON u.chat_id = c.chat_id
         WHERE {where_clause}

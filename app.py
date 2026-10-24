@@ -58,6 +58,8 @@ MESSAGE_RETENTION_DAYS = SETTINGS.message_retention_days
 UPDATE_PROCESSING_TIMEOUT_SECONDS = SETTINGS.update_processing_timeout_seconds
 ADMIN_REPLY_STATE_TTL_SECONDS = SETTINGS.admin_reply_state_ttl_seconds
 TELEGRAM_INLINE_RETRY_MAX_SECONDS = SETTINGS.telegram_inline_retry_max_seconds
+CALLBACK_ACK_TIMEOUT_SECONDS = 1.5
+ADMIN_VIEW_TIMEOUT_SECONDS = 6.0
 WEBHOOK_MAX_BODY_BYTES = 1024 * 1024
 AI_MODERATION_ENABLED = SETTINGS.ai_moderation_enabled
 DISPLAY_TIMEZONE_NAME = SETTINGS.display_timezone_name
@@ -432,7 +434,7 @@ async def answer_callback_query(callback_query_id: str, text: str = "") -> bool:
     if text:
         payload["text"] = text
     try:
-        await tg("answerCallbackQuery", payload)
+        await asyncio.wait_for(tg("answerCallbackQuery", payload), timeout=CALLBACK_ACK_TIMEOUT_SECONDS)
     except Exception as exc:
         logger.warning("answerCallbackQuery failed error=%s", exc)
         return False
@@ -968,8 +970,8 @@ def chat_label_html(chat_id: int) -> str:
     return escape_html_limited(row_user_label(user) if user else "未命名聯絡人", 90)
 
 
-def format_admin_dashboard(admin_id: int) -> str:
-    counts = get_queue_counts()
+def format_admin_dashboard(admin_id: int, *, counts: dict[str, int] | None = None) -> str:
+    counts = get_queue_counts() if counts is None else counts
     target = get_admin_state(admin_id)
     return ui.dashboard(counts, chat_label_html(target) if target is not None else None)
 
@@ -977,14 +979,17 @@ def format_admin_dashboard(admin_id: int) -> str:
 def format_conversation_queue(
     queue_name: str, rows: list[sqlite3.Row], page: int = 1,
     total_pages: int = 1, total_count: int | None = None,
+    *, counts: dict[str, int] | None = None,
 ) -> str:
     total = len(rows) if total_count is None else total_count
-    lines = [ui.queue_heading(queue_name, total, page, total_pages, get_queue_counts(), DISPLAY_TIMEZONE_NAME)]
+    counts = get_queue_counts() if counts is None else counts
+    lines = [ui.queue_heading(queue_name, total, page, total_pages, counts, DISPLAY_TIMEZONE_NAME)]
     if not rows:
         lines.append("沒有未讀訊息。" if queue_name == "inbox" else "還沒有聊天記錄。")
     for index, row in enumerate(rows, start=(page - 1) * ADMIN_PAGE_SIZE + 1):
         unread = int(row["unread_count"] or 0)
-        state = "已封鎖" if is_blacklisted(int(row["chat_id"])) else (f"未讀 {unread}" if unread else "已讀")
+        blocked = bool(row["is_blocked"]) if "is_blocked" in row.keys() else is_blacklisted(int(row["chat_id"]))
+        state = "已封鎖" if blocked else (f"未讀 {unread}" if unread else "已讀")
         lines.append(
             f"<b>{index}. {escape_html_limited(row_user_label(row), 70)}</b>\n"
             f"{state} · {compact_timestamp(row['last_user_message_at'])}\n"
@@ -1022,8 +1027,8 @@ def admin_user_keyboard(chat_id: int, viewer_admin_id: int | None = None, *, rea
     )
 
 
-def admin_dashboard_keyboard(admin_id: int | None = None) -> dict[str, Any]:
-    counts = get_queue_counts()
+def admin_dashboard_keyboard(admin_id: int | None = None, *, counts: dict[str, int] | None = None) -> dict[str, Any]:
+    counts = get_queue_counts() if counts is None else counts
     return keyboards.admin_dashboard_keyboard(counts, active_chat_id=get_admin_state(admin_id) if admin_id is not None else None)
 
 
@@ -1034,10 +1039,12 @@ def pagination_navigation_row(callback_prefix: str, page: int, total_pages: int)
 def conversation_queue_keyboard(
     rows: list[sqlite3.Row], queue_name: str, viewer_admin_id: int | None = None,
     page: int = 1, total_pages: int = 1,
+    *, counts: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     return keyboards.conversation_queue_keyboard(
         rows, queue_name, viewer_admin_id=viewer_admin_id,
-        page=page, total_pages=total_pages, page_size=ADMIN_PAGE_SIZE, counts=get_queue_counts(),
+        page=page, total_pages=total_pages, page_size=ADMIN_PAGE_SIZE,
+        counts=get_queue_counts() if counts is None else counts,
         can_cleanup=viewer_admin_id is not None and is_owner(viewer_admin_id),
     )
 
@@ -1054,13 +1061,25 @@ async def present_admin_view(
     admin_id: int, text: str, reply_markup: dict[str, Any],
     callback: dict[str, Any] | None = None,
 ) -> bool:
-    if callback:
-        message = callback.get("message") or {}
-        if (message.get("chat", {}).get("id") == admin_id and isinstance(message.get("message_id"), int)
-                and get_message_link(admin_id, message["message_id"]) is None):
-            if await edit_message_text(admin_id, message["message_id"], text, reply_markup=reply_markup):
-                return True
-    return bool(await send_message(admin_id, text, reply_markup=reply_markup))
+    async def render() -> bool:
+        if callback:
+            message = callback.get("message") or {}
+            if (message.get("chat", {}).get("id") == admin_id and isinstance(message.get("message_id"), int)
+                    and get_message_link(admin_id, message["message_id"]) is None):
+                if (str(callback.get("data", "")).startswith("refresh:")
+                        and message.get("text") == html_to_plain_text(text)
+                        and message.get("reply_markup") == reply_markup):
+                    return True
+                if await edit_message_text(admin_id, message["message_id"], text, reply_markup=reply_markup):
+                    return True
+        return bool(await send_message(admin_id, text, reply_markup=reply_markup))
+
+    try:
+        return await asyncio.wait_for(render(), timeout=ADMIN_VIEW_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        # A timed-out edit may have arrived; do not blindly send another panel.
+        logger.warning("Administrator view timed out admin_id=%s", admin_id)
+        return False
 
 
 async def show_admin_dashboard(admin_id: int, callback: dict[str, Any] | None = None,
@@ -1068,7 +1087,9 @@ async def show_admin_dashboard(admin_id: int, callback: dict[str, Any] | None = 
     if not preserve_reply:
         clear_admin_state(admin_id)
     moderation_repository.cancel_config_input(DB_PATH, admin_id)
-    await present_admin_view(admin_id, ui.notice(notice) + format_admin_dashboard(admin_id), admin_dashboard_keyboard(admin_id), callback)
+    counts = get_queue_counts()
+    await present_admin_view(admin_id, ui.notice(notice) + format_admin_dashboard(admin_id, counts=counts),
+                             admin_dashboard_keyboard(admin_id, counts=counts), callback)
 
 
 async def show_conversation_queue(
@@ -1077,12 +1098,13 @@ async def show_conversation_queue(
 ) -> None:
     clear_admin_state(admin_id)
     moderation_repository.cancel_config_input(DB_PATH, admin_id)
-    total = count_conversation_queue(queue_name)
+    counts = get_queue_counts()
+    total = counts[queue_name]
     page, pages, offset = paginate(page, total)
     rows = get_conversation_queue(queue_name, limit=ADMIN_PAGE_SIZE, offset=offset)
     await present_admin_view(
-        admin_id, ui.notice(notice) + format_conversation_queue(queue_name, rows, page, pages, total),
-        conversation_queue_keyboard(rows, queue_name, admin_id, page, pages), callback,
+        admin_id, ui.notice(notice) + format_conversation_queue(queue_name, rows, page, pages, total, counts=counts),
+        conversation_queue_keyboard(rows, queue_name, admin_id, page, pages, counts=counts), callback,
     )
 
 
@@ -1125,6 +1147,7 @@ async def show_settings(admin_id: int, callback: dict[str, Any] | None = None) -
     await present_admin_view(
         admin_id, "<b>聊天設定</b>\n\n"
         f"<b>介面與閱讀</b>\n介面語言：繁體中文\n顯示時區：{DISPLAY_TIMEZONE_NAME}\n"
+        f"執行版本：{APP_VERSION}\n帳號角色：{'負責人' if is_owner(admin_id) else '管理員'}\n"
         "未讀狀態：管理員共用\n收件範圍：Bot 私聊\n\n"
         f"<b>聯絡人管理</b>\n已封鎖聯絡人：{blocked}\n"
         "刪除會話只整理列表；封鎖才會停止接收對方的留言。\n\n"
@@ -1754,7 +1777,11 @@ async def handle_admin_message(message: dict[str, Any], update_id: int | None = 
 async def handle_callback(callback: dict[str, Any]) -> None:
     admin_id = int(callback.get("from", {}).get("id", 0))
     if is_admin(admin_id) and is_private_callback(callback):
-        async with admin_ui_locks.setdefault(admin_id, asyncio.Lock()):
+        lock = admin_ui_locks.setdefault(admin_id, asyncio.Lock())
+        if lock.locked() and str(callback.get("data", "")).startswith(("refresh:", "queue:", "contact:")):
+            await answer_callback_query(callback["id"], "上一項操作仍在處理，請稍後再重新整理")
+            return
+        async with lock:
             await dispatch_callback(callback)
     else:
         await dispatch_callback(callback)
@@ -1869,13 +1896,13 @@ async def dispatch_callback(callback: dict[str, Any]) -> None:
         else:
             await answer_callback_query(callback_id, "頁面無效")
         return
-    if action in {"queue", "read_all"}:
+    if action in {"queue", "read_all", "refresh"}:
         queue_name, _, raw_page = value.partition(":")
         page = parse_callback_page(raw_page or None)
         if page is None:
             await answer_callback_query(callback_id, "頁碼無效")
             return
-        if queue_name not in QUEUE_LABELS and not (action == "read_all" and queue_name == "dashboard" and page == 1):
+        if queue_name not in QUEUE_LABELS and not (action in {"read_all", "refresh"} and queue_name == "dashboard" and page == 1):
             await answer_callback_query(callback_id, "該列表已更新，請返回首頁")
             return
         notice = ""
@@ -1887,8 +1914,12 @@ async def dispatch_callback(callback: dict[str, Any]) -> None:
             notice = ui.all_read_notice(count)
             await answer_callback_query(callback_id, notice)
         else:
-            clear_admin_state(admin_id)
-            await answer_callback_query(callback_id)
+            if queue_name != "dashboard":
+                clear_admin_state(admin_id)
+            if action == "refresh":
+                await answer_callback_query(callback_id, "正在重新整理；沒有新內容時畫面保持不變")
+            else:
+                await answer_callback_query(callback_id)
         if queue_name == "dashboard":
             await show_admin_dashboard(admin_id, callback, preserve_reply=True, notice=notice)
         else:

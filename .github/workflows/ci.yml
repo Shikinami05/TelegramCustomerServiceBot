@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.12"]
+        python-version: ["3.10", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -26,4 +26,12 @@ jobs:
       - run: python -m compileall -q tg_bot
       - run: python -m py_compile app.py scripts/manage_webhook.py scripts/manage_backup.py scripts/manage_moderation.py
       - run: python -m unittest discover -s tests -v
-
+      - name: Test upgrades with existing AI configuration
+        env:
+          AI_API_KEY: sk-ci-synthetic-configured-key
+          AI_MODEL: deepseek-v4-flash
+          AI_PROVIDER: deepseek
+          AI_MODERATION_ENABLED: "true"
+          ADMIN_IDS: "987654321"
+          OWNER_IDS: "987654321"
+        run: python -m unittest discover -s tests -v
