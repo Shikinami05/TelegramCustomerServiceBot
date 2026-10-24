@@ -42,7 +42,14 @@ class BotDatabaseTests(unittest.TestCase):
         app.USER_RATE_LIMIT_COOLDOWN_SECONDS = 300
         app.init_db()
         patches = [
-            patch.object(app, "SETTINGS", replace(app.SETTINGS, spam_rules_enabled=False)),
+            patch.object(app, "SETTINGS", replace(app.SETTINGS, spam_rules_enabled=False,
+                         bot_token="test-token", webhook_secret="test-secret",
+                         admin_ids=frozenset({1, 2}), owner_ids=frozenset({1}))),
+            patch.object(app, "ADMIN_IDS", {1, 2}),
+            patch.object(app, "OWNER_IDS", {1}),
+            patch.object(app, "WEBHOOK_SECRET", "test-secret"),
+            patch.object(app, "BOT_TOKEN", "test-token"),
+            patch.object(app, "API_BASE", "https://api.telegram.org/bottest-token"),
             patch.object(app, "send_admin_reply_status", AsyncMock()),
         ]
         for patcher in patches:

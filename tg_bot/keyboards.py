@@ -59,7 +59,7 @@ def admin_dashboard_keyboard(counts: dict[str, int], *, show_ai_settings: bool =
         [(f"未讀留言 · {counts['inbox']}", "queue:inbox:1", "primary"),
          (f"所有會話 · {counts['all']}", "queue:all:1")],
         [(ui.ALL_READ, "read_all:dashboard:1", "success")],
-        [("設定", "settings:panel"), (ui.REFRESH, "admin:dashboard")],
+        [("設定", "settings:panel"), (ui.REFRESH, "refresh:dashboard:1")],
     ]
     if active_chat_id is not None:
         rows.insert(0, [("查看目前會話", f"detail:{active_chat_id}"),
@@ -82,7 +82,7 @@ def queue_navigation_rows(queue_name: str, page: int, total_pages: int,
     rows: list[list[ButtonSpec]] = [
         [(f"未讀 {counts['inbox']}", "queue:inbox:1"), (f"全部 {counts['all']}", "queue:all:1")],
         [(ui.ALL_READ, f"read_all:{queue_name}:{page}", "success"),
-         (ui.REFRESH, f"queue:{queue_name}:{page}")],
+         (ui.REFRESH, f"refresh:{queue_name}:{page}")],
     ]
     if total_pages > 1:
         rows.append(pagination_navigation_row(f"queue:{queue_name}", page, total_pages))
@@ -95,14 +95,15 @@ def conversation_queue_keyboard(rows: list[Any], queue_name: str, *, viewer_admi
                                 counts: dict[str, int], can_cleanup: bool = False) -> dict[str, Any]:
     navigation = queue_navigation_rows(queue_name, page, total_pages, counts)
     buttons: list[list[ButtonSpec]] = navigation[:2]
+    if queue_name == "all":
+        label = "刪除所有會話" if can_cleanup else "刪除所有會話（限負責人）"
+        buttons.append([(label, "cleanup:all", "danger")])
     for index, row in enumerate(rows, start=(page - 1) * page_size + 1):
         name = " ".join(str(row[key] or "") for key in ("first_name", "last_name")).strip()
         name = name or (f"@{row['username']}" if row["username"] else "未命名聯絡人")
         name = " ".join(name.split())
         buttons.append([(f"{index}. 查看 {truncate_text(name, 22)}", f"user:{row['chat_id']}:{queue_name}:{page}")])
     buttons.extend(navigation[2:])
-    if can_cleanup and queue_name == "all" and counts["all"]:
-        buttons.insert(-1, [("刪除所有會話", "cleanup:all", "danger")])
     return inline_keyboard(buttons)
 
 

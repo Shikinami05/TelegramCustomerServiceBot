@@ -235,7 +235,7 @@ class PersonalChatTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("防廣告", text)
             home = {button["callback_data"]: button["text"] for row in self.send.await_args.kwargs["reply_markup"]["inline_keyboard"] for button in row}
             self.assertEqual(home["read_all:dashboard:1"], "全部標為已讀")
-            self.assertEqual(home["admin:dashboard"], "重新整理")
+            self.assertEqual(home["refresh:dashboard:1"], "重新整理")
             for queue in ("inbox", "all"):
                 await app.show_conversation_queue(1, queue)
                 rows = self.send.await_args.kwargs["reply_markup"]["inline_keyboard"]

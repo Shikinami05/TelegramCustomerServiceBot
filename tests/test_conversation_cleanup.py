@@ -39,12 +39,17 @@ class ConversationCleanupTests(unittest.IsolatedAsyncioTestCase):
         return {"id": "callback", "from": {"id": admin}, "data": data,
                 "message": {"message_id": 900, "chat": {"id": admin, "type": "private"}}}
 
-    async def test_owner_entry_is_only_on_all_list_and_requires_confirmation(self):
+    async def test_cleanup_entry_stays_at_top_of_all_list_and_requires_confirmation(self):
         self.receive()
-        for admin, queue, visible in ((1, "all", True), (1, "inbox", False), (2, "all", False)):
+        for admin, queue, visible in ((1, "all", True), (1, "inbox", False), (2, "all", True)):
             await app.show_conversation_queue(admin, queue)
-            callbacks = {button["callback_data"] for row in self.present.await_args.args[2]["inline_keyboard"] for button in row}
+            rows = self.present.await_args.args[2]["inline_keyboard"]
+            callbacks = {button["callback_data"] for row in rows for button in row}
             self.assertEqual("cleanup:all" in callbacks, visible)
+            if visible:
+                self.assertEqual(rows[2][0]["callback_data"], "cleanup:all")
+                if admin == 2:
+                    self.assertIn("限負責人", rows[2][0]["text"])
         app.set_admin_state(1, 50)
         await app.handle_callback(self.callback("cleanup:all"))
         self.assertIsNone(app.get_admin_state(1))
@@ -55,6 +60,13 @@ class ConversationCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(markup["inline_keyboard"][0][0]["callback_data"].encode()), 64)
         await app.handle_callback(self.callback(markup["inline_keyboard"][0][0]["callback_data"]))
         self.assertEqual(conversations.count_queue(self.db, "all"), 0)
+
+    async def test_empty_all_list_keeps_cleanup_control_and_reports_nothing_to_remove(self):
+        await app.show_conversation_queue(1, "all")
+        rows = self.present.await_args.args[2]["inline_keyboard"]
+        self.assertEqual(rows[2][0]["callback_data"], "cleanup:all")
+        await app.handle_callback(self.callback("cleanup:all"))
+        self.assertIn("沒有可刪除", self.answer.await_args.args[1])
 
     async def test_confirmation_survives_restart_and_preserves_history_mapping_and_blocks(self):
         self.receive()

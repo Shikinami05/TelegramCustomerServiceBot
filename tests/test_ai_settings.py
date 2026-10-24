@@ -32,7 +32,10 @@ class AISettingsTests(unittest.IsolatedAsyncioTestCase):
         self.env = self.root / ".env"
         self.env.write_text("BOT_TOKEN=keep-bot\nWEBHOOK_SECRET=keep-webhook\nAI_MODERATION_ENABLED=false\n", encoding="utf-8")
         database.initialize(self.db)
-        self.settings = replace(app.SETTINGS, ai_moderation_enabled=False, deepseek_api_key="", deepseek_model="deepseek-flash")
+        self.settings = replace(app.SETTINGS, ai_moderation_enabled=False, spam_rules_enabled=True,
+                                ai_provider="deepseek", ai_api_key="", ai_model="", deepseek_api_key="",
+                                deepseek_model="deepseek-flash", moderation_media_policy="hold",
+                                moderation_daily_limit=500)
         self.send = AsyncMock(return_value=TelegramSendResult(ok=True, message_id=100))
         self.telegram = AsyncMock(return_value={"ok": True, "result": True})
         self.clear_reply = lambda admin: None
@@ -51,6 +54,13 @@ class AISettingsTests(unittest.IsolatedAsyncioTestCase):
         return {"from": {"id": admin}, "chat": {"id": admin, "type": "private"},
                 "text": text, "message_id": 200,
                 "reply_to_message": {"message_id": reply, "text": ai_settings.INPUT_MARKER}, **extra}
+
+    async def test_fixture_never_inherits_deployment_ai_credentials_or_model(self):
+        self.assertEqual(self.settings.moderation_key, "")
+        self.assertEqual(self.settings.ai_provider, "deepseek")
+        self.assertEqual(self.settings.moderation_model, "deepseek-flash")
+        self.assertFalse(self.settings.ai_moderation_enabled)
+        self.assertTrue(self.settings.spam_rules_enabled)
 
     async def test_owner_menu_is_not_in_regular_admin_or_user_scope(self):
         for menu in (manage_webhook.USER_COMMANDS, manage_webhook.ADMIN_COMMANDS):
