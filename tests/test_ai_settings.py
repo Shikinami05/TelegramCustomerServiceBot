@@ -209,13 +209,54 @@ class AISettingsTests(unittest.IsolatedAsyncioTestCase):
             await self.controller.message(self.message())
         self.assertEqual(self.settings.deepseek_api_key, "")
 
-    async def test_simple_panel_offers_three_modes_without_separate_switches(self):
+    async def test_simple_panel_has_one_primary_action_and_secondary_settings(self):
         await self.controller.panel(1)
         buttons = {button["callback_data"] for row in self.send.await_args.kwargs["reply_markup"]["inline_keyboard"] for button in row}
-        self.assertTrue({"ai:mode:rules", "ai:mode:ai", "ai:mode:off", "ai:setup", "ai:rules", "ai:advanced"} <= buttons)
-        self.assertFalse({"ai:rules_on", "ai:rules_off", "ai:enable", "ai:disable"} & buttons)
-        self.assertIn("不會自動封鎖", self.send.await_args.args[1])
+        self.assertTrue({"ai:setup", "ai:connection", "ai:check", "ai:policy", "ai:advanced"} <= buttons)
+        self.assertFalse({"ai:mode:rules", "ai:mode:off", "ai:rules_on", "ai:rules_off", "ai:enable", "ai:disable"} & buttons)
+        self.assertIn("不自動封鎖", self.send.await_args.args[1])
         self.assertLess(len(self.send.await_args.args[1]), 2000)
+
+    async def test_primary_action_matches_key_and_enabled_state_without_hiding_status(self):
+        for key, enabled, expected in (("", False, "ai:setup"), ("sk-configured-test", False, "ai:mode:ai"),
+                                        ("sk-configured-test", True, "ai:disable")):
+            self.settings = replace(self.settings, ai_api_key=key, deepseek_api_key="", ai_moderation_enabled=enabled)
+            await self.controller.panel(1)
+            rows = self.send.await_args.kwargs["reply_markup"]["inline_keyboard"]
+            self.assertEqual(rows[0][0]["callback_data"], expected)
+            self.assertIn("目前模式", self.send.await_args.args[1])
+            if key:
+                self.assertNotIn(key, self.send.await_args.args[1])
+        with patch.object(ai_settings, "probe_key", new_callable=AsyncMock) as probe:
+            await self.controller.callback(1, "mode:ai")
+        probe.assert_not_awaited()
+        self.assertIn("目前已啟用", self.send.await_args.args[1])
+
+    async def test_policy_and_connection_pages_are_bounded_and_never_send_keys(self):
+        self.settings = replace(self.settings, ai_api_key="sk-do-not-display-key")
+        for action in ("connection", "policy", "advanced"):
+            await self.controller.callback(1, action)
+            text = self.send.await_args.args[1]
+            self.assertLess(len(text.encode("utf-16-le")) // 2, 4096)
+            self.assertNotIn("sk-do-not-display-key", text)
+            self.assertEqual(text.count("<b>"), text.count("</b>"))
+        await self.controller.callback(1, "policy")
+        self.assertIn("不送歷史、ID、暱稱", self.send.await_args.args[1])
+        self.assertIn("不會自動訓練", self.send.await_args.args[1])
+        self.telegram.assert_not_awaited()
+
+    async def test_nonowner_direct_settings_helpers_cannot_open_input_or_advanced(self):
+        await self.controller.prompt(2, "setup")
+        await self.controller.advanced(2)
+        self.assertIsNone(moderation.pending_config_input(self.db, 2))
+        self.assertNotIn("AI 連線設定", str(self.send.await_args_list))
+
+    async def test_setup_routes_provider_and_model_changes_to_connection_page(self):
+        await self.controller.callback(1, "setup")
+        rows = self.send.await_args.kwargs["reply_markup"]["inline_keyboard"]
+        self.assertEqual(rows[1][0]["callback_data"], "ai:connection")
+        self.assertEqual(rows[-1][0]["text"], "返回防廣告")
+        self.assertIsNone(moderation.pending_config_input(self.db, 1))
 
     async def test_original_rules_page_escapes_custom_text_and_fits_telegram(self):
         from tg_bot.services import spam_rules
@@ -270,7 +311,7 @@ class AISettingsTests(unittest.IsolatedAsyncioTestCase):
             probe.assert_not_awaited()
             self.assertFalse(self.settings.ai_moderation_enabled)
             await self.controller.callback(1, "mode_ai_confirm:deepseek")
-        self.assertEqual(self.settings.moderation_mode_label, "規則 + AI")
+        self.assertEqual(self.settings.moderation_mode_label, "AI 語意審核")
         await self.controller.callback(1, "mode:rules")
         self.assertFalse(self.settings.ai_moderation_enabled)
         self.assertTrue(self.settings.spam_rules_enabled)

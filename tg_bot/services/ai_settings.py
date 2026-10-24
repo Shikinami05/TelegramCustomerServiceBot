@@ -17,6 +17,7 @@ from tg_bot.moderation_config import configure_moderation
 from tg_bot.repositories import moderation
 from tg_bot.services import spam_rules
 from tg_bot.services.moderation import classify
+from tg_bot.services.moderation_prompt import PROMPT_VERSION
 from tg_bot.text import escape_html_limited
 
 
@@ -77,29 +78,34 @@ class AISettingsController:
         self.clear_reply(admin_id)
         settings = self.settings()
         provider = PROVIDERS[settings.ai_provider]
+        usage = database.fetchone(self.db_path(), "SELECT requests FROM moderation_usage WHERE day=date('now')")
+        primary = (("暫停 AI 審核", "ai:disable", "danger") if settings.ai_moderation_enabled else
+                   ("啟用 AI 語意審核", "ai:mode:ai", "success") if settings.moderation_key else
+                   ("設定密鑰並啟用", "ai:setup", "primary"))
         text = (
-            "<b>防廣告設定</b>\n\n"
+            "<b>AI 防廣告</b>\n\n"
             f"<b>目前模式：{settings.moderation_mode_label}</b>\n"
-            "疑似廣告會安靜地放進暫存區，不通知對方檢測結果，也不會自動封鎖。\n\n"
-            "<b>選擇保護方式</b>\n"
-            "僅規則：本地辨識明顯的博彩、刷單和招募話術，不呼叫 AI。\n"
-            "規則 + AI：先篩選明顯廣告，再讓 AI 判斷剩餘文字，需設定密鑰。\n"
-            "暫停防廣告：直接接收新留言，已有暫存記錄不變。\n\n"
-            f"<b>AI 設定</b>\n服務商：{provider.name}\n"
+            "正常留言繼續聊天；廣告安靜暫存，不向對方展示判定，也不自動封鎖。\n\n"
+            f"<b>連線設定</b>\n服務商：{provider.name}\n"
             f"模型：<code>{html.escape(settings.moderation_model)}</code>\n"
-            f"密鑰：{'已設定' if settings.moderation_key else '未設定'}"
+            f"密鑰：{'已設定（不代表已通過連線檢查）' if settings.moderation_key else '未設定'}\n\n"
+            f"<b>今日用量</b>\n呼叫：{usage[0] if usage else 0} / {settings.moderation_daily_limit}（UTC）\n"
+            "檢測故障與內容不確定會分開記錄；暫存留言可由你放行。"
         )
         if notice:
             text += "\n\n" + html.escape(notice)
         await self.view(admin_id, text, [
-            [("僅規則", "ai:mode:rules"), ("規則 + AI", "ai:mode:ai", "success")],
-            [("暫停防廣告", "ai:mode:off", "danger")],
-            [("設定 AI", "ai:setup"), ("廣告規則", "ai:rules")],
+            [primary],
+            [("連線設定", "ai:connection"), ("檢查連線", "ai:check")],
+            [("檢視暫存", "moderation:1"), ("判定標準", "ai:policy")],
             [("更多設定", "ai:advanced")],
-            [("暫存區", "moderation:1"), ("返回設定", "settings:panel")],
+            [("返回設定", "settings:panel")],
         ], callback)
 
     async def advanced(self, admin_id: int, callback: dict | None = None) -> None:
+        if not self.is_owner(admin_id):
+            await self.send(admin_id, "僅負責人可管理防廣告設定。")
+            return
         settings = self.settings()
         provider = PROVIDERS[settings.ai_provider]
         usage = database.fetchone(self.db_path(), "SELECT requests FROM moderation_usage WHERE day=date('now')")
@@ -109,17 +115,20 @@ class AISettingsController:
             f"今日呼叫：{usage[0] if usage else 0} / {settings.moderation_daily_limit}（UTC）\n"
             f"無文字媒體：{'直接接收' if settings.moderation_media_policy == 'allow' else '暫存待確認'}",
             [
-                [("服務商", "ai:providers"), ("API 密鑰", "ai:key")],
-                [("模型", "ai:model"), ("測試檢測", "ai:test")],
-                [("廣告規則", "ai:rules"), ("每日限額", "ai:limit")],
-                [("無文字媒體", "ai:media"), ("連線檢查", "ai:check")],
+                [("僅本地規則", "ai:mode:rules"), ("暫停所有審核", "ai:mode:off", "danger")],
+                [("自訂封鎖規則", "ai:rules"), ("每日限額", "ai:limit")],
+                [("無文字媒體", "ai:media"), ("合成樣例測試", "ai:test")],
+                [("連線設定", "ai:connection")],
                 [("返回防廣告", "ai:panel")],
             ], callback)
 
     async def prompt(self, admin_id: int, kind: str, callback: dict | None = None) -> None:
+        if not self.is_owner(admin_id):
+            await self.send(admin_id, "僅負責人可管理防廣告設定。")
+            return
         self.clear_reply(admin_id)
         settings = self.settings()
-        labels = {"rules": "自訂廣告規則，每行填寫「詞語：短語」或「域名：example.com」；傳送「清空」刪除自訂規則", "key": f"{PROVIDERS[settings.ai_provider].name} API Key", "setup": f"{PROVIDERS[settings.ai_provider].name} API Key（驗證成功後啟用規則 + AI）", "model": "完整模型 ID", "limit": "每日呼叫次數（1 至 1000000）"}
+        labels = {"rules": "自訂封鎖規則，每行填寫「詞語：短語」或「域名：example.com」；命中後直接暫存；傳送「清空」刪除自訂規則", "key": f"{PROVIDERS[settings.ai_provider].name} API Key", "setup": f"{PROVIDERS[settings.ai_provider].name} API Key（驗證成功後啟用 AI 語意審核）", "model": "完整模型 ID", "limit": "每日呼叫次數（1 至 1000000）"}
         if callback:
             await self.view(admin_id, f"<b>等待輸入</b>\n\n{labels[kind]}\n3 分鐘內有效。",
                             [[("取消輸入", "ai:panel")]], callback)
@@ -150,13 +159,38 @@ class AISettingsController:
         moderation.cancel_config_input(self.db_path(), admin_id)
         settings = self.settings()
         provider = PROVIDERS[settings.ai_provider]
-        back = [("返回設定", "ai:panel")]
+        back = [("返回防廣告", "ai:panel")]
+        if action == "connection":
+            await self.view(admin_id, f"<b>AI 連線設定</b>\n\n服務商：{provider.name}\n"
+                            f"模型：<code>{html.escape(settings.moderation_model)}</code>\n"
+                            f"密鑰：{'已設定' if settings.moderation_key else '未設定'}\n\n"
+                            "變更服務商會清空舊密鑰並暫停 AI；更新密鑰不會改變目前模式。"
+                            "檢查連線驗證鑑權與模型；合成樣例測試才會呼叫實際審核。",
+                            [[("服務商", "ai:providers"), ("模型", "ai:model")],
+                             [("更新密鑰", "ai:key"), ("檢查連線", "ai:check")], back], callback)
+            return
+        if action == "policy":
+            await self.view(admin_id, "<b>AI 判定標準</b>\n\n"
+                            "<b>判斷意圖，不只看詞語</b>\n一般聊天、合理接洽、分享與舉報優先保留。"
+                            "單獨出現哈希、USDT、兼職、連結或 @帳號不等於廣告；明確招攬投注、充值、"
+                            "導流或可疑任務才會暫存。\n\n"
+                            "<b>規則與 AI</b>\nAI 模式下，內建規則只是提示，由模型複核；"
+                            "本地規則啟用時，你自訂的封鎖詞與域名仍直接暫存，不交給 AI 推翻。\n\n"
+                            "<b>資料範圍</b>\n只送這則留言的文字、說明與隱藏連結，不送歷史、ID、暱稱，"
+                            "不下載媒體或開啟連結。輸入中的指令視為資料，不允許模型執行操作。\n\n"
+                            "放行只處理這則留言，不會自動訓練模型。\n"
+                            f"提示詞版本：<code>{PROMPT_VERSION}</code>",
+                            [[("合成樣例測試", "ai:test")], back], callback)
+            return
+        if action == "mode:ai" and settings.ai_moderation_enabled:
+            await self.panel(admin_id, callback, "AI 語意審核目前已啟用。")
+            return
         if action in {"setup", "mode:ai"}:
             configured = bool(settings.moderation_key) and action == "mode:ai"
             text = (
-                "<b>設定規則 + AI</b>\n\n"
+                "<b>啟用 AI 語意審核</b>\n\n"
                 f"服務商：{provider.name}\n模型：<code>{html.escape(settings.moderation_model)}</code>\n\n"
-                "啟用後，未被本地規則攔截的留言文字、媒體說明和連結會傳送給這家服務商，"
+                "啟用後，除自訂封鎖規則命中的內容，留言文字、媒體說明和連結會傳送給這家服務商，"
                 "可能產生 API 費用；圖片和語音本身不會上傳。\n\n"
                 + ("將先驗證現有密鑰和模型；成功後立即啟用。" if configured else
                    "下一步傳送密鑰，驗證密鑰與模型成功後立即啟用，無需再找開關。"
@@ -164,7 +198,7 @@ class AISettingsController:
             )
             confirm = (("驗證並啟用", f"ai:mode_ai_confirm:{settings.ai_provider}", "success") if configured else
                        ("輸入密鑰並啟用", "ai:setup_input", "primary"))
-            await self.view(admin_id, text, [[confirm], [("更換服務商 / 模型", "ai:advanced")], back], callback)
+            await self.view(admin_id, text, [[confirm], [("更換服務商 / 模型", "ai:connection")], back], callback)
             return
         if action == "advanced":
             await self.advanced(admin_id, callback)
@@ -173,19 +207,20 @@ class AISettingsController:
             rules = spam_rules.format_rules(self.db_path()) or "暫無自訂規則"
             await self.view(admin_id, "<b>廣告規則</b>\n\n" + spam_rules.BUILTIN_RULES_TEXT +
                             "\n\n<b>自訂補充</b>\n詞語按完整短語包含匹配；域名也匹配其子域名。"
-                            "這些規則僅在本地規則啟用時生效，命中後暫存，不自動封鎖。\n\n"
+                            "自訂規則啟用時，命中後直接暫存，AI 不會推翻；內建規則在 AI 模式只提供線索。"
+                            "僅本地規則模式則由本地規則判定，不自動封鎖。\n\n"
                             + escape_html_limited(rules, 2200),
                             [[("編輯自訂規則", "ai:rules_input")], back], callback)
             return
         if action == "providers":
-            await self.view(admin_id, "<b>選擇 AI 服務商</b>\n\n切換服務商將暫停攔截並清空舊密鑰，需重新設定。",
+            await self.view(admin_id, "<b>選擇 AI 服務商</b>\n\n切換服務商將暫停 AI 並清空舊密鑰，需重新設定。本地規則仍按目前開關生效。",
                             [[(item.name, f"ai:provider:{key}")] for key, item in PROVIDERS.items()] + [back], callback)
             return
         if action.startswith("provider:"):
             selected = action.split(":", 1)[1]
             if selected not in PROVIDERS:
                 return
-            await self.view(admin_id, f"切換至 {PROVIDERS[selected].name}？\n將暫停攔截並清空原密鑰。",
+            await self.view(admin_id, f"切換至 {PROVIDERS[selected].name}？\n將暫停 AI 並清空原密鑰，本地規則開關不變。",
                             [[("確認切換", f"ai:provider_set:{selected}", "danger")], back], callback)
             return
         if action == "key":
@@ -211,8 +246,9 @@ class AISettingsController:
         if action in {"enable", "test"}:
             text = (f"<b>啟用防廣告</b>\n\n服務商：{provider.name}\n模型：{html.escape(settings.moderation_model)}\n"
                     "留言文字和連結將傳送至該服務商，會產生 API 費用。" if action == "enable" else
-                    "<b>測試檢測</b>\n\n傳送一條內建測試文字，驗證目前模型的實際呼叫和 JSON 返回。"
-                    "不使用私人留言；計入每日限額，可能產生少量費用。")
+                    "<b>合成樣例測試</b>\n\n傳送兩條本專案原創的合成文字：一般聊天與明確博彩招攬。"
+                    "檢查實際呼叫、JSON 解析與兩例是否符合預期，不代表整體準確率。"
+                    "不使用私人留言；占用 2 次每日額度，可能產生少量費用。")
             await self.view(admin_id, text, [[("確認", f"ai:{action}_confirm:{settings.ai_provider}", "success")], back], callback)
             return
         try:
@@ -247,20 +283,27 @@ class AISettingsController:
                     if not settings.moderation_key or not await probe_key(settings.moderation_key, settings.ai_provider, settings.moderation_model):
                         await self.panel(admin_id, callback, "檢查失敗：請核對服務商、密鑰、模型 ID 和網路。原設定未修改。")
                         return
-                    notice = "鑑權通過，模型在服務商列表中。實際呼叫可使用「測試檢測」。"
+                    notice = "鑑權通過，模型在服務商列表中。實際呼叫可使用「合成樣例測試」。"
                     if action.startswith("test_confirm"):
                         with database.connect(self.db_path()) as conn:
                             conn.execute("INSERT OR IGNORE INTO moderation_usage(day) VALUES(date('now'))")
-                            reserved = conn.execute("UPDATE moderation_usage SET requests=requests+1 WHERE day=date('now') AND requests<?",
-                                                    (settings.moderation_daily_limit,)).rowcount
+                            reserved = conn.execute("UPDATE moderation_usage SET requests=requests+2 WHERE day=date('now') AND requests<=?",
+                                                    (settings.moderation_daily_limit - 2,)).rowcount
                             conn.commit()
                         if not reserved:
-                            notice = "今日呼叫額度已用完，未傳送測試請求。"
+                            notice = "測試需要 2 次額度；今日剩餘不足，未傳送測試請求。"
                         else:
+                            results = []
                             async with httpx.AsyncClient(trust_env=False, follow_redirects=False) as client:
-                                result = await classify(client, settings.moderation_key, settings.moderation_model,
-                                                        "你好，想和你聊聊天。", settings.moderation_timeout_seconds, settings.ai_provider)
-                            notice = ("測試呼叫失敗：" if result.failed else "模型呼叫與解析成功：") + result.reason
+                                for label, text, expected in (
+                                    ("一般聊天", "你好，想和你聊聊天。", "allow"),
+                                    ("博彩招攬", "哈希投注限時加碼，充值領獎，私訊報名進群。", "spam"),
+                                ):
+                                    result = await classify(client, settings.moderation_key, settings.moderation_model,
+                                                            text, settings.moderation_timeout_seconds, settings.ai_provider)
+                                    outcome = "呼叫未完成" if result.failed else "符合預期" if result.verdict == expected else "與預期不符"
+                                    results.append(f"{label}：{outcome}（{result.reason}）")
+                            notice = "；".join(results) + "。只代表這兩個樣例，未更改審核開關。"
                     elif action.startswith(("enable_confirm:", "mode_ai_confirm:")):
                         self.save(admin_id, replace(settings, ai_moderation_enabled=True,
                                                    spam_rules_enabled=True if action.startswith("mode_ai_confirm:") else settings.spam_rules_enabled), "enable")
@@ -274,7 +317,8 @@ class AISettingsController:
                     notice = "本地規則已更新。"
                 elif action == "disable":
                     self.save(admin_id, replace(settings, ai_moderation_enabled=False), "disable")
-                    notice = "AI 審核已暫停，本地規則按其獨立開關生效。歷史暫存仍保留在暫存區。"
+                    notice = ("AI 已暫停，已回到僅本地規則；不再傳送新留言給服務商。" if settings.spam_rules_enabled else
+                              "AI 已暫停；本地規則也未啟用，新留言直接接收。") + "歷史暫存仍保留。"
                 elif action != "panel":
                     return
             await self.panel(admin_id, callback, notice)
@@ -356,7 +400,7 @@ class AISettingsController:
                     await self.panel(admin_id, callback, "輸入格式無效，原設定未修改。")
                     return True
                 self.save(admin_id, updated, f"update_{kind}")
-            notice = ("已儲存並啟用規則 + AI，無需重新啟動。疑似廣告會進入暫存區。" if kind == "setup" else
+            notice = ("已儲存並啟用 AI 語意審核，無需重新啟動。疑似廣告會進入暫存區。" if kind == "setup" else
                       "已儲存並即時生效，無需重新啟動。單獨更新密鑰不改變目前保護模式。")
             await self.panel(admin_id, callback, notice)
         except Exception:

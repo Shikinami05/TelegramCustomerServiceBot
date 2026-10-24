@@ -59,7 +59,8 @@ class ModerationTests(unittest.IsolatedAsyncioTestCase):
         repository.hold(self.db_path, update_id, "待审核")
 
     def response(self, verdict="allow", **fields):
-        return {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps({"verdict": verdict})}}], **fields}
+        code = {"allow": "conversation", "spam": "promotion", "uncertain": "ambiguous"}.get(verdict, "conversation")
+        return {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps({"verdict": verdict, "reason_code": code})}}], **fields}
 
     async def test_api_payload_only_contains_text_and_fixed_endpoint(self):
         calls = []

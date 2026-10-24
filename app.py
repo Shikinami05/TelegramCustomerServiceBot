@@ -1038,6 +1038,7 @@ def conversation_queue_keyboard(
     return keyboards.conversation_queue_keyboard(
         rows, queue_name, viewer_admin_id=viewer_admin_id,
         page=page, total_pages=total_pages, page_size=ADMIN_PAGE_SIZE, counts=get_queue_counts(),
+        can_cleanup=viewer_admin_id is not None and is_owner(viewer_admin_id),
     )
 
 
@@ -1791,6 +1792,48 @@ async def dispatch_callback(callback: dict[str, Any]) -> None:
         await get_ai_settings_controller().callback(admin_id, value, callback)
         return
     moderation_repository.cancel_config_input(DB_PATH, admin_id)
+    if action == "cleanup":
+        if not is_owner(admin_id):
+            await answer_callback_query(callback_id, "僅負責人可刪除所有會話")
+            return
+        if value == "all":
+            clear_admin_state(admin_id)
+            try:
+                token, count = conversation_repository.prepare_cleanup(DB_PATH, admin_id)
+            except ValueError as exc:
+                await answer_callback_query(callback_id, str(exc))
+                return
+            if not count:
+                await answer_callback_query(callback_id, "目前沒有可刪除的會話")
+                await show_conversation_queue(admin_id, "all", callback=callback)
+                return
+            await answer_callback_query(callback_id)
+            await present_admin_view(
+                admin_id, f"<b>刪除所有會話？</b>\n\n目前列出的 {count} 個會話將從所有管理員的列表移除，"
+                "並退出相應的持續回覆。\n\n<b>保留的內容</b>\n聊天記錄、原生 Reply 對應與 Telegram 訊息都會保留，"
+                "不會解除封鎖或刪除暫存留言。\n\n<b>新留言保護</b>\n確認期間新增或收到新留言的會話不會被刪除；"
+                "已移除的會話在對方再次留言後會恢復。\n\n確認有效期為 3 分鐘。",
+                inline_keyboard([[("確認刪除所有會話", f"cleanup:confirm:{token}", "danger")],
+                                 [("保留所有會話", f"cleanup:cancel:{token}")],
+                                 [("返回所有會話", "queue:all:1")]]), callback,
+            )
+            return
+        operation, _, token = value.partition(":")
+        if (operation not in {"confirm", "cancel"} or not token.isascii() or len(token) != 16
+                or any(not (char.isalnum() or char in "-_") for char in token)):
+            await answer_callback_query(callback_id, "確認資料無效")
+            return
+        result = conversation_repository.finish_cleanup(DB_PATH, admin_id, token, cancel=operation == "cancel")
+        if result.status == "archived":
+            notice = f"已移除 {result.archived} 個會話；保留 {result.preserved} 個新增或有新留言的會話。聊天記錄未刪除。"
+        elif result.status == "canceled":
+            notice = "已取消，所有會話與未讀狀態都保留。"
+        else:
+            await answer_callback_query(callback_id, "確認已使用、過期或失效，未刪除任何會話")
+            return
+        await answer_callback_query(callback_id, "會話整理完成" if result.status == "archived" else "已取消")
+        await show_conversation_queue(admin_id, "all", callback=callback, notice=notice)
+        return
     if action.startswith("broadcast") or action in {"takeover", "close", "resolve", "reopen"}:
         await answer_callback_query(callback_id, "該功能已移除，請使用聊天列表")
         return
