@@ -19,6 +19,10 @@ def source(job) -> str:
     provider = PROVIDERS.get(job["provider"])
     if provider:
         return f"{provider.name} · {escaped(job['model'], 200)}"
+    if job["reason_code"] == "custom_rule":
+        return "自訂封鎖規則（未呼叫 AI）"
+    if job["reason_code"] == "builtin_rule":
+        return "內建本地規則（未呼叫 AI）"
     return "本地策略 / 歷史記錄未記錄模型"
 
 
@@ -31,10 +35,11 @@ class ModerationInbox:
         self.enabled = enabled
 
     async def show(self, admin_id: int, page: int = 1, callback=None, category: str = "spam") -> None:
+        category = "other" if category == "pending" else category
         jobs, page, pages = moderation.pending_page(self.db, page, category=category)
         lines = [f"<b>暫存區 · {LABELS[category]}</b>", ""]
         buttons = [[(LABELS[key] + (" · 目前" if key == category else ""), f"moderation:1:{key}")
-                    for key in ("spam", "pending")]]
+                    for key in ("spam", "other", "error")]]
         for index, job in enumerate(jobs, start=(page - 1) * 5 + 1):
             user = json.loads(job["snapshot"]).get("from", {})
             name = user.get("first_name") or user.get("username") or "未命名聯絡人"
@@ -54,10 +59,13 @@ class ModerationInbox:
         user = json.loads(job["snapshot"]).get("from", {})
         name = " ".join(str(user.get(field) or "") for field in ("first_name", "last_name")).strip()
         username = f"@{user['username']}" if user.get("username") else "未設定"
+        prompt_version = job["prompt_version"] or ("舊版本未記錄" if job["provider"] else "不適用（本地規則）")
         text = ("<b>暫存留言</b>\n\n"
                 f"使用者：{escaped(name, 80)} · <code>{job['chat_id']}</code>\n"
                 f"Username：{escaped(username, 80)}\n"
-                f"檢測来源：{source(job)}\n結果：{escaped(job['reason'], 200)}\n\n"
+                f"檢測來源：{source(job)}\n"
+                f"提示詞版本：{escaped(prompt_version, 80)}\n"
+                f"結果：{escaped(job['reason'], 200)}\n\n"
                 f"{escaped(job['summary'], 1100)}")
         await self.present(admin_id, text, inline_keyboard([
             [("放行本條", f"moderation_allow:{suffix}", "success"), ("忽略本條", f"moderation_dismiss:{suffix}")],

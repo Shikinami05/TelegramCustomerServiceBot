@@ -356,6 +356,13 @@ def initialize(db_path: Path) -> None:
         ensure_column(conn, "admin_config_inputs", "provider", "TEXT NOT NULL DEFAULT 'deepseek'")
         ensure_column(conn, "admin_config_inputs", "panel_id", "INTEGER")
         ensure_column(conn, "moderation_notices", "signature", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "moderation_jobs", "reason_code", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "moderation_jobs", "prompt_version", "TEXT NOT NULL DEFAULT ''")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS conversation_cleanups ("
+            "token TEXT PRIMARY KEY, admin_id INTEGER NOT NULL, snapshot TEXT NOT NULL, "
+            "expires_at INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending')"
+        )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_admin_deliveries_pending "
             "ON admin_deliveries(status, next_attempt_at, id)"

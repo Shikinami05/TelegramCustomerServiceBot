@@ -76,7 +76,7 @@ def replace_rules(db_path: Path, text: str) -> int:
     return len(rules)
 
 
-def check(db_path: Path, text: str) -> str | None:
+def check_custom(db_path: Path, text: str) -> str | None:
     normalized = normalize(text)
     rules = read_rules(db_path)
     for kind, value in rules:
@@ -92,14 +92,21 @@ def check(db_path: Path, text: str) -> str | None:
                     continue
                 if host == value or host.endswith("." + value):
                     return "命中自訂廣告域名"
-    # Reports and discussions go to AI; a keyword alone must not block ordinary chat.
-    if any(word in normalized for word in DISCUSSION):
-        return None
     if any(kind == "phrase" and normalize(value) in normalized for kind, value in rules):
         return "命中自訂廣告短語"
+
+
+def check_builtin(text: str) -> str | None:
+    normalized = normalize(text)
+    if any(word in normalized for word in DISCUSSION):
+        return None
     if any(topic in normalized and any(word in normalized.replace(topic, "") for word in SOLICITATION)
            for topic in GAMBLING):
         return "疑似博彩推廣話術"
     if any(word in normalized for word in SCHEMES) and any(word in normalized for word in CONTACT):
         return "疑似返佣或招募推廣"
     return None
+
+
+def check(db_path: Path, text: str) -> str | None:
+    return check_custom(db_path, text) or check_builtin(text)

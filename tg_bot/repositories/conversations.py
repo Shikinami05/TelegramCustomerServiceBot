@@ -1,11 +1,72 @@
+import json
+import secrets
 import sqlite3
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from tg_bot import database
 
 
 QUEUE_NAMES = {"inbox", "all"}
+
+
+class CleanupResult(NamedTuple):
+    status: str
+    archived: int = 0
+    preserved: int = 0
+
+
+def prepare_cleanup(db_path: Path, admin_id: int, *, now: int | None = None) -> tuple[str, int]:
+    now = int(time.time()) if now is None else now
+    token = secrets.token_urlsafe(12)
+    with database.connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            "SELECT chat_id,last_inbound_seq FROM conversations WHERE archived_at IS NULL ORDER BY chat_id LIMIT 10001"
+        ).fetchall()
+        if len(rows) > 10000:
+            raise ValueError("會話數超出單次整理上限，請分批整理")
+        conn.execute("DELETE FROM conversation_cleanups WHERE expires_at<?", (now - 86400,))
+        conn.execute("UPDATE conversation_cleanups SET status='canceled' WHERE admin_id=? AND status='pending'", (admin_id,))
+        conn.execute("INSERT INTO conversation_cleanups(token,admin_id,snapshot,expires_at) VALUES(?,?,?,?)",
+                     (token, admin_id, json.dumps([(row["chat_id"], row["last_inbound_seq"]) for row in rows]), now + 180))
+        conn.commit()
+    return token, len(rows)
+
+
+def finish_cleanup(db_path: Path, admin_id: int, token: str, *, cancel: bool = False,
+                   now: int | None = None) -> CleanupResult:
+    now = int(time.time()) if now is None else now
+    with database.connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        action = conn.execute("SELECT * FROM conversation_cleanups WHERE token=? AND admin_id=?", (token, admin_id)).fetchone()
+        if not action:
+            return CleanupResult("missing")
+        if action["status"] != "pending":
+            return CleanupResult("used")
+        if action["expires_at"] <= now:
+            return CleanupResult("expired")
+        if cancel:
+            conn.execute("UPDATE conversation_cleanups SET status='canceled' WHERE token=?", (token,))
+            conn.commit()
+            return CleanupResult("canceled")
+        expected = dict(json.loads(action["snapshot"]))
+        active = conn.execute("SELECT chat_id,last_inbound_seq FROM conversations WHERE archived_at IS NULL").fetchall()
+        eligible = [(row["chat_id"], row["last_inbound_seq"]) for row in active
+                    if expected.get(row["chat_id"]) == row["last_inbound_seq"]]
+        # One transaction consumes the confirmation and preserves changed/new conversations.
+        conn.executemany(
+            "UPDATE conversations SET archived_at=CURRENT_TIMESTAMP,last_read_seq=last_inbound_seq,unread_count=0 "
+            "WHERE chat_id=? AND last_inbound_seq=?", eligible,
+        )
+        conn.executemany("DELETE FROM admin_states WHERE target_chat_id=?", [(chat_id,) for chat_id, _ in eligible])
+        conn.execute("UPDATE conversation_cleanups SET status='used' WHERE token=?", (token,))
+        preserved = len(active) - len(eligible)
+        conn.execute("INSERT INTO admin_audit_logs(admin_id,action,details) VALUES(?,'conversation_archive_all',?)",
+                     (admin_id, f"archived={len(eligible)},preserved={preserved}"))
+        conn.commit()
+        return CleanupResult("archived", len(eligible), preserved)
 
 
 def set_admin_state(db_path: Path, admin_id: int, target_chat_id: int) -> None:

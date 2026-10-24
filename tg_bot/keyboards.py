@@ -92,7 +92,7 @@ def queue_navigation_rows(queue_name: str, page: int, total_pages: int,
 
 def conversation_queue_keyboard(rows: list[Any], queue_name: str, *, viewer_admin_id: int | None,
                                 page: int, total_pages: int, page_size: int,
-                                counts: dict[str, int]) -> dict[str, Any]:
+                                counts: dict[str, int], can_cleanup: bool = False) -> dict[str, Any]:
     navigation = queue_navigation_rows(queue_name, page, total_pages, counts)
     buttons: list[list[ButtonSpec]] = navigation[:2]
     for index, row in enumerate(rows, start=(page - 1) * page_size + 1):
@@ -101,6 +101,8 @@ def conversation_queue_keyboard(rows: list[Any], queue_name: str, *, viewer_admi
         name = " ".join(name.split())
         buttons.append([(f"{index}. 查看 {truncate_text(name, 22)}", f"user:{row['chat_id']}:{queue_name}:{page}")])
     buttons.extend(navigation[2:])
+    if can_cleanup and queue_name == "all" and counts["all"]:
+        buttons.insert(-1, [("刪除所有會話", "cleanup:all", "danger")])
     return inline_keyboard(buttons)
 
 

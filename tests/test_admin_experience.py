@@ -160,14 +160,32 @@ class AdminExperienceTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await ai_settings.probe_key("sk-key", "deepseek", "available-model"))
 
     async def test_synthetic_test_is_budgeted_and_never_uses_private_history(self):
+        self.settings = replace(self.settings, moderation_daily_limit=2)
+        with patch.object(ai_settings, "probe_key", AsyncMock(return_value=True)), \
+             patch.object(ai_settings, "classify", AsyncMock(side_effect=[service.Verdict("allow", "ok"), service.Verdict("spam", "ok")])) as classify:
+            await self.controller.callback(1, "test_confirm:deepseek")
+            await self.controller.callback(1, "test_confirm:deepseek")
+        self.assertEqual(classify.await_count, 2)
+        self.assertEqual(classify.await_args_list[0].args[3], "你好，想和你聊聊天。")
+        self.assertIn("哈希投注", classify.await_args_list[1].args[3])
+        self.assertEqual(database.fetchone(self.db, "SELECT requests FROM moderation_usage")[0], 2)
+
+    async def test_synthetic_test_with_insufficient_budget_makes_no_classification_request(self):
         self.settings = replace(self.settings, moderation_daily_limit=1)
         with patch.object(ai_settings, "probe_key", AsyncMock(return_value=True)), \
-             patch.object(ai_settings, "classify", AsyncMock(return_value=service.Verdict("allow", "ok"))) as classify:
+             patch.object(ai_settings, "classify", new_callable=AsyncMock) as classify:
             await self.controller.callback(1, "test_confirm:deepseek")
+        classify.assert_not_awaited()
+        self.assertEqual(database.fetchone(self.db, "SELECT requests FROM moderation_usage")[0], 0)
+        self.assertTrue(self.settings.ai_moderation_enabled)
+
+    async def test_synthetic_test_mismatch_is_visible_and_never_changes_protection(self):
+        original = self.settings
+        with patch.object(ai_settings, "probe_key", AsyncMock(return_value=True)), \
+             patch.object(ai_settings, "classify", AsyncMock(return_value=service.Verdict("allow", "normal"))):
             await self.controller.callback(1, "test_confirm:deepseek")
-        self.assertEqual(classify.await_count, 1)
-        self.assertEqual(classify.await_args.args[3], "你好，想和你聊聊天。")
-        self.assertEqual(database.fetchone(self.db, "SELECT requests FROM moderation_usage")[0], 1)
+        self.assertIn("與預期不符", self.present.await_args.args[1])
+        self.assertEqual(self.settings, original)
 
     async def test_models_containing_slashes_survive_restart(self):
         self.settings = replace(self.settings, ai_provider="siliconflow", ai_api_key="sk-siliconflow-key", ai_model="Qwen/Qwen3-32B")
@@ -183,7 +201,7 @@ class AdminExperienceTests(unittest.IsolatedAsyncioTestCase):
             requests = []
             def handler(request):
                 requests.append(request)
-                return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": '{"verdict":"allow"}'}}]})
+                return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": '{"verdict":"allow","reason_code":"conversation"}'}}]})
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
                 result = await service.classify(client, "sk-isolated-key", PROVIDERS[provider].default_model, "hello", 1, provider)
             self.assertEqual(result.verdict, "allow")
@@ -220,6 +238,16 @@ class AdminExperienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("DeepSeek", text)
         self.assertIn("deepseek-flash", text)
         self.assertNotIn("new-model", text)
+
+    async def test_spam_uncertain_and_service_errors_have_separate_ui_tabs(self):
+        self.held(100, 50, "spam")
+        self.held(101, 51, "uncertain")
+        self.held(102, 52, "error")
+        await self.inbox.show(1, category="pending")
+        callbacks = {button["callback_data"] for row in self.present.await_args.args[2]["inline_keyboard"] for button in row}
+        self.assertTrue({"moderation:1:spam", "moderation:1:other", "moderation:1:error"} <= callbacks)
+        self.assertIn("moderation_detail:101:1:other", callbacks)
+        self.assertNotIn("moderation_detail:102:1:other", callbacks)
 
     async def test_dismiss_does_not_blacklist_or_deliver(self):
         self.held()

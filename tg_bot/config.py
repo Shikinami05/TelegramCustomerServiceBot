@@ -91,7 +91,7 @@ class Settings:
     @property
     def moderation_mode_label(self) -> str:
         if self.ai_moderation_enabled:
-            return "規則 + AI" if self.spam_rules_enabled else "僅 AI"
+            return "AI 語意審核" if self.spam_rules_enabled else "AI 語意審核（未啟用自訂規則）"
         return "僅本地規則" if self.spam_rules_enabled else "已暫停"
 
     @property

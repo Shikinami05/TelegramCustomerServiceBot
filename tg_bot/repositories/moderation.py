@@ -79,9 +79,11 @@ def hold(db_path: Path, update_id: int, reason: str, verdict: str = "error") -> 
                      "WHERE update_id=? AND status='running'", (reason, verdict, update_id))
 
 
-def record_result(db_path: Path, update_id: int, provider: str, model: str, verdict: str, reason: str) -> None:
-    database.execute(db_path, "UPDATE moderation_jobs SET provider=?,model=?,verdict=?,reason=? "
-                     "WHERE update_id=? AND status='running'", (provider, model, verdict, reason, update_id))
+def record_result(db_path: Path, update_id: int, provider: str, model: str, verdict: str, reason: str,
+                  *, reason_code: str = "", prompt_version: str = "") -> None:
+    database.execute(db_path, "UPDATE moderation_jobs SET provider=?,model=?,verdict=?,reason=?,reason_code=?,prompt_version=? "
+                     "WHERE update_id=? AND status='running'",
+                     (provider, model, verdict, reason, reason_code, prompt_version, update_id))
 
 
 def get(db_path: Path, update_id: int) -> sqlite3.Row | None:
